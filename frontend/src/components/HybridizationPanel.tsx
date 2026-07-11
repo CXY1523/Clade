@@ -154,16 +154,7 @@ export function HybridizationPanel({ onClose, onSuccess }: Props) {
     }
   }, [selectedPair, fetchPreview]);
 
-  // 强行杂交预览
-  useEffect(() => {
-    if (mode === "forced" && forceSpeciesA && forceSpeciesB) {
-      fetchForcePreview();
-    } else {
-      setForcePreview(null);
-    }
-  }, [mode, forceSpeciesA, forceSpeciesB]);
-
-  async function fetchForcePreview() {
+  const fetchForcePreview = useCallback(async () => {
     if (!forceSpeciesA || !forceSpeciesB) return;
     try {
       setPreviewLoading(true);
@@ -177,7 +168,16 @@ export function HybridizationPanel({ onClose, onSuccess }: Props) {
     } finally {
       setPreviewLoading(false);
     }
-  }
+  }, [forceSpeciesA, forceSpeciesB]);
+
+  // 强行杂交预览
+  useEffect(() => {
+    if (mode === "forced" && forceSpeciesA && forceSpeciesB) {
+      fetchForcePreview();
+    } else {
+      setForcePreview(null);
+    }
+  }, [mode, forceSpeciesA, forceSpeciesB, fetchForcePreview]);
 
   async function executeForceHybridization() {
     if (!forceSpeciesA || !forceSpeciesB) return;

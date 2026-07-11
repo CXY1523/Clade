@@ -203,7 +203,7 @@ export const ConnectionSection = memo(function ConnectionSection({
     } finally {
       setFetchingModels(null);
     }
-  }, [dispatch]);
+  }, []);
 
   return (
     <div className="section-page">

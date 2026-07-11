@@ -79,21 +79,6 @@ export function SettingsPanel({ config, onClose, onSave }: Props) {
     });
   }, [config]);
 
-  // 键盘快捷键
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key === "s") {
-        e.preventDefault();
-        handleSave();
-      }
-      if (e.key === "Escape") {
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
-
   // 保存配置
   const handleSave = useCallback(async () => {
     dispatch({ type: "SET_SAVING", saving: true });
@@ -107,6 +92,21 @@ export function SettingsPanel({ config, onClose, onSave }: Props) {
       dispatch({ type: "SET_SAVING", saving: false });
     }
   }, [state.form, onSave]);
+
+  // 键盘快捷键
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.key === "s") {
+        e.preventDefault();
+        handleSave();
+      }
+      if (e.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [handleSave, onClose]);
 
   // 导出配置
   const handleExport = useCallback(() => {
