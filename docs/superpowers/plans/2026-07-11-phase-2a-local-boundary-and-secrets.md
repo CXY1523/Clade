@@ -51,11 +51,19 @@
 
 ### Task 1: Enforce local-only bind hosts
 
+> **Controller resolution (2026-07-12):** The fail-closed constraint applies
+> inside Vite as well as the launcher. A direct Vite start must reject a
+> non-loopback `FRONTEND_HOST` unless `ALLOW_LAN_ACCESS=true`. The proxy target
+> follows `BACKEND_HOST`, mapping wildcard bind hosts (`0.0.0.0`, `::`) to
+> `127.0.0.1` and preserving a specific backend address.
+
 **Files:**
 - Create: `backend/app/core/network_policy.py`
 - Create: `backend/app/core/tests/test_network_policy.py`
 - Modify: `backend/app/core/config.py`
 - Modify: `start.ps1`
+- Create: `frontend/src/config/networkPolicy.ts`
+- Create: `frontend/src/config/networkPolicy.test.ts`
 - Modify: `frontend/vite.config.ts`
 - Modify: `README.md`
 
@@ -91,10 +99,11 @@ def test_default_hosts_are_loopback() -> None:
     assert hosts.lan_enabled is False
 
 
+@pytest.mark.parametrize("field", ["BACKEND_HOST", "FRONTEND_HOST"])
 @pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.25", "10.0.0.8"])
-def test_non_loopback_host_requires_lan_opt_in(host: str) -> None:
+def test_non_loopback_host_requires_lan_opt_in(field: str, host: str) -> None:
     with pytest.raises(ValueError, match="ALLOW_LAN_ACCESS=true"):
-        resolve_bind_hosts(make_settings(BACKEND_HOST=host))
+        resolve_bind_hosts(make_settings(**{field: host}))
 
 
 def test_explicit_lan_opt_in_allows_non_loopback_hosts() -> None:
@@ -182,7 +191,7 @@ def resolve_bind_hosts(settings: Settings) -> BindHosts:
 
 Run: `cd backend; .venv\Scripts\python.exe -m pytest app/core/tests/test_network_policy.py -q`
 
-Expected: `5 passed`.
+Expected: `8 passed`.
 
 - [ ] **Step 5: Make `start.ps1` consume the policy**
 
@@ -201,6 +210,7 @@ try {
 $bindConfig = $bindConfigJson | ConvertFrom-Json
 $backendHost = $bindConfig.backend
 $frontendHost = $bindConfig.frontend
+$allowLanAccess = if ($bindConfig.lan_enabled) { "true" } else { "false" }
 if ($bindConfig.lan_enabled) {
     Write-Warning "局域网访问已启用。Clade API 和前端可能被同一网络中的其他设备访问。"
 }
@@ -212,25 +222,39 @@ Change the backend launch line to:
 python -m uvicorn app.main:app --reload --host $backendHost --port $BACKEND_PORT
 ```
 
-Pass the frontend host into its process and Vite:
+Pass the resolved policy values into the Vite process:
 
 ```powershell
+`$env:BACKEND_HOST='$backendHost'
 `$env:FRONTEND_HOST='$frontendHost'
+`$env:ALLOW_LAN_ACCESS='$allowLanAccess'
 npx.cmd vite --host `$env:FRONTEND_HOST --port $FRONTEND_PORT --config vite.config.ts
 ```
 
-In `frontend/vite.config.ts`, add:
+Create `frontend/src/config/networkPolicy.ts` as a pure policy module and add
+focused tests in `frontend/src/config/networkPolicy.test.ts`. The tests must
+cover rejection without opt-in, explicit opt-in, wildcard backend mapping for
+both `0.0.0.0` and `::`, and preservation of a specific LAN backend address.
+The policy must default both hosts to `127.0.0.1` and throw an error containing
+`ALLOW_LAN_ACCESS=true` when a non-loopback host is used without opt-in.
+
+In `frontend/vite.config.ts`, consume only the resolved policy:
 
 ```ts
-const FRONTEND_HOST = process.env.FRONTEND_HOST || "127.0.0.1";
+import { resolveFrontendNetworkPolicy } from "./src/config/networkPolicy";
+
+const NETWORK_POLICY = resolveFrontendNetworkPolicy(process.env);
 ```
 
-and set `server.host`:
+Use the resolved frontend host and backend proxy host:
 
 ```ts
   server: {
-    host: FRONTEND_HOST,
+    host: NETWORK_POLICY.frontendHost,
     port: FRONTEND_PORT,
+    proxy: {
+      "/api": {
+        target: `http://${NETWORK_POLICY.backendProxyHost}:${BACKEND_PORT}`,
 ```
 
 - [ ] **Step 6: Update manual-start documentation**
@@ -263,17 +287,19 @@ Run:
 cd backend
 .venv\Scripts\python.exe -m pytest app/core/tests/test_network_policy.py -q
 cd ..\frontend
+npm run test:run
 npm run build
 cd ..
 git diff --check
 ```
 
-Expected: focused tests pass, frontend build exits `0`, and diff check is clean.
+Expected: focused backend tests and all frontend tests pass, frontend build
+exits `0`, and diff check is clean.
 
 Commit:
 
 ```powershell
-git add backend/app/core/config.py backend/app/core/network_policy.py backend/app/core/tests/test_network_policy.py start.ps1 frontend/vite.config.ts README.md
+git add backend/app/core/config.py backend/app/core/network_policy.py backend/app/core/tests/test_network_policy.py start.ps1 frontend/src/config/networkPolicy.ts frontend/src/config/networkPolicy.test.ts frontend/vite.config.ts README.md docs/superpowers/plans/2026-07-11-phase-2a-local-boundary-and-secrets.md
 git commit -m "security: default servers to loopback"
 ```
 

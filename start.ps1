@@ -344,6 +344,7 @@ try {
 $bindConfig = $bindConfigJson | ConvertFrom-Json
 $backendHost = $bindConfig.backend
 $frontendHost = $bindConfig.frontend
+$allowLanAccess = if ($bindConfig.lan_enabled) { "true" } else { "false" }
 if ($bindConfig.lan_enabled) {
     Write-Warning "局域网访问已启用。Clade API 和前端可能被同一网络中的其他设备访问。"
 }
@@ -364,7 +365,9 @@ $feCmd = @"
 Set-Location -LiteralPath '$frontendPath'
 `$env:BACKEND_PORT='$BACKEND_PORT'
 `$env:FRONTEND_PORT='$FRONTEND_PORT'
+`$env:BACKEND_HOST='$backendHost'
 `$env:FRONTEND_HOST='$frontendHost'
+`$env:ALLOW_LAN_ACCESS='$allowLanAccess'
 npx.cmd vite --host `$env:FRONTEND_HOST --port $FRONTEND_PORT --config vite.config.ts
 "@
 Start-Process powershell -ArgumentList "-NoExit", "-Command", $feCmd -WorkingDirectory $frontendPath

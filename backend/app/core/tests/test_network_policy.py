@@ -21,10 +21,11 @@ def test_default_hosts_are_loopback() -> None:
     assert hosts.lan_enabled is False
 
 
+@pytest.mark.parametrize("field", ["BACKEND_HOST", "FRONTEND_HOST"])
 @pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.25", "10.0.0.8"])
-def test_non_loopback_host_requires_lan_opt_in(host: str) -> None:
+def test_non_loopback_host_requires_lan_opt_in(field: str, host: str) -> None:
     with pytest.raises(ValueError, match="ALLOW_LAN_ACCESS=true"):
-        resolve_bind_hosts(make_settings(BACKEND_HOST=host))
+        resolve_bind_hosts(make_settings(**{field: host}))
 
 
 def test_explicit_lan_opt_in_allows_non_loopback_hosts() -> None:
