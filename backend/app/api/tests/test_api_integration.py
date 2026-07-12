@@ -270,10 +270,45 @@ class TestNewRouterIntegration:
         with pytest.raises(ValueError, match="Recursive schema reference"):
             _inline_local_schema_definitions(recursive_schema)
 
+    def test_openapi_schema_inlining_allows_sibling_definition_reuse(self):
+        from ..analytics import _inline_local_schema_definitions
+
+        schema = {
+            "$defs": {"Value": {"type": "string"}},
+            "$ref": "#/$defs/Value",
+            "not": {"$ref": "#/$defs/Value"},
+        }
+
+        assert _inline_local_schema_definitions(schema) == {
+            "allOf": [{"type": "string"}],
+            "not": {"type": "string"},
+        }
+
+    def test_openapi_schema_inlining_removes_definitions_from_ref_root(self):
+        from ..analytics import _inline_local_schema_definitions
+
+        schema = {
+            "$defs": {"Value": {"type": "string"}},
+            "$ref": "#/$defs/Value",
+            "title": "Value",
+        }
+
+        expanded = _inline_local_schema_definitions(schema)
+
+        assert expanded == {
+            "allOf": [{"type": "string"}],
+            "title": "Value",
+        }
+
     @pytest.mark.parametrize(
         "content_type",
-        ["text/plain", None],
-        ids=["text-plain", "missing"],
+        [
+            "text/plain",
+            None,
+            "application/*+json",
+            "application/ +json",
+        ],
+        ids=["text-plain", "missing", "wildcard-json", "blank-subtype-json"],
     )
     def test_post_config_rejects_non_json_media_type(
         self, client, mock_container, content_type
@@ -308,8 +343,9 @@ class TestNewRouterIntegration:
         [
             "application/json; charset=utf-8",
             "application/problem+json; charset=utf-8",
+            "Application/Problem+Json; Charset=UTF-8",
         ],
-        ids=["application-json", "structured-json"],
+        ids=["application-json", "structured-json", "mixed-case-structured-json"],
     )
     def test_post_config_accepts_json_media_type_with_parameters(
         self, client, mock_container, content_type
@@ -423,6 +459,66 @@ class TestNewRouterIntegration:
         configure_router.assert_not_called()
         runtime_routes.apply_ui_config.assert_not_called()
         runtime_routes.simulation_engine.reload_configs.assert_not_called()
+
+    def test_post_config_cache_error_does_not_stop_runtime_refresh(
+        self, client, mock_container, caplog
+    ):
+        from ...models.config import ProviderConfig, UIConfig
+
+        current = UIConfig(
+            providers={
+                "main": ProviderConfig(
+                    id="main", name="Main", api_key="sk-secret"
+                )
+            }
+        )
+        mock_container.config_service.get_ui_config.return_value = current
+        mock_container.settings.ui_config_path = "data/test-settings.json"
+        mock_container.environment_repository.save_ui_config.side_effect = (
+            lambda _path, config: config
+        )
+        runtime_routes = MagicMock()
+        refresh_order = []
+
+        class CacheRefreshError(RuntimeError):
+            pass
+
+        def fail_cache():
+            refresh_order.append("cache")
+            raise CacheRefreshError("cache failed for sk-secret")
+
+        mock_container.config_service.invalidate_cache.side_effect = fail_cache
+        runtime_routes.apply_ui_config.side_effect = (
+            lambda _saved: refresh_order.append("apply")
+        )
+        runtime_routes.simulation_engine.reload_configs.side_effect = (
+            lambda _configs: refresh_order.append("reload")
+        )
+
+        with (
+            patch(
+                "app.api.analytics.configure_model_router",
+                side_effect=lambda *_args: refresh_order.append("configure"),
+            ),
+            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
+        ):
+            response = client.post(
+                "/api/config/ui",
+                json={
+                    "config": {
+                        "providers": {
+                            "main": {"id": "main", "name": "Main", "api_key": ""}
+                        }
+                    },
+                    "clear_provider_api_keys": [],
+                },
+            )
+
+        assert response.status_code == 200
+        assert refresh_order == ["cache", "configure", "apply", "reload"]
+        assert "CacheRefreshError" in caplog.text
+        assert "sk-secret" not in response.text
+        assert "sk-secret" not in caplog.text
 
     def test_post_config_runtime_errors_do_not_log_provider_key(
         self, client, mock_container, caplog

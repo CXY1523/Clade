@@ -292,9 +292,9 @@ def _inline_local_schema_definitions(schema: dict[str, Any]) -> dict[str, Any]:
             next_references = active_references | {reference}
             expanded_reference = expand(definition, next_references)
             siblings = {
-                key: expand(item, next_references)
+                key: expand(item, active_references)
                 for key, item in value.items()
-                if key != "$ref"
+                if key not in {"$ref", "$defs"}
             }
             if siblings:
                 return {"allOf": [expanded_reference], **siblings}
@@ -319,10 +319,18 @@ def _is_json_media_type(content_type: str | None) -> bool:
     media_type = content_type.split(";", 1)[0].strip().lower()
     if media_type == "application/json":
         return True
+    if not media_type.startswith("application/"):
+        return False
+
+    subtype = media_type.removeprefix("application/")
+    token_characters = frozenset(
+        "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyz"
+    )
     return (
-        media_type.startswith("application/")
-        and media_type.endswith("+json")
-        and len(media_type) > len("application/+json")
+        subtype.endswith("+json")
+        and bool(subtype.removesuffix("+json"))
+        and "*" not in subtype
+        and all(character in token_characters for character in subtype)
     )
 
 
@@ -393,7 +401,13 @@ def update_ui_config(
     )
     
     # 使缓存失效
-    config_service.invalidate_cache()
+    try:
+        config_service.invalidate_cache()
+    except Exception as exc:
+        logger.warning(
+            "[config] Cache invalidation failed (error_type=%s)",
+            type(exc).__name__,
+        )
     
     # 应用配置到容器级 ModelRouter
     try:
