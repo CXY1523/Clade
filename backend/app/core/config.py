@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     # 服务端口配置
     backend_port: int = Field(default=8022, alias="BACKEND_PORT")
     frontend_port: int = Field(default=5188, alias="FRONTEND_PORT")
+    backend_host: str = Field(default="127.0.0.1", alias="BACKEND_HOST")
+    frontend_host: str = Field(default="127.0.0.1", alias="FRONTEND_HOST")
+    allow_lan_access: bool = Field(default=False, alias="ALLOW_LAN_ACCESS")
     database_url: str = Field(default=f"sqlite:///{PROJECT_ROOT.as_posix()}/data/db/egame.db", alias="DATABASE_URL")
     embedding_provider: str = Field(default="local", alias="EMBEDDING_PROVIDER")
     report_model: str = Field(default="gpt-large", alias="REPORT_MODEL")

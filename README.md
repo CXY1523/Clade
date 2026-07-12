@@ -152,7 +152,7 @@ python -m venv venv
 pip install -e ".[dev]"
 
 # 启动后端服务
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8022
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8022
 ```
 
 **第二步：启动前端**
@@ -170,8 +170,12 @@ cd frontend
 npm install
 
 # 启动前端服务
-npm run dev
+npm run dev -- --host 127.0.0.1
 ```
+
+默认仅允许本机访问。只有确实需要局域网访问时，才同时设置
+`ALLOW_LAN_ACCESS=true`、`BACKEND_HOST=0.0.0.0` 和
+`FRONTEND_HOST=0.0.0.0`。局域网模式会暴露本地 API，请仅在可信网络中使用。
 
 **第三步：访问游戏**
 

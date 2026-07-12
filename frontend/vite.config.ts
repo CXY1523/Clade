@@ -9,6 +9,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 从环境变量读取端口配置，支持灵活部署
 const BACKEND_PORT = process.env.BACKEND_PORT || "8022";
 const FRONTEND_PORT = parseInt(process.env.FRONTEND_PORT || "5188", 10);
+const FRONTEND_HOST = process.env.FRONTEND_HOST || "127.0.0.1";
 
 export default defineConfig({
   // 显式指定项目根目录，解决某些系统上启动脚本工作目录不正确的问题
@@ -33,6 +34,7 @@ export default defineConfig({
     ],
   },
   server: {
+    host: FRONTEND_HOST,
     port: FRONTEND_PORT,
     proxy: {
       "/api": {
