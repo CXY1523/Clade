@@ -17,6 +17,12 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from ..security.config_secrets import (
+    UIConfigUpdateRequest,
+    merge_ui_config_secrets,
+    public_ui_config,
+    resolve_provider_credentials,
+)
 from ..schemas.responses import ExportRecord
 from .dependencies import get_container, get_history_repository, get_session
 from ..core.ai_router_config import configure_model_router
@@ -255,28 +261,31 @@ async def stream_simulation_events(
 @router.get("/config/ui")
 def get_ui_config(
     container: 'ServiceContainer' = Depends(get_container),
-):
+) -> dict:
     """获取 UI 配置"""
-    return container.config_service.get_ui_config()
+    return public_ui_config(container.config_service.get_ui_config())
 
 
 @router.post("/config/ui")
 def update_ui_config(
-    config: dict,
+    request: UIConfigUpdateRequest,
     container: 'ServiceContainer' = Depends(get_container),
-):
+) -> dict:
     """更新 UI 配置"""
-    from ..models.config import UIConfig
-    
     env_repo = container.environment_repository
     config_service = container.config_service
-    
-    ui_config = UIConfig(**config)
+
+    current = config_service.get_ui_config()
+    merged = merge_ui_config_secrets(
+        current,
+        request.config,
+        request.clear_provider_api_keys,
+    )
     
     # 保存配置
     saved = env_repo.save_ui_config(
         Path(container.settings.ui_config_path),
-        ui_config
+        merged,
     )
     
     # 使缓存失效
@@ -286,16 +295,16 @@ def update_ui_config(
     try:
         configure_model_router(saved, container.model_router, container.embedding_service, container.settings)
         logger.info("[配置] 容器 ModelRouter 已更新")
-    except Exception as e:
-        logger.warning(f"[配置] 更新容器 ModelRouter 失败: {e}")
+    except Exception:
+        logger.warning("[配置] 更新容器 ModelRouter 失败")
     
     # 【修复】应用 AI 配置到 ModelRouter（负载均衡、服务商路由等）
     try:
         from . import routes
         routes.apply_ui_config(saved)
         logger.info("[配置] AI 服务商配置已应用")
-    except Exception as e:
-        logger.warning(f"[配置] 应用 AI 配置失败（不影响其他配置）: {e}")
+    except Exception:
+        logger.warning("[配置] 应用 AI 配置失败（不影响其他配置）")
     
     # 【修复】刷新 SimulationEngine 及子服务的配置（分化、死亡率、生态平衡等）
     try:
@@ -309,10 +318,10 @@ def update_ui_config(
         }
         routes.simulation_engine.reload_configs(new_configs)
         logger.info("[配置] 游戏参数配置已刷新到引擎")
-    except Exception as e:
-        logger.warning(f"[配置] 刷新引擎配置失败（将在下次推演时自动加载）: {e}")
+    except Exception:
+        logger.warning("[配置] 刷新引擎配置失败（将在下次推演时自动加载）")
     
-    return saved
+    return public_ui_config(saved)
 
 
 @router.post("/config/test-api")
@@ -322,10 +331,18 @@ def test_api_connection(
 ) -> dict:
     """测试 API 连接是否有效"""
     import httpx
-    
-    base_url = request.get("base_url", "")
-    api_key = request.get("api_key", "")
-    provider_type = request.get("provider_type", "openai")
+
+    try:
+        credentials = resolve_provider_credentials(
+            request,
+            container.config_service.get_ui_config(),
+        )
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
+    base_url = credentials.base_url or ""
+    api_key = credentials.api_key
+    provider_type = credentials.provider_type
     
     if not base_url or not api_key:
         return {"success": False, "error": "缺少必要参数"}
@@ -351,15 +368,14 @@ def test_api_connection(
             return {
                 "success": False,
                 "error": f"API 返回状态码: {response.status_code}",
-                "detail": response.text[:500] if response.text else "",
             }
             
     except httpx.TimeoutException:
         return {"success": False, "error": "连接超时"}
-    except httpx.ConnectError as e:
-        return {"success": False, "error": f"连接失败: {str(e)}"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except httpx.ConnectError:
+        return {"success": False, "error": "连接失败"}
+    except Exception:
+        return {"success": False, "error": "请求失败"}
 
 
 @router.post("/config/fetch-models")
@@ -369,10 +385,18 @@ def fetch_models(
 ) -> dict:
     """获取服务商的可用模型列表"""
     import httpx
-    
-    base_url = request.get("base_url", "")
-    api_key = request.get("api_key", "")
-    provider_type = request.get("provider_type", "openai")
+
+    try:
+        credentials = resolve_provider_credentials(
+            request,
+            container.config_service.get_ui_config(),
+        )
+    except ValueError as exc:
+        return {"success": False, "error": str(exc), "models": []}
+
+    base_url = credentials.base_url or ""
+    api_key = credentials.api_key
+    provider_type = credentials.provider_type
     
     if not base_url or not api_key:
         return {"success": False, "error": "缺少必要参数", "models": []}
@@ -416,8 +440,8 @@ def fetch_models(
                 "models": [],
             }
             
-    except Exception as e:
-        return {"success": False, "error": str(e), "models": []}
+    except Exception:
+        return {"success": False, "error": "请求失败", "models": []}
 
 
 # ========== 地图 ==========

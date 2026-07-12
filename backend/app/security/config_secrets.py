@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -10,6 +11,33 @@ from ..models.config import UIConfig
 class UIConfigUpdateRequest(BaseModel):
     config: UIConfig
     clear_provider_api_keys: set[str] = Field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class ProviderCredentials:
+    base_url: str | None
+    api_key: str
+    provider_type: str
+
+
+def resolve_provider_credentials(
+    request: dict[str, Any],
+    current: UIConfig,
+) -> ProviderCredentials:
+    provider_id = str(request.get("provider_id") or "")
+    stored = current.providers.get(provider_id)
+    base_url = request.get("base_url") or (stored.base_url if stored else None)
+    api_key = request.get("api_key") or (stored.api_key if stored else None)
+    provider_type = request.get("provider_type") or (
+        stored.provider_type if stored else "openai"
+    )
+    if not api_key:
+        raise ValueError("API Key is not configured")
+    return ProviderCredentials(
+        base_url=base_url,
+        api_key=api_key,
+        provider_type=provider_type,
+    )
 
 
 def public_ui_config(config: UIConfig) -> dict[str, Any]:

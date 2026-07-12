@@ -9,6 +9,8 @@ API 集成测试 - 验证路由和依赖注入
 5. 验证 SessionManager 状态管理
 """
 
+import sys
+
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from fastapi.testclient import TestClient
@@ -149,6 +151,243 @@ class TestNewRouterIntegration:
         mock_container.history_repository.list_turns.return_value = []
         response = client.get("/api/history")
         assert response.status_code == 200
+
+    def test_get_config_redacts_provider_key(self, client, mock_container):
+        from ...models.config import ProviderConfig, UIConfig
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig(
+            providers={
+                "main": ProviderConfig(
+                    id="main", name="Main", api_key="sk-secret"
+                )
+            }
+        )
+
+        response = client.get("/api/config/ui")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["providers"]["main"]["api_key"] == ""
+        assert body["providers"]["main"]["api_key_configured"] is True
+        assert "sk-secret" not in response.text
+
+    def test_post_config_preserves_empty_key(self, client, mock_container):
+        from ...models.config import ProviderConfig, UIConfig
+
+        current = UIConfig(
+            providers={
+                "main": ProviderConfig(
+                    id="main", name="Main", api_key="sk-secret"
+                )
+            }
+        )
+        mock_container.config_service.get_ui_config.return_value = current
+        mock_container.settings.ui_config_path = "data/test-settings.json"
+        mock_container.environment_repository.save_ui_config.side_effect = (
+            lambda _path, config: config
+        )
+        runtime_routes = MagicMock()
+
+        with (
+            patch("app.api.analytics.configure_model_router") as configure_router,
+            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
+        ):
+            response = client.post(
+                "/api/config/ui",
+                json={
+                    "config": {
+                        "providers": {
+                            "main": {"id": "main", "name": "Main", "api_key": ""}
+                        }
+                    },
+                    "clear_provider_api_keys": [],
+                },
+            )
+
+        assert response.status_code == 200
+        saved = mock_container.environment_repository.save_ui_config.call_args.args[1]
+        assert saved.providers["main"].api_key == "sk-secret"
+        configure_router.assert_called_once_with(
+            saved,
+            mock_container.model_router,
+            mock_container.embedding_service,
+            mock_container.settings,
+        )
+        runtime_routes.apply_ui_config.assert_called_once_with(saved)
+        runtime_routes.simulation_engine.reload_configs.assert_called_once()
+        assert "sk-secret" not in response.text
+
+    def test_post_config_save_failure_does_not_refresh_runtime(
+        self, client, mock_container
+    ):
+        from ...models.config import UIConfig
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig()
+        mock_container.settings.ui_config_path = "data/test-settings.json"
+        mock_container.environment_repository.save_ui_config.side_effect = RuntimeError(
+            "save failed"
+        )
+        runtime_routes = MagicMock()
+
+        with (
+            patch("app.api.analytics.configure_model_router") as configure_router,
+            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
+            pytest.raises(RuntimeError, match="save failed"),
+        ):
+            client.post(
+                "/api/config/ui",
+                json={"config": {"providers": {}}, "clear_provider_api_keys": []},
+            )
+
+        mock_container.config_service.invalidate_cache.assert_not_called()
+        configure_router.assert_not_called()
+        runtime_routes.apply_ui_config.assert_not_called()
+        runtime_routes.simulation_engine.reload_configs.assert_not_called()
+
+    def test_post_config_runtime_errors_do_not_log_provider_key(
+        self, client, mock_container, caplog
+    ):
+        from ...models.config import ProviderConfig, UIConfig
+
+        current = UIConfig(
+            providers={
+                "main": ProviderConfig(
+                    id="main", name="Main", api_key="sk-secret"
+                )
+            }
+        )
+        mock_container.config_service.get_ui_config.return_value = current
+        mock_container.settings.ui_config_path = "data/test-settings.json"
+        mock_container.environment_repository.save_ui_config.side_effect = (
+            lambda _path, config: config
+        )
+        runtime_routes = MagicMock()
+        runtime_routes.apply_ui_config.side_effect = RuntimeError(
+            "apply failed for sk-secret"
+        )
+        runtime_routes.simulation_engine.reload_configs.side_effect = RuntimeError(
+            "reload failed for sk-secret"
+        )
+
+        with (
+            patch(
+                "app.api.analytics.configure_model_router",
+                side_effect=RuntimeError("configure failed for sk-secret"),
+            ),
+            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
+        ):
+            response = client.post(
+                "/api/config/ui",
+                json={
+                    "config": {
+                        "providers": {
+                            "main": {"id": "main", "name": "Main", "api_key": ""}
+                        }
+                    },
+                    "clear_provider_api_keys": [],
+                },
+            )
+
+        assert response.status_code == 200
+        assert "sk-secret" not in response.text
+        assert "sk-secret" not in caplog.text
+
+    def test_api_connection_uses_stored_credentials_without_echoing_them(
+        self, client, mock_container, caplog
+    ):
+        from ...models.config import ProviderConfig, UIConfig
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig(
+            providers={
+                "main": ProviderConfig(
+                    id="main",
+                    name="Main",
+                    base_url="https://stored.example/v1",
+                    api_key="sk-secret",
+                )
+            }
+        )
+        upstream_response = MagicMock(
+            status_code=401,
+            text="upstream echoed sk-secret",
+        )
+        http_client = MagicMock()
+        http_client.__enter__.return_value = http_client
+        http_client.get.return_value = upstream_response
+
+        with patch("httpx.Client", return_value=http_client):
+            response = client.post(
+                "/api/config/test-api", json={"provider_id": "main"}
+            )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is False
+        http_client.get.assert_called_once_with(
+            "https://stored.example/v1/models",
+            headers={"Authorization": "Bearer sk-secret"},
+        )
+        assert "sk-secret" not in response.text
+        assert "sk-secret" not in caplog.text
+
+    def test_fetch_models_uses_stored_credentials(self, client, mock_container):
+        from ...models.config import ProviderConfig, UIConfig
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig(
+            providers={
+                "main": ProviderConfig(
+                    id="main",
+                    name="Main",
+                    base_url="https://stored.example/v1",
+                    api_key="sk-secret",
+                )
+            }
+        )
+        upstream_response = MagicMock()
+        upstream_response.status_code = 200
+        upstream_response.json.return_value = {"data": [{"id": "model-1"}]}
+        http_client = MagicMock()
+        http_client.__enter__.return_value = http_client
+        http_client.get.return_value = upstream_response
+
+        with patch("httpx.Client", return_value=http_client):
+            response = client.post(
+                "/api/config/fetch-models", json={"provider_id": "main"}
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "models": [{"id": "model-1", "name": "model-1"}],
+        }
+        http_client.get.assert_called_once_with(
+            "https://stored.example/v1/models",
+            headers={"Authorization": "Bearer sk-secret"},
+        )
+        assert "sk-secret" not in response.text
+
+    def test_fetch_models_does_not_echo_key_from_exception(
+        self, client, mock_container, caplog
+    ):
+        from ...models.config import UIConfig
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig()
+        http_client = MagicMock()
+        http_client.__enter__.return_value = http_client
+        http_client.get.side_effect = RuntimeError("request rejected for sk-unsaved")
+
+        with patch("httpx.Client", return_value=http_client):
+            response = client.post(
+                "/api/config/fetch-models",
+                json={
+                    "base_url": "https://new.example/v1",
+                    "api_key": "sk-unsaved",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is False
+        assert "sk-unsaved" not in response.text
+        assert "sk-unsaved" not in caplog.text
 
 
 # 旧路由兼容性测试已移除 - api/routes.py 已删除
