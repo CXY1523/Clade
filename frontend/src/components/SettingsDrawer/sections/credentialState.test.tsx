@@ -94,6 +94,38 @@ describe("stored provider credential behavior", () => {
     expect(dispatch).toHaveBeenCalledWith({ type: "CLEAR_PROVIDER_API_KEY", providerId: "main" });
   });
 
+  it("clears by the selected provider map key when the embedded id is stale", () => {
+    const dispatch = vi.fn();
+    render(
+      <ConnectionSection
+        providers={{
+          "canonical-key": { ...storedProvider, id: "stale-id" },
+        }}
+        selectedProviderId="canonical-key"
+        testResults={{}}
+        testingProviderId={null}
+        showApiKeys={{}}
+        dispatch={dispatch}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "清除已保存密钥" }));
+    const confirmation = dispatch.mock.calls.find(
+      ([action]) => action.type === "SET_CONFIRM_DIALOG"
+    )?.[0];
+
+    confirmation.dialog.onConfirm();
+
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "CLEAR_PROVIDER_API_KEY",
+      providerId: "canonical-key",
+    });
+    expect(dispatch).not.toHaveBeenCalledWith({
+      type: "CLEAR_PROVIDER_API_KEY",
+      providerId: "stale-id",
+    });
+  });
+
   it("routes replacement input through the credential action", () => {
     const dispatch = vi.fn();
     render(

@@ -145,7 +145,7 @@ export const ConnectionSection = memo(function ConnectionSection({
     }
   }, [dispatch]);
 
-  const handleClearApiKey = useCallback((provider: ProviderConfig) => {
+  const handleClearApiKey = useCallback((providerId: string, provider: ProviderConfig) => {
     dispatch({
       type: "SET_CONFIRM_DIALOG",
       dialog: {
@@ -154,7 +154,7 @@ export const ConnectionSection = memo(function ConnectionSection({
         message: `确定要清除 ${provider.name} 已保存的 API Key 吗？保存配置后生效。`,
         variant: "danger",
         onConfirm: () => {
-          dispatch({ type: "CLEAR_PROVIDER_API_KEY", providerId: provider.id });
+          dispatch({ type: "CLEAR_PROVIDER_API_KEY", providerId });
         },
       },
     });
@@ -409,7 +409,7 @@ export const ConnectionSection = memo(function ConnectionSection({
                       <button
                         type="button"
                         className="btn btn-outline danger"
-                        onClick={() => handleClearApiKey(selectedProvider)}
+                        onClick={() => handleClearApiKey(selectedProviderId!, selectedProvider)}
                       >
                         清除已保存密钥
                       </button>
