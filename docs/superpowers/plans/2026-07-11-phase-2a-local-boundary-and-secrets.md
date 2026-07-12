@@ -445,7 +445,9 @@ Expected: `5 passed`.
 Create `backend/app/repositories/tests/test_environment_repository_config.py`:
 
 ```python
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier, Event, Lock
 
 from app.models.config import UIConfig
 from app.repositories.environment_repository import EnvironmentRepository
@@ -470,30 +472,93 @@ def test_save_ui_config_replaces_file_and_removes_temp_file(
     repo.save_ui_config(path, UIConfig(autosave_enabled=True))
 
     assert UIConfig.model_validate_json(path.read_text(encoding="utf-8")).autosave_enabled is True
-    assert replacements == [(path.with_suffix(".json.tmp"), path)]
-    assert not path.with_suffix(".json.tmp").exists()
+    assert len(replacements) == 1
+    temp_path, target_path = replacements[0]
+    assert temp_path.parent == path.parent
+    assert temp_path != path
+    assert target_path == path
+    assert not temp_path.exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_concurrent_save_ui_config_uses_independent_temp_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "settings.json"
+    repo = EnvironmentRepository()
+    write_barrier = Barrier(2)
+    replace_barrier = Barrier(2)
+    first_replace_done = Event()
+    replacements: list[tuple[Path, Path, bool]] = []
+    replacements_lock = Lock()
+    original_replace = Path.replace
+    original_write_text = Path.write_text
+
+    def synchronized_write_text(destination: Path, data: str, **kwargs) -> int:
+        written = original_write_text(destination, data, **kwargs)
+        if destination == path.with_suffix(path.suffix + ".tmp"):
+            write_barrier.wait(timeout=5)
+        return written
+
+    def synchronized_replace(source: Path, target: Path) -> Path:
+        saved = UIConfig.model_validate_json(source.read_text(encoding="utf-8"))
+        with replacements_lock:
+            replacement_order = len(replacements)
+            replacements.append((source, target, saved.autosave_enabled))
+        replace_barrier.wait(timeout=5)
+        if replacement_order == 0:
+            try:
+                return original_replace(source, target)
+            finally:
+                first_replace_done.set()
+        first_replace_done.wait(timeout=5)
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "write_text", synchronized_write_text)
+    monkeypatch.setattr(Path, "replace", synchronized_replace)
+
+    configs = [UIConfig(autosave_enabled=False), UIConfig(autosave_enabled=True)]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(repo.save_ui_config, path, config) for config in configs]
+        exceptions = [future.exception(timeout=5) for future in futures]
+
+    assert exceptions == [None, None]
+    assert len({source for source, _, _ in replacements}) == 2
+    assert {target for _, target, _ in replacements} == {path}
+    assert {enabled for _, _, enabled in replacements} == {False, True}
+    assert list(tmp_path.glob("*.tmp")) == []
 ```
 
 Run: `cd backend; .venv\Scripts\python.exe -m pytest app/repositories/tests/test_environment_repository_config.py -q`
 
-Expected: fail because the implementation writes directly instead of using the expected temporary path.
+Expected: the direct writer fails the replacement test; the fixed-name temporary
+writer fails the controlled concurrent test with `FileNotFoundError`.
 
 - [ ] **Step 6: Save the configuration atomically**
 
-Replace `save_ui_config` with:
+Import `NamedTemporaryFile` from `tempfile`, then replace `save_ui_config` with:
 
 ```python
     def save_ui_config(self, path: Path, config: UIConfig) -> UIConfig:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(path.suffix + ".tmp")
+        temp_path: Path | None = None
         try:
-            temp_path.write_text(
-                config.model_dump_json(indent=2, ensure_ascii=False),
+            with NamedTemporaryFile(
+                mode="w",
                 encoding="utf-8",
-            )
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                temp_file.write(config.model_dump_json(indent=2, ensure_ascii=False))
+                temp_file.flush()
             temp_path.replace(path)
         finally:
-            temp_path.unlink(missing_ok=True)
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
         logger.debug(f"[配置] 已保存配置到 {path}")
         return config
 ```

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Iterable
+from tempfile import NamedTemporaryFile
 from typing import Generator
 
 from pathlib import Path
@@ -120,15 +121,23 @@ class EnvironmentRepository:
     def save_ui_config(self, path: Path, config: UIConfig) -> UIConfig:
         """保存 UI 配置到 JSON 文件"""
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(path.suffix + ".tmp")
+        temp_path: Path | None = None
         try:
-            temp_path.write_text(
-                config.model_dump_json(indent=2, ensure_ascii=False),
+            with NamedTemporaryFile(
+                mode="w",
                 encoding="utf-8",
-            )
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                temp_file.write(config.model_dump_json(indent=2, ensure_ascii=False))
+                temp_file.flush()
             temp_path.replace(path)
         finally:
-            temp_path.unlink(missing_ok=True)
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
         logger.debug(f"[配置] 已保存配置到 {path}")
         return config
 
