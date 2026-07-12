@@ -119,9 +119,16 @@ class EnvironmentRepository:
 
     def save_ui_config(self, path: Path, config: UIConfig) -> UIConfig:
         """保存 UI 配置到 JSON 文件"""
-        # 1. 保存到 JSON 文件
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(config.model_dump_json(indent=2, ensure_ascii=False), encoding="utf-8")
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            temp_path.write_text(
+                config.model_dump_json(indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            temp_path.replace(path)
+        finally:
+            temp_path.unlink(missing_ok=True)
         logger.debug(f"[配置] 已保存配置到 {path}")
         return config
 
