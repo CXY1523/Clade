@@ -228,12 +228,113 @@ class TestNewRouterIntegration:
         request_body = document["paths"]["/api/config/ui"]["post"]["requestBody"]
         schema = request_body["content"]["application/json"]["schema"]
 
+        def local_definition_refs(value):
+            if isinstance(value, dict):
+                reference = value.get("$ref")
+                if isinstance(reference, str) and reference.startswith("#/$defs/"):
+                    yield reference
+                for nested in value.values():
+                    yield from local_definition_refs(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    yield from local_definition_refs(nested)
+
         assert request_body["required"] is True
         assert set(schema.get("properties", {})) >= {
             "config",
             "clear_provider_api_keys",
         }
         assert schema.get("title") != "Raw Request"
+        assert list(local_definition_refs(schema)) == []
+        config_schema = schema["properties"]["config"]
+        assert set(config_schema.get("properties", {})) >= {
+            "providers",
+            "capability_routes",
+        }
+
+    def test_openapi_schema_inlining_rejects_recursive_definitions(self):
+        from ..analytics import _inline_local_schema_definitions
+
+        recursive_schema = {
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "child": {"$ref": "#/$defs/Node"},
+                    },
+                },
+            },
+            "$ref": "#/$defs/Node",
+        }
+
+        with pytest.raises(ValueError, match="Recursive schema reference"):
+            _inline_local_schema_definitions(recursive_schema)
+
+    @pytest.mark.parametrize(
+        "content_type",
+        ["text/plain", None],
+        ids=["text-plain", "missing"],
+    )
+    def test_post_config_rejects_non_json_media_type(
+        self, client, mock_container, content_type
+    ):
+        from ...models.config import UIConfig
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig()
+        mock_container.settings.ui_config_path = "data/test-settings.json"
+        mock_container.environment_repository.save_ui_config.side_effect = (
+            lambda _path, config: config
+        )
+        runtime_routes = MagicMock()
+        headers = {"content-type": content_type} if content_type else {}
+
+        with (
+            patch("app.api.analytics.configure_model_router"),
+            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
+        ):
+            response = client.post(
+                "/api/config/ui",
+                content=b'{"config":{"providers":{}}}',
+                headers=headers,
+            )
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": "Invalid configuration payload"}
+        assert "providers" not in response.text
+        mock_container.environment_repository.save_ui_config.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "content_type",
+        [
+            "application/json; charset=utf-8",
+            "application/problem+json; charset=utf-8",
+        ],
+        ids=["application-json", "structured-json"],
+    )
+    def test_post_config_accepts_json_media_type_with_parameters(
+        self, client, mock_container, content_type
+    ):
+        from ...models.config import UIConfig
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig()
+        mock_container.settings.ui_config_path = "data/test-settings.json"
+        mock_container.environment_repository.save_ui_config.side_effect = (
+            lambda _path, config: config
+        )
+        runtime_routes = MagicMock()
+
+        with (
+            patch("app.api.analytics.configure_model_router"),
+            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
+        ):
+            response = client.post(
+                "/api/config/ui",
+                content=b'{"config":{"providers":{}}}',
+                headers={"content-type": content_type},
+            )
+
+        assert response.status_code == 200
+        mock_container.environment_repository.save_ui_config.assert_called_once()
 
     def test_post_config_preserves_empty_key(self, client, mock_container):
         from ...models.config import ProviderConfig, UIConfig

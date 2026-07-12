@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
@@ -268,7 +268,71 @@ def get_ui_config(
     return public_ui_config(container.config_service.get_ui_config())
 
 
+def _inline_local_schema_definitions(schema: dict[str, Any]) -> dict[str, Any]:
+    definitions = schema.get("$defs", {})
+    if not isinstance(definitions, dict):
+        raise ValueError("Schema definitions must be an object")
+
+    def expand(value: Any, active_references: frozenset[str]) -> Any:
+        if isinstance(value, list):
+            return [expand(item, active_references) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        reference = value.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            if reference in active_references:
+                raise ValueError(f"Recursive schema reference: {reference}")
+
+            definition_name = reference.removeprefix("#/$defs/")
+            definition = definitions.get(definition_name)
+            if not isinstance(definition, dict):
+                raise ValueError(f"Unknown local schema reference: {reference}")
+
+            next_references = active_references | {reference}
+            expanded_reference = expand(definition, next_references)
+            siblings = {
+                key: expand(item, next_references)
+                for key, item in value.items()
+                if key != "$ref"
+            }
+            if siblings:
+                return {"allOf": [expanded_reference], **siblings}
+            return expanded_reference
+
+        return {
+            key: expand(item, active_references)
+            for key, item in value.items()
+            if key != "$defs"
+        }
+
+    expanded = expand(schema, frozenset())
+    if not isinstance(expanded, dict):
+        raise ValueError("Schema root must be an object")
+    return expanded
+
+
+def _is_json_media_type(content_type: str | None) -> bool:
+    if not content_type:
+        return False
+
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if media_type == "application/json":
+        return True
+    return (
+        media_type.startswith("application/")
+        and media_type.endswith("+json")
+        and len(media_type) > len("application/+json")
+    )
+
+
 async def _parse_ui_config_update(request: Request) -> UIConfigUpdateRequest:
+    if not _is_json_media_type(request.headers.get("content-type")):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid configuration payload",
+        )
+
     try:
         raw_request = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -299,7 +363,9 @@ async def _parse_ui_config_update(request: Request) -> UIConfigUpdateRequest:
             "required": True,
             "content": {
                 "application/json": {
-                    "schema": UIConfigUpdateRequest.model_json_schema(),
+                    "schema": _inline_local_schema_definitions(
+                        UIConfigUpdateRequest.model_json_schema()
+                    ),
                 },
             },
         },
