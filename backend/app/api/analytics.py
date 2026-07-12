@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
+from pydantic import ValidationError
 
 from ..security.config_secrets import (
     UIConfigUpdateRequest,
@@ -268,10 +269,18 @@ def get_ui_config(
 
 @router.post("/config/ui")
 def update_ui_config(
-    request: UIConfigUpdateRequest,
+    raw_request: Any = Body(...),
     container: 'ServiceContainer' = Depends(get_container),
 ) -> dict:
     """更新 UI 配置"""
+    try:
+        request = UIConfigUpdateRequest.model_validate(raw_request)
+    except ValidationError:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid configuration payload",
+        ) from None
+
     env_repo = container.environment_repository
     config_service = container.config_service
 
@@ -295,16 +304,22 @@ def update_ui_config(
     try:
         configure_model_router(saved, container.model_router, container.embedding_service, container.settings)
         logger.info("[配置] 容器 ModelRouter 已更新")
-    except Exception:
-        logger.warning("[配置] 更新容器 ModelRouter 失败")
+    except Exception as exc:
+        logger.warning(
+            "[配置] 更新容器 ModelRouter 失败 (error_type=%s)",
+            type(exc).__name__,
+        )
     
     # 【修复】应用 AI 配置到 ModelRouter（负载均衡、服务商路由等）
     try:
         from . import routes
         routes.apply_ui_config(saved)
         logger.info("[配置] AI 服务商配置已应用")
-    except Exception:
-        logger.warning("[配置] 应用 AI 配置失败（不影响其他配置）")
+    except Exception as exc:
+        logger.warning(
+            "[配置] 应用 AI 配置失败（不影响其他配置） (error_type=%s)",
+            type(exc).__name__,
+        )
     
     # 【修复】刷新 SimulationEngine 及子服务的配置（分化、死亡率、生态平衡等）
     try:
@@ -318,8 +333,12 @@ def update_ui_config(
         }
         routes.simulation_engine.reload_configs(new_configs)
         logger.info("[配置] 游戏参数配置已刷新到引擎")
-    except Exception:
-        logger.warning("[配置] 刷新引擎配置失败（将在下次推演时自动加载）")
+    except Exception as exc:
+        logger.warning(
+            "[配置] 刷新引擎配置失败（将在下次推演时自动加载） "
+            "(error_type=%s)",
+            type(exc).__name__,
+        )
     
     return public_ui_config(saved)
 

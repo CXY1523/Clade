@@ -171,6 +171,33 @@ class TestNewRouterIntegration:
         assert body["providers"]["main"]["api_key_configured"] is True
         assert "sk-secret" not in response.text
 
+    def test_post_config_validation_error_does_not_echo_nested_key(self, client):
+        secret = "sk-validation-secret"
+
+        response = client.post(
+            "/api/config/ui",
+            json={
+                "config": {
+                    "providers": [
+                        {"id": "main", "name": "Main", "api_key": secret}
+                    ]
+                }
+            },
+        )
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": "Invalid configuration payload"}
+        assert secret not in response.text
+
+    def test_post_config_non_object_body_does_not_echo_body(self, client):
+        secret = "sk-non-object-secret"
+
+        response = client.post("/api/config/ui", json=secret)
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": "Invalid configuration payload"}
+        assert secret not in response.text
+
     def test_post_config_preserves_empty_key(self, client, mock_container):
         from ...models.config import ProviderConfig, UIConfig
 
@@ -187,9 +214,22 @@ class TestNewRouterIntegration:
             lambda _path, config: config
         )
         runtime_routes = MagicMock()
+        refresh_order = []
+        mock_container.config_service.invalidate_cache.side_effect = (
+            lambda: refresh_order.append("cache")
+        )
+        runtime_routes.apply_ui_config.side_effect = (
+            lambda _saved: refresh_order.append("apply")
+        )
+        runtime_routes.simulation_engine.reload_configs.side_effect = (
+            lambda _configs: refresh_order.append("reload")
+        )
 
         with (
-            patch("app.api.analytics.configure_model_router") as configure_router,
+            patch(
+                "app.api.analytics.configure_model_router",
+                side_effect=lambda *_args: refresh_order.append("configure"),
+            ) as configure_router,
             patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
         ):
             response = client.post(
@@ -215,6 +255,8 @@ class TestNewRouterIntegration:
         )
         runtime_routes.apply_ui_config.assert_called_once_with(saved)
         runtime_routes.simulation_engine.reload_configs.assert_called_once()
+        mock_container.config_service.invalidate_cache.assert_called_once_with()
+        assert refresh_order == ["cache", "configure", "apply", "reload"]
         assert "sk-secret" not in response.text
 
     def test_post_config_save_failure_does_not_refresh_runtime(
@@ -262,17 +304,27 @@ class TestNewRouterIntegration:
             lambda _path, config: config
         )
         runtime_routes = MagicMock()
-        runtime_routes.apply_ui_config.side_effect = RuntimeError(
-            "apply failed for sk-secret"
+        refresh_order = []
+        mock_container.config_service.invalidate_cache.side_effect = (
+            lambda: refresh_order.append("cache")
         )
-        runtime_routes.simulation_engine.reload_configs.side_effect = RuntimeError(
-            "reload failed for sk-secret"
+
+        def fail_refresh(stage):
+            def fail(*_args):
+                refresh_order.append(stage)
+                raise RuntimeError(f"{stage} failed for sk-secret")
+
+            return fail
+
+        runtime_routes.apply_ui_config.side_effect = fail_refresh("apply")
+        runtime_routes.simulation_engine.reload_configs.side_effect = fail_refresh(
+            "reload"
         )
 
         with (
             patch(
                 "app.api.analytics.configure_model_router",
-                side_effect=RuntimeError("configure failed for sk-secret"),
+                side_effect=fail_refresh("configure"),
             ),
             patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
         ):
@@ -289,6 +341,8 @@ class TestNewRouterIntegration:
             )
 
         assert response.status_code == 200
+        assert refresh_order == ["cache", "configure", "apply", "reload"]
+        assert caplog.text.count("RuntimeError") == 3
         assert "sk-secret" not in response.text
         assert "sk-secret" not in caplog.text
 
