@@ -198,6 +198,43 @@ class TestNewRouterIntegration:
         assert response.json() == {"detail": "Invalid configuration payload"}
         assert secret not in response.text
 
+    @pytest.mark.parametrize(
+        ("body", "secret"),
+        [
+            (b"null", None),
+            (b"", None),
+            (b'{"api_key":"sk-bad-json-secret"', "sk-bad-json-secret"),
+        ],
+        ids=["null", "empty", "invalid-json"],
+    )
+    def test_post_config_unparseable_body_uses_safe_422(
+        self, client, body, secret
+    ):
+        response = client.post(
+            "/api/config/ui",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": "Invalid configuration payload"}
+        assert '"input"' not in response.text
+        assert '"ctx"' not in response.text
+        if secret:
+            assert secret not in response.text
+
+    def test_post_config_openapi_documents_update_envelope(self, client):
+        document = client.get("/openapi.json").json()
+        request_body = document["paths"]["/api/config/ui"]["post"]["requestBody"]
+        schema = request_body["content"]["application/json"]["schema"]
+
+        assert request_body["required"] is True
+        assert set(schema.get("properties", {})) >= {
+            "config",
+            "clear_provider_api_keys",
+        }
+        assert schema.get("title") != "Raw Request"
+
     def test_post_config_preserves_empty_key(self, client, mock_container):
         from ...models.config import ProviderConfig, UIConfig
 

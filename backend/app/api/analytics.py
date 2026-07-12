@@ -11,11 +11,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
 
 from ..security.config_secrets import (
@@ -267,20 +268,48 @@ def get_ui_config(
     return public_ui_config(container.config_service.get_ui_config())
 
 
-@router.post("/config/ui")
-def update_ui_config(
-    raw_request: Any = Body(...),
-    container: 'ServiceContainer' = Depends(get_container),
-) -> dict:
-    """更新 UI 配置"""
+async def _parse_ui_config_update(request: Request) -> UIConfigUpdateRequest:
     try:
-        request = UIConfigUpdateRequest.model_validate(raw_request)
+        raw_request = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid configuration payload",
+        ) from None
+
+    if not isinstance(raw_request, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid configuration payload",
+        )
+
+    try:
+        return UIConfigUpdateRequest.model_validate(raw_request)
     except ValidationError:
         raise HTTPException(
             status_code=422,
             detail="Invalid configuration payload",
         ) from None
 
+
+@router.post(
+    "/config/ui",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": UIConfigUpdateRequest.model_json_schema(),
+                },
+            },
+        },
+    },
+)
+def update_ui_config(
+    request: UIConfigUpdateRequest = Depends(_parse_ui_config_update),
+    container: 'ServiceContainer' = Depends(get_container),
+) -> dict:
+    """更新 UI 配置"""
     env_repo = container.environment_repository
     config_service = container.config_service
 
