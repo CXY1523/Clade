@@ -56,6 +56,26 @@ describe("config API credential payloads", () => {
     });
   });
 
+  it("uses the provider map key as the canonical clear identifier", async () => {
+    const mismatchedIdConfig = {
+      ...config,
+      providers: {
+        canonical: {
+          ...config.providers.main,
+          id: "stale-provider-id",
+        },
+      },
+    } satisfies UIConfig;
+    mocks.post.mockResolvedValue(mismatchedIdConfig);
+
+    await updateUIConfig(mismatchedIdConfig);
+
+    expect(mocks.post).toHaveBeenCalledWith("/api/config/ui", {
+      config: mismatchedIdConfig,
+      clear_provider_api_keys: ["canonical"],
+    });
+  });
+
   it("identifies a provider when testing with its stored key", async () => {
     mocks.post.mockResolvedValue({ success: true, message: "ok" });
 

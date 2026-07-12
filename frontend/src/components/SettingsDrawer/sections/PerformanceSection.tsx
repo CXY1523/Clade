@@ -15,6 +15,9 @@ interface Props {
   dispatch: Dispatch<SettingsAction>;
 }
 
+const hasUsableApiKey = (provider: ProviderConfig) =>
+  Boolean(provider.api_key || provider.api_key_configured) && !provider.api_key_clear_requested;
+
 // 预设配置
 const PRESETS = [
   {
@@ -138,7 +141,7 @@ export const PerformanceSection = memo(function PerformanceSection({
   };
 
   // 获取可用的服务商列表
-  const providerList = Object.values(providers).filter((p) => p.api_key);
+  const providerList = Object.values(providers).filter(hasUsableApiKey);
 
   // 获取服务商的模型列表（排除禁用的）
   const getProviderModels = (providerId: string): string[] => {

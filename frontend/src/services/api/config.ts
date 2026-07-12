@@ -20,9 +20,9 @@ export async function fetchUIConfig(): Promise<UIConfig> {
  */
 export async function updateUIConfig(config: UIConfig): Promise<UIConfig> {
   console.log("[API] 保存配置...");
-  const clearProviderApiKeys = Object.values(config.providers || {})
-    .filter((provider) => provider.api_key_clear_requested)
-    .map((provider) => provider.id);
+  const clearProviderApiKeys = Object.entries(config.providers || {})
+    .filter(([, provider]) => provider.api_key_clear_requested)
+    .map(([providerId]) => providerId);
   const result = await http.post<UIConfig>("/api/config/ui", {
     config,
     clear_provider_api_keys: clearProviderApiKeys,

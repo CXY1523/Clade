@@ -159,4 +159,24 @@ describe("stored provider credential behavior", () => {
       );
     });
   });
+
+  it("keeps an embedding provider pending clear unavailable", () => {
+    const { container } = render(
+      <EmbeddingSection
+        providers={{
+          main: { ...storedProvider, api_key_clear_requested: true },
+        }}
+        embeddingProvider={null}
+        embeddingProviderId="main"
+        embeddingModel="embedding-test"
+        dispatch={vi.fn()}
+      />
+    );
+    const testButton = container.querySelector<HTMLButtonElement>(".card .btn-primary");
+
+    expect(screen.queryByRole("option", { name: /Main/ })).toBeNull();
+    expect(testButton).toBeDisabled();
+    fireEvent.click(testButton!);
+    expect(apiMocks.testApiConnection).not.toHaveBeenCalled();
+  });
 });
