@@ -20,7 +20,13 @@ export async function fetchUIConfig(): Promise<UIConfig> {
  */
 export async function updateUIConfig(config: UIConfig): Promise<UIConfig> {
   console.log("[API] 保存配置...");
-  const result = await http.post<UIConfig>("/api/config/ui", config);
+  const clearProviderApiKeys = Object.values(config.providers || {})
+    .filter((provider) => provider.api_key_clear_requested)
+    .map((provider) => provider.id);
+  const result = await http.post<UIConfig>("/api/config/ui", {
+    config,
+    clear_provider_api_keys: clearProviderApiKeys,
+  });
   console.log("[API] 配置保存成功");
   return result;
 }
@@ -29,6 +35,7 @@ export async function updateUIConfig(config: UIConfig): Promise<UIConfig> {
 
 export interface ApiTestParams {
   type: "chat" | "embedding";
+  provider_id?: string;
   base_url: string;
   api_key: string;
   model: string;
@@ -72,6 +79,7 @@ export interface FetchModelsResult {
  * 获取服务商的模型列表
  */
 export async function fetchProviderModels(params: {
+  provider_id?: string;
   base_url: string;
   api_key: string;
   provider_type: "openai" | "anthropic" | "google";

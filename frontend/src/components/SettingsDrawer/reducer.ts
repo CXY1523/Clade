@@ -131,6 +131,39 @@ export function settingsReducer(state: SettingsState, action: SettingsAction): S
         },
       };
 
+    case "UPDATE_PROVIDER_API_KEY":
+      return {
+        ...state,
+        form: {
+          ...state.form,
+          providers: {
+            ...state.form.providers,
+            [action.providerId]: {
+              ...state.form.providers[action.providerId],
+              api_key: action.apiKey,
+              api_key_clear_requested: false,
+            },
+          },
+        },
+      };
+
+    case "CLEAR_PROVIDER_API_KEY":
+      return {
+        ...state,
+        form: {
+          ...state.form,
+          providers: {
+            ...state.form.providers,
+            [action.providerId]: {
+              ...state.form.providers[action.providerId],
+              api_key: "",
+              api_key_configured: false,
+              api_key_clear_requested: true,
+            },
+          },
+        },
+      };
+
     case "ADD_PROVIDER":
       return {
         ...state,
