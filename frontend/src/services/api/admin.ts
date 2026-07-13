@@ -33,11 +33,11 @@ export async function resetWorld(
 /**
  * 删除数据库
  */
-export async function dropDatabase(adminToken?: string): Promise<{ success: boolean }> {
+export async function dropDatabase(adminToken: string): Promise<{ success: boolean }> {
   return http.post(
     "/api/admin/drop-database",
     { confirm: true },
-    adminToken === undefined ? undefined : adminRequestConfig(adminToken)
+    adminRequestConfig(adminToken)
   );
 }
 
