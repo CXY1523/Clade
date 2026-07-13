@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiMocks = vi.hoisted(() => ({
   checkHealth: vi.fn(),
@@ -31,6 +31,11 @@ describe("AdminPanel destructive reset safety gate", () => {
       vi.fn(() => true)
     );
     vi.stubGlobal("alert", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("passes the entered administrator token to the destructive API", async () => {
