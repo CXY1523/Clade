@@ -1024,8 +1024,9 @@ class SaveManager:
             if hasattr(environment_repository, 'get_habitat_stats'):
                 stats["habitat_stats"] = environment_repository.get_habitat_stats()
                 
-        except Exception as e:
-            stats["error"] = str(e)
+        except Exception:
+            stats["error"] = "无法获取存储统计信息"
+            logger.error("[存档管理器] 获取存储统计失败")
         
         return stats
 

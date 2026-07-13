@@ -220,3 +220,51 @@ def test_storage_stats_omit_save_root(tmp_path: Path) -> None:
 
     assert "saves_dir" not in stats
     assert str(manager.saves_dir) not in json.dumps(stats, ensure_ascii=False)
+
+
+def test_storage_stats_redact_filesystem_errors_from_response_and_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    root = tmp_path / "saves"
+    contained = write_historical_save(
+        root,
+        "save_20200101_000000_stats-error",
+        HISTORICAL_DISPLAY_NAME,
+    ).resolve()
+    manager = SaveManager(root)
+    sensitive_error = OSError(
+        f"scan failed for {manager.saves_dir} and {contained}"
+    )
+
+    def fail_rglob(path: Path, pattern: str):
+        assert path == contained
+        assert pattern == "*"
+        raise sensitive_error
+
+    caplog.set_level(logging.ERROR)
+    with monkeypatch.context() as file_scan:
+        file_scan.setattr(Path, "rglob", fail_rglob)
+        stats = manager.get_storage_stats()
+
+    assert stats == {
+        "save_count": 1,
+        "total_size_mb": 0,
+        "largest_save": None,
+        "habitat_stats": {},
+        "error": "无法获取存储统计信息",
+    }
+    assert any(
+        record.getMessage() == "[存档管理器] 获取存储统计失败"
+        for record in caplog.records
+    )
+
+    output_text = json.dumps(stats, ensure_ascii=False)
+    for sensitive_value in (
+        str(manager.saves_dir),
+        str(contained),
+        str(sensitive_error),
+    ):
+        assert sensitive_value not in output_text
+        assert sensitive_value not in caplog.text
