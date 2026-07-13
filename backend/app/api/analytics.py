@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from threading import RLock
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="", tags=["analytics"])
+_UI_CONFIG_UPDATE_LOCK = RLock()
 
 
 # ========== 导出 ==========
@@ -335,6 +337,18 @@ def _is_json_media_type(content_type: str | None) -> bool:
 
 
 async def _parse_ui_config_update(request: Request) -> UIConfigUpdateRequest:
+    raw_request = await _parse_safe_json_object(request)
+
+    try:
+        return UIConfigUpdateRequest.model_validate(raw_request)
+    except ValidationError:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid configuration payload",
+        ) from None
+
+
+async def _parse_safe_json_object(request: Request) -> dict[str, Any]:
     if not _is_json_media_type(request.headers.get("content-type")):
         raise HTTPException(
             status_code=422,
@@ -355,13 +369,23 @@ async def _parse_ui_config_update(request: Request) -> UIConfigUpdateRequest:
             detail="Invalid configuration payload",
         )
 
-    try:
-        return UIConfigUpdateRequest.model_validate(raw_request)
-    except ValidationError:
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid configuration payload",
-        ) from None
+    return raw_request
+
+
+def _json_object_request_openapi() -> dict[str, Any]:
+    return {
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                },
+            },
+        },
+    }
 
 
 @router.post(
@@ -382,6 +406,14 @@ async def _parse_ui_config_update(request: Request) -> UIConfigUpdateRequest:
 def update_ui_config(
     request: UIConfigUpdateRequest = Depends(_parse_ui_config_update),
     container: 'ServiceContainer' = Depends(get_container),
+) -> dict:
+    with _UI_CONFIG_UPDATE_LOCK:
+        return _update_ui_config(request, container)
+
+
+def _update_ui_config(
+    request: UIConfigUpdateRequest,
+    container: 'ServiceContainer',
 ) -> dict:
     """更新 UI 配置"""
     env_repo = container.environment_repository
@@ -452,9 +484,9 @@ def update_ui_config(
     return public_ui_config(saved)
 
 
-@router.post("/config/test-api")
+@router.post("/config/test-api", openapi_extra=_json_object_request_openapi())
 def test_api_connection(
-    request: dict,
+    request: dict[str, Any] = Depends(_parse_safe_json_object),
     container: 'ServiceContainer' = Depends(get_container),
 ) -> dict:
     """测试 API 连接是否有效"""
@@ -506,9 +538,9 @@ def test_api_connection(
         return {"success": False, "error": "请求失败"}
 
 
-@router.post("/config/fetch-models")
+@router.post("/config/fetch-models", openapi_extra=_json_object_request_openapi())
 def fetch_models(
-    request: dict,
+    request: dict[str, Any] = Depends(_parse_safe_json_object),
     container: 'ServiceContainer' = Depends(get_container),
 ) -> dict:
     """获取服务商的可用模型列表"""

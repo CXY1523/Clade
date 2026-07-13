@@ -3,11 +3,15 @@
  * 单列布局，清晰的卡片分组
  */
 
-import { memo, useState, type Dispatch } from "react";
+import { memo, useMemo, useState, type Dispatch } from "react";
 import type { UIConfig, ProviderConfig, CapabilityRouteConfig } from "@/services/api.types";
 import type { SettingsAction } from "../types";
 import { SectionHeader, Card, SliderRow, NumberInput, ToggleRow, InfoBox, SelectRow } from "../common/Controls";
-import { getProviderLogo } from "../reducer";
+import {
+  canonicalizeProviderRecords,
+  getCanonicalProviderId,
+  getProviderLogo,
+} from "../reducer";
 
 interface Props {
   config: UIConfig;
@@ -141,11 +145,12 @@ export const PerformanceSection = memo(function PerformanceSection({
   };
 
   // 获取可用的服务商列表
-  const providerList = Object.values(providers).filter(hasUsableApiKey);
+  const canonicalProviders = useMemo(() => canonicalizeProviderRecords(providers), [providers]);
+  const providerList = Object.values(canonicalProviders).filter(hasUsableApiKey);
 
   // 获取服务商的模型列表（排除禁用的）
   const getProviderModels = (providerId: string): string[] => {
-    const provider = providers[providerId];
+    const provider = canonicalProviders[providerId];
     if (!provider?.models) return [];
     const disabledModels = provider.disabled_models || [];
     return provider.models.filter(m => !disabledModels.includes(m));
@@ -153,7 +158,11 @@ export const PerformanceSection = memo(function PerformanceSection({
 
   // 获取功能路由配置
   const getCapabilityRoute = (capKey: string): CapabilityRouteConfig => {
-    return config.capability_routes?.[capKey] || { timeout: 60 };
+    const route = config.capability_routes?.[capKey] || { timeout: 60 };
+    return {
+      ...route,
+      provider_id: getCanonicalProviderId(providers, route.provider_id),
+    };
   };
 
   // 判断功能是否使用自定义配置
@@ -162,7 +171,10 @@ export const PerformanceSection = memo(function PerformanceSection({
     return !!(route?.provider_id || route?.model);
   };
 
-  const defaultProviderId = config.default_provider_id || config.ai_provider || null;
+  const defaultProviderId = getCanonicalProviderId(
+    providers,
+    config.default_provider_id || config.ai_provider
+  ) || null;
   const defaultModel = config.default_model || config.ai_model || null;
   const aiTimeout = config.ai_timeout || 60;
 
@@ -265,7 +277,7 @@ export const PerformanceSection = memo(function PerformanceSection({
                           desc="留空则使用默认服务商"
                           value={route.provider_id || ""}
                           options={[
-                            { value: "", label: `使用默认 ${defaultProviderId ? `(${providers[defaultProviderId]?.name || defaultProviderId})` : ''}` },
+                            { value: "", label: `使用默认 ${defaultProviderId ? `(${canonicalProviders[defaultProviderId]?.name || defaultProviderId})` : ''}` },
                             ...providerList.map(p => ({ value: p.id, label: `${getProviderLogo(p)} ${p.name}` }))
                           ]}
                           onChange={(v) => handleRouteUpdate(cap.key, "provider_id", v || null)}

@@ -126,6 +126,41 @@ describe("stored provider credential behavior", () => {
     });
   });
 
+  it("uses the provider record key for connection selection, edits, tests, and model fetches", async () => {
+    const dispatch = vi.fn();
+    const { container } = render(
+      <ConnectionSection
+        providers={{
+          "canonical-key": { ...storedProvider, id: "stale-id" },
+        }}
+        selectedProviderId="canonical-key"
+        testResults={{}}
+        testingProviderId={null}
+        showApiKeys={{}}
+        dispatch={dispatch}
+      />
+    );
+
+    fireEvent.click(container.querySelector<HTMLElement>(".provider-item")!);
+    fireEvent.change(screen.getByDisplayValue("Main"), { target: { value: "Renamed" } });
+    const actionButtons = container.querySelectorAll<HTMLButtonElement>(".form-actions button");
+    fireEvent.click(actionButtons[0]);
+    fireEvent.click(actionButtons[1]);
+
+    expect(dispatch).toHaveBeenCalledWith({ type: "SELECT_PROVIDER", id: "canonical-key" });
+    expect(dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "UPDATE_PROVIDER", id: "canonical-key", value: "Renamed" })
+    );
+    await waitFor(() => {
+      expect(apiMocks.testApiConnection).toHaveBeenCalledWith(
+        expect.objectContaining({ provider_id: "canonical-key" })
+      );
+      expect(apiMocks.fetchProviderModels).toHaveBeenCalledWith(
+        expect.objectContaining({ provider_id: "canonical-key" })
+      );
+    });
+  });
+
   it("routes replacement input through the credential action", () => {
     const dispatch = vi.fn();
     render(
@@ -188,6 +223,38 @@ describe("stored provider credential behavior", () => {
     await waitFor(() => {
       expect(apiMocks.testApiConnection).toHaveBeenCalledWith(
         expect.objectContaining({ type: "embedding", provider_id: "main", api_key: "" })
+      );
+    });
+  });
+
+  it("uses the provider record key for embedding selection and requests", async () => {
+    const dispatch = vi.fn();
+    const { container } = render(
+      <EmbeddingSection
+        providers={{
+          "canonical-key": { ...storedProvider, id: "stale-id" },
+        }}
+        embeddingProvider={null}
+        embeddingProviderId="canonical-key"
+        embeddingModel="embedding-test"
+        dispatch={dispatch}
+      />
+    );
+    const providerSelect = screen.getAllByRole("combobox")[0];
+    const providerOption = screen.getByRole<HTMLOptionElement>("option", { name: /Main/ });
+
+    expect(providerOption.value).toBe("canonical-key");
+    fireEvent.change(providerSelect, { target: { value: providerOption.value } });
+    fireEvent.click(container.querySelector<HTMLButtonElement>(".card .btn-primary")!);
+
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "UPDATE_GLOBAL",
+      field: "embedding_provider_id",
+      value: "canonical-key",
+    });
+    await waitFor(() => {
+      expect(apiMocks.testApiConnection).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "embedding", provider_id: "canonical-key" })
       );
     });
   });

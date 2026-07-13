@@ -42,6 +42,16 @@ export function isLoopbackHost(host: string): boolean {
   );
 }
 
+export function assertFrontendBindHostAllowed(
+  host: string | boolean | undefined,
+  lanEnabled: boolean
+): void {
+  const isLoopback = host === undefined || host === false || (typeof host === "string" && isLoopbackHost(host));
+  if (!lanEnabled && !isLoopback) {
+    throw new Error(`Non-loopback binding requires ALLOW_LAN_ACCESS=true: ${String(host)}`);
+  }
+}
+
 function readHost(value: string | undefined, name: string): string {
   if (value === undefined) return LOOPBACK_HOST;
   const host = value.trim();
@@ -63,9 +73,9 @@ export function resolveFrontendNetworkPolicy(env: NetworkEnvironment): FrontendN
   const lanEnabled = env.ALLOW_LAN_ACCESS?.trim().toLowerCase() === "true";
 
   if (!lanEnabled) {
-    const unsafe = [backendHost, frontendHost].filter((host) => !isLoopbackHost(host));
-    if (unsafe.length > 0) {
-      throw new Error(`Non-loopback binding requires ALLOW_LAN_ACCESS=true: ${unsafe.join(", ")}`);
+    assertFrontendBindHostAllowed(frontendHost, lanEnabled);
+    if (!isLoopbackHost(backendHost)) {
+      throw new Error(`Non-loopback binding requires ALLOW_LAN_ACCESS=true: ${backendHost}`);
     }
   }
 

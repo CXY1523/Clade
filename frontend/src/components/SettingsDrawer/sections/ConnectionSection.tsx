@@ -2,12 +2,18 @@
  * ConnectionSection - 服务商连接配置 (全新设计)
  */
 
-import { memo, useCallback, useEffect, useState, type Dispatch } from "react";
+import { memo, useCallback, useEffect, useMemo, useState, type Dispatch } from "react";
 import type { ProviderConfig, ProviderType } from "@/services/api.types";
 import type { SettingsAction, TestResult } from "../types";
 import { testApiConnection, fetchProviderModels, type ModelInfo } from "@/services/api";
 import { PROVIDER_API_TYPES } from "../constants";
-import { getProviderLogo, getProviderTypeBadge, generateId } from "../reducer";
+import {
+  canonicalizeProviderRecords,
+  generateId,
+  getCanonicalProviderId,
+  getProviderLogo,
+  getProviderTypeBadge,
+} from "../reducer";
 import { SectionHeader, ActionButton, InfoBox, ConfigGroup } from "../common/Controls";
 
 interface Props {
@@ -30,8 +36,12 @@ export const ConnectionSection = memo(function ConnectionSection({
   showApiKeys,
   dispatch,
 }: Props) {
-  const providerList = Object.values(providers);
-  const selectedProvider = selectedProviderId ? providers[selectedProviderId] : null;
+  const canonicalProviders = useMemo(() => canonicalizeProviderRecords(providers), [providers]);
+  const canonicalSelectedProviderId = getCanonicalProviderId(providers, selectedProviderId);
+  const providerList = Object.values(canonicalProviders);
+  const selectedProvider = canonicalSelectedProviderId
+    ? canonicalProviders[canonicalSelectedProviderId]
+    : null;
   const selectedProviderDefaultModel = selectedProvider?.selected_models?.[0] || "";
 
   const [fetchingModels, setFetchingModels] = useState<string | null>(null);
@@ -171,13 +181,13 @@ export const ConnectionSection = memo(function ConnectionSection({
         variant: "danger",
         onConfirm: () => {
           dispatch({ type: "REMOVE_PROVIDER", id });
-          if (selectedProviderId === id) {
+          if (canonicalSelectedProviderId === id) {
             dispatch({ type: "SELECT_PROVIDER", id: null });
           }
         },
       },
     });
-  }, [dispatch, selectedProviderId]);
+  }, [canonicalSelectedProviderId, dispatch]);
 
   // 获取模型列表
   const handleFetchModels = useCallback(async (provider: ProviderConfig) => {

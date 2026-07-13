@@ -3,11 +3,15 @@
  * 单列布局，配置语义搜索引擎
  */
 
-import { memo, useState, useCallback, type Dispatch } from "react";
+import { memo, useState, useCallback, useMemo, type Dispatch } from "react";
 import type { ProviderConfig } from "@/services/api.types";
 import type { SettingsAction, TestResult } from "../types";
 import { testApiConnection } from "@/services/api";
-import { getProviderLogo } from "../reducer";
+import {
+  canonicalizeProviderRecords,
+  getCanonicalProviderId,
+  getProviderLogo,
+} from "../reducer";
 import { EMBEDDING_PRESETS } from "../constants";
 import { SectionHeader, Card, FeatureGrid, InfoBox } from "../common/Controls";
 
@@ -37,9 +41,13 @@ export const EmbeddingSection = memo(function EmbeddingSection({
   embeddingSemanticHotspotLimit,
   dispatch,
 }: Props) {
-  const providerList = Object.values(providers).filter(hasUsableApiKey);
-  const effectiveProviderId = embeddingProviderId || embeddingProvider;
-  const selectedProvider = effectiveProviderId ? providers[effectiveProviderId] : null;
+  const canonicalProviders = useMemo(() => canonicalizeProviderRecords(providers), [providers]);
+  const providerList = Object.values(canonicalProviders).filter(hasUsableApiKey);
+  const effectiveProviderId = getCanonicalProviderId(
+    providers,
+    embeddingProviderId || embeddingProvider
+  );
+  const selectedProvider = effectiveProviderId ? canonicalProviders[effectiveProviderId] : null;
   const concurrencyEnabled = Boolean(embeddingConcurrencyEnabled);
   const concurrencyLimit = embeddingConcurrencyLimit && embeddingConcurrencyLimit > 0 ? embeddingConcurrencyLimit : 2;
   const hotspotOnly = Boolean(embeddingSemanticHotspotOnly);

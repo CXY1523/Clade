@@ -173,9 +173,19 @@ npm install
 npm run dev -- --host 127.0.0.1
 ```
 
-默认仅允许本机访问。只有确实需要局域网访问时，才同时设置
-`ALLOW_LAN_ACCESS=true`、`BACKEND_HOST=0.0.0.0` 和
-`FRONTEND_HOST=0.0.0.0`。局域网模式会暴露本地 API，请仅在可信网络中使用。
+以上手动命令固定为本机访问。只有确实需要局域网访问时，请先停止手动启动的
+前后端，再回到项目根目录，通过带安全检查的启动脚本显式开启：
+
+```powershell
+$env:ALLOW_LAN_ACCESS = "true"
+$env:BACKEND_HOST = "0.0.0.0"
+$env:FRONTEND_HOST = "0.0.0.0"
+.\start.ps1
+```
+
+不要只给手动命令添加 `--host 0.0.0.0`；这会绕过统一启动检查。局域网模式会
+暴露本地 API，请仅在可信网络中使用。使用完毕后关闭当前 PowerShell 窗口，或
+移除上述三个环境变量，再重新启动即可恢复默认的本机访问。
 
 **第三步：访问游戏**
 

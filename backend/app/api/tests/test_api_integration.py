@@ -580,6 +580,119 @@ class TestNewRouterIntegration:
         assert "sk-secret" not in response.text
         assert "sk-secret" not in caplog.text
 
+    def test_concurrent_config_updates_preserve_both_changes_and_refresh_in_disk_order(
+        self, client, mock_container, tmp_path
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event, Lock
+
+        from ...models.config import ProviderConfig, UIConfig
+        from ...repositories.environment_repository import EnvironmentRepository
+
+        path = tmp_path / "settings.json"
+        repository = EnvironmentRepository()
+        initial = UIConfig(
+            providers={
+                "main": ProviderConfig(
+                    id="main", name="Main", api_key="sk-original"
+                )
+            },
+            autosave_enabled=False,
+        )
+        repository.save_ui_config(path, initial)
+
+        state = {"current": initial}
+        state_lock = Lock()
+        first_read_started = Event()
+        second_read_started = Event()
+        replacement_saved = Event()
+        unrelated_refresh_started = Event()
+        read_count = 0
+        save_order = []
+        refresh_order = []
+
+        def get_ui_config():
+            nonlocal read_count
+            with state_lock:
+                snapshot = state["current"].model_copy(deep=True)
+                read_index = read_count
+                read_count += 1
+            if read_index == 0:
+                first_read_started.set()
+                second_read_started.wait(timeout=0.4)
+            else:
+                second_read_started.set()
+            return snapshot
+
+        def update_disk(_path, config):
+            label = "unrelated" if config.autosave_enabled else "replacement"
+            if label == "unrelated":
+                replacement_saved.wait(timeout=2)
+            saved = repository.save_ui_config(path, config)
+            with state_lock:
+                state["current"] = saved.model_copy(deep=True)
+                save_order.append(label)
+            if label == "replacement":
+                replacement_saved.set()
+            return saved
+
+        def refresh_router(saved, *_args):
+            label = "unrelated" if saved.autosave_enabled else "replacement"
+            if label == "replacement":
+                unrelated_refresh_started.wait(timeout=0.4)
+            else:
+                unrelated_refresh_started.set()
+            refresh_order.append(label)
+
+        mock_container.config_service.get_ui_config.side_effect = get_ui_config
+        mock_container.settings.ui_config_path = str(path)
+        mock_container.environment_repository.save_ui_config.side_effect = update_disk
+        runtime_routes = MagicMock()
+
+        replacement_payload = {
+            "config": {
+                "providers": {
+                    "main": {
+                        "id": "main",
+                        "name": "Main",
+                        "api_key": "sk-replaced",
+                    }
+                },
+                "autosave_enabled": False,
+            },
+            "clear_provider_api_keys": [],
+        }
+        unrelated_payload = {
+            "config": {
+                "providers": {
+                    "main": {"id": "main", "name": "Main", "api_key": ""}
+                },
+                "autosave_enabled": True,
+            },
+            "clear_provider_api_keys": [],
+        }
+
+        with (
+            patch("app.api.analytics.configure_model_router", side_effect=refresh_router),
+            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            replacement = executor.submit(
+                client.post, "/api/config/ui", json=replacement_payload
+            )
+            assert first_read_started.wait(timeout=2)
+            unrelated = executor.submit(
+                client.post, "/api/config/ui", json=unrelated_payload
+            )
+            responses = [replacement.result(timeout=5), unrelated.result(timeout=5)]
+
+        assert [response.status_code for response in responses] == [200, 200]
+        final = repository.load_ui_config(path)
+        assert final.providers["main"].api_key == "sk-replaced"
+        assert final.autosave_enabled is True
+        assert save_order == ["replacement", "unrelated"]
+        assert refresh_order == save_order
+
     def test_api_connection_uses_stored_credentials_without_echoing_them(
         self, client, mock_container, caplog
     ):
@@ -676,6 +789,69 @@ class TestNewRouterIntegration:
         assert response.json()["success"] is False
         assert "sk-unsaved" not in response.text
         assert "sk-unsaved" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["/api/config/test-api", "/api/config/fetch-models"],
+    )
+    @pytest.mark.parametrize(
+        "payload",
+        ["sk-scalar-secret", ["sk-list-secret"]],
+        ids=["scalar", "list"],
+    )
+    def test_config_action_non_object_body_uses_safe_422(
+        self, client, endpoint, payload
+    ):
+        secret = payload if isinstance(payload, str) else payload[0]
+
+        response = client.post(endpoint, json=payload)
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": "Invalid configuration payload"}
+        assert secret not in response.text
+        assert '"input"' not in response.text
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["/api/config/test-api", "/api/config/fetch-models"],
+    )
+    @pytest.mark.parametrize(
+        ("body", "content_type", "secret"),
+        [
+            (b'{"api_key":"sk-malformed-secret"', "application/json", "sk-malformed-secret"),
+            (b"sk-wrong-media-secret", "text/plain", "sk-wrong-media-secret"),
+        ],
+        ids=["malformed-json", "wrong-media-type"],
+    )
+    def test_config_action_invalid_body_contract_does_not_echo_input(
+        self, client, endpoint, body, content_type, secret
+    ):
+        response = client.post(
+            endpoint,
+            content=body,
+            headers={"content-type": content_type},
+        )
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": "Invalid configuration payload"}
+        assert secret not in response.text
+        assert '"input"' not in response.text
+        assert '"ctx"' not in response.text
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["/api/config/test-api", "/api/config/fetch-models"],
+    )
+    def test_config_action_openapi_keeps_json_object_body_contract(
+        self, client, endpoint
+    ):
+        request_body = client.get("/openapi.json").json()["paths"][endpoint]["post"][
+            "requestBody"
+        ]
+        schema = request_body["content"]["application/json"]["schema"]
+
+        assert request_body["required"] is True
+        assert schema["type"] == "object"
 
 
 # 旧路由兼容性测试已移除 - api/routes.py 已删除

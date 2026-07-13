@@ -2,7 +2,10 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "path";
 import { fileURLToPath } from "url";
-import { resolveFrontendNetworkPolicy } from "./src/config/networkPolicy";
+import {
+  assertFrontendBindHostAllowed,
+  resolveFrontendNetworkPolicy,
+} from "./src/config/networkPolicy";
 
 // 获取当前文件所在目录（确保 Vite 能找到 index.html）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -15,7 +18,15 @@ const NETWORK_POLICY = resolveFrontendNetworkPolicy(process.env);
 export default defineConfig({
   // 显式指定项目根目录，解决某些系统上启动脚本工作目录不正确的问题
   root: __dirname,
-  plugins: [react()],
+  plugins: [
+    react(),
+    {
+      name: "clade-network-policy",
+      configResolved(config) {
+        assertFrontendBindHostAllowed(config.server.host, NETWORK_POLICY.lanEnabled);
+      },
+    },
+  ],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

@@ -43,4 +43,26 @@ describe("credential reducer actions", () => {
     expect(replaced.form.providers.main.api_key).toBe("sk-new");
     expect(replaced.form.providers.main.api_key_clear_requested).toBe(false);
   });
+
+  it("normalizes provider identity from the record key during initialization and import", () => {
+    const mismatchedConfig = {
+      ...config,
+      providers: {
+        "canonical-key": {
+          ...config.providers.main,
+          id: "stale-id",
+        },
+      },
+    };
+    const initialized = createInitialState(mismatchedConfig);
+
+    expect(initialized.form.providers["canonical-key"].id).toBe("canonical-key");
+
+    const imported = settingsReducer(createInitialState(config), {
+      type: "SET_FORM",
+      form: mismatchedConfig,
+    });
+
+    expect(imported.form.providers["canonical-key"].id).toBe("canonical-key");
+  });
 });
