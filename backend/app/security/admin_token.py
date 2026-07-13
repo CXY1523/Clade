@@ -19,5 +19,8 @@ def require_admin_token(
     if not configured_token:
         raise HTTPException(status_code=503, detail="管理员功能未启用")
 
-    if not secrets.compare_digest(x_clade_admin_token or "", configured_token):
+    if not secrets.compare_digest(
+        (x_clade_admin_token or "").encode("utf-8"),
+        configured_token.encode("utf-8"),
+    ):
         raise HTTPException(status_code=403, detail="管理员令牌无效")
