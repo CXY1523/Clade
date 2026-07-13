@@ -96,17 +96,24 @@ export function normalizeProviderIdentities(config: UIConfig): UIConfig {
   const providers = config.providers || {};
   const normalizeId = (providerId: string | null | undefined) =>
     getCanonicalProviderId(providers, providerId);
+  const normalizeProviderIds = (providerIds: string[] | null | undefined) => {
+    if (!providerIds) return providerIds;
+    const seen = new Set<string>();
+    return providerIds
+      .map((providerId) => getCanonicalProviderId(providers, providerId) || providerId)
+      .filter((providerId) => {
+        if (seen.has(providerId)) return false;
+        seen.add(providerId);
+        return true;
+      });
+  };
   const capabilityRoutes = Object.fromEntries(
     Object.entries(config.capability_routes || {}).map(([capability, route]) => [
       capability,
       {
         ...route,
         provider_id: normalizeId(route.provider_id),
-        provider_ids: route.provider_ids
-          ? route.provider_ids.map(
-              (providerId) => getCanonicalProviderId(providers, providerId) || providerId
-            )
-          : route.provider_ids,
+        provider_ids: normalizeProviderIds(route.provider_ids),
       },
     ])
   );

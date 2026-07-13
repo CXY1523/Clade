@@ -96,9 +96,12 @@ def configure_model_router(
         
         current_route = model_router.routes.get(capability)
         provider = providers.get(route_config.provider_id)
-        selectable_provider_ids = [
-            pid for pid in (route_config.provider_ids or []) if pid in providers
-        ]
+        selectable_provider_ids = []
+        seen_provider_ids = set()
+        for pid in route_config.provider_ids or []:
+            if pid in providers and pid not in seen_provider_ids:
+                seen_provider_ids.add(pid)
+                selectable_provider_ids.append(pid)
         
         if not provider and selectable_provider_ids and not lb_enabled:
             first_pid = selectable_provider_ids[0]

@@ -57,7 +57,7 @@ describe("credential reducer actions", () => {
         speciation: {
           timeout: 60,
           provider_id: "stale-id",
-          provider_ids: ["stale-id", "canonical-key", "unknown-id"],
+          provider_ids: ["stale-id", "canonical-key", "unknown-id", "unknown-id"],
         },
       },
     };
@@ -65,7 +65,6 @@ describe("credential reducer actions", () => {
 
     expect(initialized.form.providers["canonical-key"].id).toBe("canonical-key");
     expect(initialized.form.capability_routes.speciation.provider_ids).toEqual([
-      "canonical-key",
       "canonical-key",
       "unknown-id",
     ]);
@@ -77,7 +76,6 @@ describe("credential reducer actions", () => {
 
     expect(imported.form.providers["canonical-key"].id).toBe("canonical-key");
     expect(imported.form.capability_routes.speciation.provider_ids).toEqual([
-      "canonical-key",
       "canonical-key",
       "unknown-id",
     ]);
