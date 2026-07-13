@@ -99,7 +99,15 @@ export function normalizeProviderIdentities(config: UIConfig): UIConfig {
   const capabilityRoutes = Object.fromEntries(
     Object.entries(config.capability_routes || {}).map(([capability, route]) => [
       capability,
-      { ...route, provider_id: normalizeId(route.provider_id) },
+      {
+        ...route,
+        provider_id: normalizeId(route.provider_id),
+        provider_ids: route.provider_ids
+          ? route.provider_ids.map(
+              (providerId) => getCanonicalProviderId(providers, providerId) || providerId
+            )
+          : route.provider_ids,
+      },
     ])
   );
 

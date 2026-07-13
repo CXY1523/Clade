@@ -24,6 +24,7 @@ export default defineConfig({
       name: "clade-network-policy",
       configResolved(config) {
         assertFrontendBindHostAllowed(config.server.host, NETWORK_POLICY.lanEnabled);
+        assertFrontendBindHostAllowed(config.preview.host, NETWORK_POLICY.lanEnabled);
       },
     },
   ],

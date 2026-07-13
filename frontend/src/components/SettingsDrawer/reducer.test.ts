@@ -53,10 +53,22 @@ describe("credential reducer actions", () => {
           id: "stale-id",
         },
       },
+      capability_routes: {
+        speciation: {
+          timeout: 60,
+          provider_id: "stale-id",
+          provider_ids: ["stale-id", "canonical-key", "unknown-id"],
+        },
+      },
     };
     const initialized = createInitialState(mismatchedConfig);
 
     expect(initialized.form.providers["canonical-key"].id).toBe("canonical-key");
+    expect(initialized.form.capability_routes.speciation.provider_ids).toEqual([
+      "canonical-key",
+      "canonical-key",
+      "unknown-id",
+    ]);
 
     const imported = settingsReducer(createInitialState(config), {
       type: "SET_FORM",
@@ -64,5 +76,19 @@ describe("credential reducer actions", () => {
     });
 
     expect(imported.form.providers["canonical-key"].id).toBe("canonical-key");
+    expect(imported.form.capability_routes.speciation.provider_ids).toEqual([
+      "canonical-key",
+      "canonical-key",
+      "unknown-id",
+    ]);
+
+    const loadBalanced = settingsReducer(imported, {
+      type: "TOGGLE_ROUTE_PROVIDER",
+      capKey: "speciation",
+      providerId: "canonical-key",
+    });
+
+    expect(loadBalanced.form.capability_routes.speciation.provider_ids).toEqual(["unknown-id"]);
+    expect(loadBalanced.form.capability_routes.speciation.provider_ids).not.toContain("stale-id");
   });
 });

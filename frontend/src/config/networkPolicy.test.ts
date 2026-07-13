@@ -47,7 +47,13 @@ interface ViteCliResult {
   startedListening: boolean;
 }
 
-function runViteCli(hostArgs: string[], overrides: NetworkEnv): Promise<ViteCliResult> {
+type ViteCommand = "dev" | "preview";
+
+function runViteCli(
+  command: ViteCommand,
+  hostArgs: string[],
+  overrides: NetworkEnv
+): Promise<ViteCliResult> {
   const env = { ...process.env };
   for (const key of NETWORK_ENV_KEYS) {
     delete env[key];
@@ -60,7 +66,16 @@ function runViteCli(hostArgs: string[], overrides: NetworkEnv): Promise<ViteCliR
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      [viteCli, ...hostArgs, "--port", testPort, "--strictPort", "--clearScreen", "false"],
+      [
+        viteCli,
+        ...(command === "preview" ? ["preview"] : []),
+        ...hostArgs,
+        "--port",
+        testPort,
+        "--strictPort",
+        "--clearScreen",
+        "false",
+      ],
       {
         cwd: process.cwd(),
         env,
@@ -78,7 +93,11 @@ function runViteCli(hostArgs: string[], overrides: NetworkEnv): Promise<ViteCliR
 
     const capture = (chunk: Buffer) => {
       output += chunk.toString("utf8");
-      if (/ready in/i.test(output) && !startedListening) {
+      const plainOutput = output
+        .split(String.fromCharCode(27))
+        .join("")
+        .replace(/\[[0-9;]*m/g, "");
+      if (/(?:ready in|Local:)/i.test(plainOutput) && !startedListening) {
         startedListening = true;
         child.kill();
       }
@@ -142,7 +161,7 @@ describe("Vite network policy", () => {
   ])(
     "rejects %s from the real Vite CLI before listening without LAN opt-in",
     async (_label, hostArgs) => {
-      const result = await runViteCli(hostArgs, {});
+      const result = await runViteCli("dev", hostArgs, {});
 
       expect(result.startedListening).toBe(false);
       expect(result.exitCode).not.toBe(0);
@@ -154,7 +173,35 @@ describe("Vite network policy", () => {
   it(
     "allows a real Vite CLI wildcard when LAN access is explicitly enabled",
     async () => {
-      const result = await runViteCli(["--host", "0.0.0.0"], {
+      const result = await runViteCli("dev", ["--host", "0.0.0.0"], {
+        ALLOW_LAN_ACCESS: "true",
+      });
+
+      expect(result.startedListening).toBe(true);
+      expect(result.output).not.toContain("Non-loopback binding requires");
+    },
+    15_000
+  );
+
+  it.each([
+    ["an explicit wildcard", ["--host", "0.0.0.0"]],
+    ["the boolean wildcard", ["--host"]],
+  ])(
+    "rejects preview %s before listening without LAN opt-in",
+    async (_label, hostArgs) => {
+      const result = await runViteCli("preview", hostArgs, {});
+
+      expect(result.startedListening).toBe(false);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.output).toContain("ALLOW_LAN_ACCESS=true");
+    },
+    15_000
+  );
+
+  it(
+    "allows a preview wildcard when LAN access is explicitly enabled",
+    async () => {
+      const result = await runViteCli("preview", ["--host", "0.0.0.0"], {
         ALLOW_LAN_ACCESS: "true",
       });
 
