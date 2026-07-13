@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     backend_host: str = Field(default="127.0.0.1", alias="BACKEND_HOST")
     frontend_host: str = Field(default="127.0.0.1", alias="FRONTEND_HOST")
     allow_lan_access: bool = Field(default=False, alias="ALLOW_LAN_ACCESS")
+    clade_admin_token: str | None = Field(default=None, alias="CLADE_ADMIN_TOKEN")
     database_url: str = Field(default=f"sqlite:///{PROJECT_ROOT.as_posix()}/data/db/egame.db", alias="DATABASE_URL")
     embedding_provider: str = Field(default="local", alias="EMBEDDING_PROVIDER")
     report_model: str = Field(default="gpt-large", alias="REPORT_MODEL")
