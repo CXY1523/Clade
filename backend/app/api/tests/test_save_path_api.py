@@ -1,17 +1,160 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from contextlib import contextmanager
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
 import pytest
 from fastapi.testclient import TestClient
 
 from ...main import app
-from ...security.save_paths import SavePathError, resolve_save_directory
+from ...security.save_paths import (
+    InvalidSaveNameError,
+    SavePathError,
+    resolve_save_directory,
+    validate_save_name,
+)
+from ..simulation import (
+    _cleanup_old_autosaves,
+    _is_numbered_autosave,
+    _perform_autosave,
+    autosave_prefixes,
+    build_autosave_name,
+)
 
 
 PRIVATE_PATH_SENTINEL = r"C:\private\clade-tree\saves"
+
+
+def test_short_autosave_name_keeps_the_existing_format() -> None:
+    base = "原初大陆"
+
+    assert build_autosave_name(base, 2) == f"{base}_autosave_2"
+
+
+def test_long_autosave_name_is_valid_bounded_and_deterministic() -> None:
+    base = "界" * 50
+
+    first = build_autosave_name(base, 123)
+    second = build_autosave_name(base, 123)
+
+    assert first == second
+    assert len(first) <= 50
+    assert first.endswith("_autosave_123")
+    assert validate_save_name(first) == first
+    assert first in {prefix + "123" for prefix in autosave_prefixes(base)}
+
+
+def test_long_autosave_bases_with_the_same_prefix_do_not_collide() -> None:
+    left = build_autosave_name("A" * 49 + "B", 1)
+    right = build_autosave_name("A" * 49 + "C", 1)
+
+    assert left != right
+
+
+def test_autosave_name_uses_bounded_fallback_for_multi_digit_slot() -> None:
+    base = "a" * 39
+    legacy, bounded = autosave_prefixes(base)
+
+    assert len(legacy) == 49
+    assert build_autosave_name(base, 1) == f"{base}_autosave_1"
+    assert build_autosave_name(base, 123) == bounded + "123"
+    assert len(build_autosave_name(base, 123)) <= 50
+
+
+@pytest.mark.parametrize("base", ["short", "L" * 50])
+def test_autosave_prefixes_always_return_legacy_then_bounded(base: str) -> None:
+    digest = hashlib.sha256(base.encode("utf-8")).hexdigest()[:8]
+
+    assert autosave_prefixes(base) == (
+        f"{base}_autosave_",
+        f"{base[:20]}_{digest}_autosave_",
+    )
+
+
+@pytest.mark.parametrize("slot", [0, -1])
+def test_autosave_name_rejects_non_positive_slots_without_echoing_input(
+    slot: int,
+) -> None:
+    base = "private-base-name"
+
+    with pytest.raises(ValueError) as exc_info:
+        build_autosave_name(base, slot)
+
+    assert base not in str(exc_info.value)
+    assert str(slot) not in str(exc_info.value)
+
+
+def test_autosave_name_rejects_unbounded_slot_without_echoing_input() -> None:
+    base = "private-base-name"
+    slot = int("9" * 51)
+
+    with pytest.raises(InvalidSaveNameError) as exc_info:
+        build_autosave_name(base, slot)
+
+    assert base not in str(exc_info.value)
+    assert str(slot) not in str(exc_info.value)
+
+
+def test_perform_autosave_uses_bounded_name_and_authoritative_turn() -> None:
+    base = "A" * 50
+    config = SimpleNamespace(
+        autosave_enabled=True,
+        autosave_interval=1,
+        autosave_max_slots=3,
+    )
+    session = SimpleNamespace(
+        current_save_name=base,
+        increment_autosave_counter=MagicMock(return_value=123),
+    )
+    save_manager = MagicMock()
+    save_manager.list_saves.return_value = []
+    container = SimpleNamespace(
+        config_service=SimpleNamespace(get_ui_config=MagicMock(return_value=config)),
+        simulation_engine=SimpleNamespace(turn_counter=456),
+        save_manager=save_manager,
+    )
+
+    assert _perform_autosave(455, session, container) is True
+
+    expected_name = build_autosave_name(base, 123)
+    save_manager.save_game.assert_called_once_with(expected_name, turn_index=456)
+    assert len(expected_name) <= 50
+    assert expected_name != autosave_prefixes(base)[0] + "123"
+
+
+def test_cleanup_old_autosaves_matches_both_prefixes_and_numeric_slots() -> None:
+    base = "a" * 39
+    legacy, bounded = autosave_prefixes(base)
+    saves = [
+        {"name": legacy + "1", "timestamp": 50},
+        {"name": bounded + "2", "timestamp": 40},
+        {"name": legacy + "3", "timestamp": 30},
+        {"name": bounded + "4", "timestamp": 20},
+        {"name": legacy, "timestamp": 10},
+        {"name": legacy + "latest", "timestamp": 100},
+        {"name": bounded + "１２", "timestamp": 100},
+        {"name": f"{base}x_autosave_5", "timestamp": 100},
+    ]
+    save_manager = MagicMock()
+    save_manager.list_saves.return_value = saves
+    container = SimpleNamespace(save_manager=save_manager)
+
+    _cleanup_old_autosaves(base, 2, container)
+
+    assert save_manager.delete_save.call_args_list == [
+        call(legacy + "3"),
+        call(bounded + "4"),
+    ]
+
+
+def test_autosave_match_checks_later_overlapping_prefixes() -> None:
+    assert _is_numbered_autosave(
+        "base_autosave_12",
+        ("base_", "base_autosave_"),
+    ) is True
 
 
 @pytest.fixture

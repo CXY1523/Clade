@@ -63,6 +63,26 @@ def test_historical_folder_is_found_by_metadata_without_rename(
     assert historical.name == "save_20200101_000000_old-folder"
 
 
+def test_historical_integrity_and_compression_preserve_original_folder(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "saves"
+    folder_name = "save_20200101_000000_historical-folder"
+    historical = write_historical_save(root, folder_name, HISTORICAL_DISPLAY_NAME)
+    manager = SaveManager(root)
+
+    integrity = manager.check_save_integrity(HISTORICAL_DISPLAY_NAME)
+    migration = manager.migrate_save_to_compressed(HISTORICAL_DISPLAY_NAME)
+
+    assert integrity["valid"] is True
+    assert integrity["turn_index"] == 0
+    assert migration["success"] is True
+    assert (historical / "game_state.json.gz").is_file()
+    assert not (historical / "game_state.json").exists()
+    assert manager.get_save_dir(HISTORICAL_DISPLAY_NAME) == historical.resolve()
+    assert historical.name == folder_name
+
+
 @pytest.mark.parametrize(
     "method_name",
     [

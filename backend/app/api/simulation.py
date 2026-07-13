@@ -12,6 +12,7 @@ Uses dependency injection to get service instances, no module-level globals.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time as time_module
@@ -40,7 +41,11 @@ from ..schemas.responses import (
     SpeciesSnapshot,
     TurnReport,
 )
-from ..security.save_paths import SavePathError, validate_save_name
+from ..security.save_paths import (
+    InvalidSaveNameError,
+    SavePathError,
+    validate_save_name,
+)
 from ..tensor.config import TensorConfig
 from .dependencies import (
     get_config,
@@ -161,6 +166,36 @@ def _infer_ecological_role(species) -> str:
         return "carnivore"
 
 
+def autosave_prefixes(base_name: str) -> tuple[str, ...]:
+    validated = validate_save_name(base_name)
+    legacy = f"{validated}_autosave_"
+    digest = hashlib.sha256(validated.encode("utf-8")).hexdigest()[:8]
+    bounded = f"{validated[:20]}_{digest}_autosave_"
+    return legacy, bounded
+
+
+def build_autosave_name(base_name: str, slot: int) -> str:
+    if slot < 1:
+        raise ValueError("Autosave slot must be positive.")
+
+    slot_text = str(slot)
+    for prefix in autosave_prefixes(base_name):
+        candidate = prefix + slot_text
+        if len(candidate) <= 50:
+            return validate_save_name(candidate)
+
+    raise InvalidSaveNameError("Autosave name exceeds the length limit.")
+
+
+def _is_numbered_autosave(name: str, prefixes: tuple[str, ...]) -> bool:
+    for prefix in prefixes:
+        if name.startswith(prefix):
+            suffix = name[len(prefix):]
+            if suffix and all("0" <= char <= "9" for char in suffix):
+                return True
+    return False
+
+
 def _perform_autosave(
     turn_index: int,
     session: 'SimulationSessionManager',
@@ -201,7 +236,10 @@ def _perform_autosave(
             )
         
         # 执行保存
-        autosave_name = f"{save_name}_autosave_{counter // config.autosave_interval}"
+        autosave_name = build_autosave_name(
+            save_name,
+            counter // config.autosave_interval,
+        )
         container.save_manager.save_game(autosave_name, turn_index=authoritative_turn)
         logger.info(f"[自动保存] 成功保存: {autosave_name}, 回合={authoritative_turn}")
         
@@ -220,8 +258,13 @@ def _cleanup_old_autosaves(
 ) -> None:
     """清理旧的自动保存，只保留最新的N个"""
     try:
+        prefixes = autosave_prefixes(base_save_name)
         saves = container.save_manager.list_saves()
-        autosaves = [s for s in saves if s["name"].startswith(f"{base_save_name}_autosave_")]
+        autosaves = [
+            save
+            for save in saves
+            if _is_numbered_autosave(save["name"], prefixes)
+        ]
         autosaves.sort(key=lambda s: s.get("timestamp", 0), reverse=True)
         
         for old_save in autosaves[max_slots:]:
