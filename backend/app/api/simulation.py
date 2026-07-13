@@ -40,6 +40,7 @@ from ..schemas.responses import (
     SpeciesSnapshot,
     TurnReport,
 )
+from ..security.save_paths import SavePathError, validate_save_name
 from ..tensor.config import TensorConfig
 from .dependencies import (
     get_config,
@@ -670,10 +671,11 @@ async def create_save(
         
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"[存档API错误] {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"创建存档失败: {str(e)}")
+    except SavePathError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception:
+        logger.error("[存档API错误] 创建存档失败")
+        raise HTTPException(status_code=500, detail="创建存档失败") from None
 
 
 @router.post("/saves/save")
@@ -695,9 +697,11 @@ async def save_game(
             "save_name": request.save_name,
             "turn_index": turn_index,
         }
-    except Exception as e:
-        logger.error(f"[存档API错误] {str(e)}")
-        raise HTTPException(status_code=500, detail=f"保存游戏失败: {str(e)}")
+    except SavePathError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception:
+        logger.error("[存档API错误] 保存游戏失败")
+        raise HTTPException(status_code=500, detail="保存游戏失败") from None
 
 
 @router.post("/saves/load")
@@ -781,10 +785,11 @@ async def load_game(
         
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"[存档API错误] {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"加载存档失败: {str(e)}")
+    except SavePathError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception:
+        logger.error("[存档API错误] 加载存档失败")
+        raise HTTPException(status_code=500, detail="加载存档失败") from None
 
 
 @router.delete("/saves/{save_name}")
@@ -794,9 +799,12 @@ def delete_save(
 ) -> dict:
     """删除存档"""
     try:
-        container.save_manager.delete_save(save_name)
-        return {"success": True, "deleted": save_name}
-    except Exception as e:
-        logger.error(f"[存档API错误] {str(e)}")
-        raise HTTPException(status_code=500, detail=f"删除存档失败: {str(e)}")
+        validated_name = validate_save_name(save_name)
+        deleted = container.save_manager.delete_save(validated_name)
+        return {"success": True, "deleted": validated_name, "found": deleted}
+    except SavePathError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception:
+        logger.error("[存档API错误] 删除存档失败")
+        raise HTTPException(status_code=500, detail="删除存档失败") from None
 
