@@ -216,6 +216,31 @@ def test_idna_hostname_is_normalized_before_resolution() -> None:
     assert resolver.calls == [("xn--fsqu00a.xn--0zwm56d", 443)]
 
 
+def test_idna_equivalent_public_trailing_dot_is_removed_before_resolution() -> None:
+    resolver = FakeResolver({"public.example": ["93.184.216.34"]})
+
+    validated = OutboundURLPolicy(resolver=resolver).validate(
+        "HTTPS://PUBLIC.EXAMPLE\u3002/v1", allow_local=False
+    )
+
+    assert validated.hostname == "public.example"
+    assert validated.url == "https://public.example/v1"
+    assert resolver.calls == [("public.example", 443)]
+
+
+def test_idna_equivalent_localhost_trailing_dot_uses_loopback_exception() -> None:
+    resolver = FakeResolver({"localhost": ["127.0.0.1", "::1"]})
+
+    validated = OutboundURLPolicy(resolver=resolver).validate(
+        "http://localhost\u3002:11434/v1", allow_local=True
+    )
+
+    assert validated.hostname == "localhost"
+    assert validated.url == "http://localhost:11434/v1"
+    assert validated.is_local is True
+    assert resolver.calls == [("localhost", 11434)]
+
+
 def test_literal_ips_skip_dns_and_ipv6_keeps_url_brackets() -> None:
     resolver = FakeResolver({})
 

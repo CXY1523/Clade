@@ -124,6 +124,12 @@ class OutboundURLPolicy:
             normalized_hostname = normalized_hostname.encode("idna").decode("ascii").lower()
         except UnicodeError:
             raise _invalid_url() from None
+        if normalized_hostname.endswith("."):
+            normalized_hostname = normalized_hostname[:-1]
+        if not normalized_hostname or any(
+            not label for label in normalized_hostname.split(".")
+        ):
+            raise _invalid_url()
 
         literal_ip: IPAddress | None
         try:
