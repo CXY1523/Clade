@@ -865,20 +865,29 @@ class TestConfigServiceContract:
     """ConfigService 缓存和配置加载契约测试"""
     
     @pytest.fixture
-    def config_service(self):
+    def config_service(self, tmp_path):
         """创建 ConfigService 实例"""
         from ...core.config_service import ConfigService
         from ...core.config import get_settings
         
-        settings = get_settings()
+        settings = get_settings().model_copy(
+            update={"ui_config_path": str(tmp_path / "missing-settings.json")}
+        )
         return ConfigService(settings)
     
     def test_config_service_initialization(self, config_service):
         """测试 ConfigService 初始化"""
         assert config_service is not None
     
-    def test_config_service_returns_equivalent_independent_defaults(self, config_service):
+    def test_config_service_returns_equivalent_independent_defaults(
+        self, config_service, tmp_path
+    ):
         """配置文件不存在时，每次读取都返回内容一致的独立默认配置"""
+        missing_config_path = tmp_path / "missing-settings.json"
+
+        assert config_service.settings.ui_config_path == str(missing_config_path)
+        assert not missing_config_path.exists()
+
         config1 = config_service.get_ui_config()
         config2 = config_service.get_ui_config()
 

@@ -471,6 +471,22 @@ class TestAncestryPlugin:
         count = self.plugin.build_index(ctx)
         assert count == 3
 
+    def test_build_index_embedding_failure_does_not_publish_empty_cache(self):
+        existing_species = MockSpecies(lineage_code="A")
+        assert self.plugin.build_index(MockContext(all_species=[existing_species])) == 1
+        existing_ancestry = self.plugin._ancestry_cache["A"]
+
+        self.service.embed = Mock(return_value=[])
+        count = self.plugin.build_index(
+            MockContext(
+                all_species=[existing_species, MockSpecies(lineage_code="A_B")]
+            )
+        )
+
+        assert count == 0
+        assert set(self.plugin._ancestry_cache) == {"A"}
+        assert self.plugin._ancestry_cache["A"] is existing_ancestry
+
 
 # ==================== 降级路径测试 ====================
 
