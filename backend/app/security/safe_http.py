@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import ssl
 import threading
@@ -21,6 +22,25 @@ from .outbound_url import (
 
 Endpoint = Literal["models", "messages"]
 T = TypeVar("T")
+
+
+_LOG_CONTEXT = threading.local()
+
+
+class _SafeProbeTraceFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not bool(getattr(_LOG_CONTEXT, "suppress_httpcore_trace", False))
+
+
+_TRACE_FILTER = _SafeProbeTraceFilter()
+for _logger_name in (
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+):
+    logging.getLogger(_logger_name).addFilter(_TRACE_FILTER)
 
 
 @dataclass(frozen=True)
@@ -352,8 +372,6 @@ class SafeProbeClient:
         allow_local: bool,
         max_bytes: int = MODEL_LIST_MAX_BYTES,
     ) -> dict[str, Any]:
-        if max_bytes < 0:
-            raise _invalid_url()
         return self._run_with_deadline(
             lambda: self._fetch_json(
                 base_url,
@@ -367,16 +385,27 @@ class SafeProbeClient:
         )
 
     def _run_with_deadline(self, operation: Callable[[], T], total: float) -> T:
+        def guarded_operation() -> T:
+            previous = bool(
+                getattr(_LOG_CONTEXT, "suppress_httpcore_trace", False)
+            )
+            _LOG_CONTEXT.suppress_httpcore_trace = True
+            try:
+                return operation()
+            finally:
+                _LOG_CONTEXT.suppress_httpcore_trace = previous
+
         try:
-            return self._runner.run(operation, timeout=total)
+            return self._runner.run(guarded_operation, timeout=total)
         except OutboundRequestError:
             raise
         except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
             raise _timeout() from None
+        except (httpx.DecodingError, httpx.ProtocolError, httpcore.ProtocolError):
+            raise _bad_response() from None
         except (
             httpx.RequestError,
             httpcore.NetworkError,
-            httpcore.ProtocolError,
             OSError,
         ):
             raise _connect_failed() from None
@@ -411,6 +440,10 @@ class SafeProbeClient:
             follow_redirects=False,
         )
 
+    @staticmethod
+    def _request_headers(headers: Mapping[str, str]) -> dict[str, str]:
+        return {key: value for key, value in headers.items() if key.lower() != "host"}
+
     def _probe_status(
         self,
         base_url: str,
@@ -425,7 +458,9 @@ class SafeProbeClient:
         )
         client = self._client(validated, timeouts)
         try:
-            with client.stream("GET", request_url, headers=headers) as response:
+            with client.stream(
+                "GET", request_url, headers=self._request_headers(headers)
+            ) as response:
                 return response.status_code
         finally:
             client.close()
@@ -440,12 +475,17 @@ class SafeProbeClient:
         max_bytes: int,
         timeouts: ProbeTimeouts,
     ) -> dict[str, Any]:
+        if max_bytes < 0:
+            raise _invalid_url()
+        max_bytes = min(max_bytes, MODEL_LIST_MAX_BYTES)
         validated, request_url = self._validated_endpoint(
             base_url, endpoint=endpoint, allow_local=allow_local
         )
         client = self._client(validated, timeouts)
         try:
-            with client.stream("GET", request_url, headers=headers) as response:
+            with client.stream(
+                "GET", request_url, headers=self._request_headers(headers)
+            ) as response:
                 content_length = response.headers.get("Content-Length")
                 if content_length is not None:
                     try:

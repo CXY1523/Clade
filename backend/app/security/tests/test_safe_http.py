@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import ssl
 import threading
 import time
 from collections.abc import Callable
@@ -64,6 +65,7 @@ class CannedHTTPStream(httpcore.NetworkStream):
         self.write_error = write_error
         self.request_bytes = bytearray()
         self.tls_server_names: list[str | None] = []
+        self.ssl_contexts: list[ssl.SSLContext] = []
         self.body_bytes_read = 0
         self.close_count = 0
 
@@ -99,6 +101,7 @@ class CannedHTTPStream(httpcore.NetworkStream):
         server_hostname: str | None = None,
         timeout: float | None = None,
     ) -> httpcore.NetworkStream:
+        self.ssl_contexts.append(ssl_context)
         self.tls_server_names.append(server_hostname)
         return self
 
@@ -237,19 +240,26 @@ def test_pinned_backend_rejects_unexpected_origin_and_unix_socket() -> None:
 def test_transport_preserves_original_host_header_and_tls_server_name() -> None:
     stream = CannedHTTPStream(_response_headers())
     backend = RecordingBackend(stream)
-    client = SafeProbeClient(policy=_public_policy(), network_backend=backend)
+    resolver = FakeResolver({"public.example": ["93.184.216.34"]})
+    client = SafeProbeClient(
+        policy=OutboundURLPolicy(resolver=resolver), network_backend=backend
+    )
 
     assert client.probe_status(
         "https://public.example/v1",
         endpoint="models",
-        headers={},
+        headers={"hOsT": "attacker.invalid"},
         allow_local=False,
     ) == 200
 
     assert b"Host: public.example\r\n" in stream.request_bytes
+    assert b"attacker.invalid" not in stream.request_bytes
     assert b"GET /v1/models HTTP/1.1\r\n" in stream.request_bytes
     assert stream.tls_server_names == ["public.example"]
+    assert stream.ssl_contexts[0].check_hostname is True
+    assert stream.ssl_contexts[0].verify_mode == ssl.CERT_REQUIRED
     assert backend.connect_calls[0][0:2] == ("93.184.216.34", 443)
+    assert resolver.calls == [("public.example", 443)]
 
 
 def test_transport_preserves_nondefault_port_in_host_header() -> None:
@@ -310,6 +320,29 @@ def test_fetch_json_rejects_content_length_over_exact_one_mib() -> None:
             endpoint="models",
             headers={},
             allow_local=False,
+        )
+
+    assert exc_info.value.code == "outbound_response_too_large"
+    assert stream.body_bytes_read == 0
+    assert stream.close_count == 1
+
+
+def test_fetch_json_cannot_raise_the_fixed_one_mib_limit() -> None:
+    oversized_body = b"x" * (MODEL_LIST_MAX_BYTES + 1)
+    stream = CannedHTTPStream(
+        _response_headers(content_length=len(oversized_body)), [oversized_body]
+    )
+    client = SafeProbeClient(
+        policy=_public_policy(), network_backend=RecordingBackend(stream)
+    )
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        client.fetch_json(
+            "https://public.example/v1",
+            endpoint="models",
+            headers={},
+            allow_local=False,
+            max_bytes=MODEL_LIST_MAX_BYTES * 2,
         )
 
     assert exc_info.value.code == "outbound_response_too_large"
@@ -541,6 +574,84 @@ def test_errors_and_logs_never_contain_headers_query_or_response_body(
         "outbound_connect_failed",
         "outbound_bad_response",
     ]
+
+
+def test_malformed_http_body_never_reaches_errors_or_debug_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    body_secret = "malformed-chunk-body-secret"
+    stream = CannedHTTPStream(
+        _response_headers(
+            content_length=None, extra=b"Transfer-Encoding: chunked\r\n"
+        ),
+        [f"not-hex-{body_secret}\r\n".encode()],
+    )
+    client = SafeProbeClient(
+        policy=_public_policy(), network_backend=RecordingBackend(stream)
+    )
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        client.fetch_json(
+            "https://public.example/v1",
+            endpoint="models",
+            headers={},
+            allow_local=False,
+        )
+
+    assert exc_info.value.code == "outbound_bad_response"
+    assert body_secret not in str(exc_info.value)
+    assert body_secret not in caplog.text
+
+
+def test_malformed_http_header_never_reaches_errors_or_debug_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    header_secret = "malformed-header-secret"
+    stream = CannedHTTPStream(
+        b"HTTP/1.1 200 OK\r\nBad Header "
+        + header_secret.encode()
+        + b"\r\n\r\n"
+    )
+    client = SafeProbeClient(
+        policy=_public_policy(), network_backend=RecordingBackend(stream)
+    )
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        client.fetch_json(
+            "https://public.example/v1",
+            endpoint="models",
+            headers={},
+            allow_local=False,
+        )
+
+    assert exc_info.value.code == "outbound_bad_response"
+    assert header_secret not in str(exc_info.value)
+    assert header_secret not in caplog.text
+
+
+def test_invalid_content_encoding_maps_to_fixed_bad_response() -> None:
+    body = b"not-a-valid-gzip-stream"
+    stream = CannedHTTPStream(
+        _response_headers(
+            content_length=len(body), extra=b"Content-Encoding: gzip\r\n"
+        ),
+        [body],
+    )
+    client = SafeProbeClient(
+        policy=_public_policy(), network_backend=RecordingBackend(stream)
+    )
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        client.fetch_json(
+            "https://public.example/v1",
+            endpoint="models",
+            headers={},
+            allow_local=False,
+        )
+
+    assert exc_info.value.code == "outbound_bad_response"
 
 
 def test_endpoint_is_restricted_to_controlled_tail() -> None:
