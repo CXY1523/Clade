@@ -258,17 +258,27 @@ class TestStageRegistry:
     """StageRegistry 测试"""
     
     def test_registered_stages(self):
-        """测试已注册阶段"""
-        # 验证核心阶段已注册
+        """测试 GPU-only 架构下的核心阶段注册"""
         expected_stages = [
-            "init", "parse_pressures", "map_evolution",
-            "fetch_species", "preliminary_mortality",
-            "migration", "final_mortality", "population_update",
+            "init",
+            "parse_pressures",
+            "map_evolution",
+            "fetch_species",
+            "tensor_ecology",
+            "population_update",
         ]
-        
+        legacy_stages = [
+            "preliminary_mortality",
+            "migration",
+            "final_mortality",
+        ]
+
         for stage_name in expected_stages:
             stage_class = stage_registry.get(stage_name)
             assert stage_class is not None, f"阶段 {stage_name} 未注册"
+
+        for stage_name in legacy_stages:
+            assert stage_registry.get(stage_name) is None, f"旧阶段 {stage_name} 不应注册"
     
     def test_create_stage_instance(self):
         """测试创建阶段实例"""
