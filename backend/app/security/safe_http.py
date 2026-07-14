@@ -442,7 +442,13 @@ class SafeProbeClient:
 
     @staticmethod
     def _request_headers(headers: Mapping[str, str]) -> dict[str, str]:
-        return {key: value for key, value in headers.items() if key.lower() != "host"}
+        request_headers = {
+            key: value
+            for key, value in headers.items()
+            if key.lower() not in ("host", "accept-encoding")
+        }
+        request_headers["Accept-Encoding"] = "identity"
+        return request_headers
 
     def _probe_status(
         self,
@@ -486,6 +492,18 @@ class SafeProbeClient:
             with client.stream(
                 "GET", request_url, headers=self._request_headers(headers)
             ) as response:
+                content_encoding = response.headers.get("Content-Encoding")
+                if content_encoding is not None:
+                    encodings = [
+                        value.strip().lower()
+                        for value in content_encoding.split(",")
+                        if value.strip()
+                    ]
+                    if not encodings or any(
+                        value != "identity" for value in encodings
+                    ):
+                        raise _bad_response()
+
                 content_length = response.headers.get("Content-Length")
                 if content_length is not None:
                     try:

@@ -4,6 +4,8 @@ import logging
 import ssl
 import threading
 import time
+import tracemalloc
+import zlib
 from collections.abc import Callable
 from ipaddress import ip_address
 from typing import Any
@@ -652,6 +654,44 @@ def test_invalid_content_encoding_maps_to_fixed_bad_response() -> None:
         )
 
     assert exc_info.value.code == "outbound_bad_response"
+
+
+def test_valid_compression_bomb_is_rejected_before_body_read_or_large_decode() -> None:
+    compressor = zlib.compressobj(wbits=31)
+    one_mib = b"x" * MODEL_LIST_MAX_BYTES
+    encoded_body = b"".join(compressor.compress(one_mib) for _ in range(16))
+    encoded_body += compressor.flush()
+    assert len(encoded_body) < 20_000
+
+    stream = CannedHTTPStream(
+        _response_headers(
+            content_length=len(encoded_body), extra=b"Content-Encoding: gzip\r\n"
+        ),
+        [encoded_body],
+    )
+    client = SafeProbeClient(
+        policy=_public_policy(), network_backend=RecordingBackend(stream)
+    )
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(OutboundRequestError) as exc_info:
+            client.fetch_json(
+                "https://public.example/v1",
+                endpoint="models",
+                headers={"Accept-Encoding": "gzip"},
+                allow_local=False,
+            )
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert exc_info.value.code == "outbound_bad_response"
+    assert stream.body_bytes_read == 0
+    assert stream.close_count == 1
+    assert b"Accept-Encoding: identity\r\n" in stream.request_bytes
+    assert b"Accept-Encoding: gzip\r\n" not in stream.request_bytes
+    assert peak_bytes < 8 * MODEL_LIST_MAX_BYTES
 
 
 def test_endpoint_is_restricted_to_controlled_tail() -> None:
