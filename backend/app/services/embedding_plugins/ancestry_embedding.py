@@ -86,7 +86,7 @@ class AncestryEmbeddingPlugin(EmbeddingPlugin):
         
         for sp in species_list:
             ancestry = self._compute_ancestry_vector(sp, ctx)
-            if ancestry and len(ancestry.vector) > 0:
+            if ancestry:
                 self._ancestry_cache[sp.lineage_code] = ancestry
                 
                 # 使用向量作为索引
