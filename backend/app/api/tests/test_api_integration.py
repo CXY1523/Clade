@@ -877,16 +877,13 @@ class TestConfigServiceContract:
         """测试 ConfigService 初始化"""
         assert config_service is not None
     
-    def test_config_service_caching(self, config_service):
-        """测试配置缓存行为"""
-        # 首次调用应该加载配置
+    def test_config_service_returns_equivalent_independent_defaults(self, config_service):
+        """配置文件不存在时，每次读取都返回内容一致的独立默认配置"""
         config1 = config_service.get_ui_config()
-        
-        # 第二次调用应该返回缓存的配置
         config2 = config_service.get_ui_config()
-        
-        # 应该是同一个对象（缓存）
-        assert config1 is config2
+
+        assert config1.model_dump() == config2.model_dump()
+        assert config1 is not config2
     
     def test_config_service_ecology_balance(self, config_service):
         """测试生态平衡配置获取"""
@@ -1226,16 +1223,15 @@ class TestServiceConfigInjectionContract:
         assert engine._mortality_config is mortality_config
         assert engine._speciation_config is speciation_config
     
-    def test_tile_mortality_engine_warns_without_config(self, caplog):
-        """测试 TileBasedMortalityEngine 未提供配置时发出警告"""
-        import logging
+    def test_tile_mortality_engine_is_gpu_compatibility_placeholder(self):
+        """旧入口可安全构造，但实际计算已由 TensorEcologyStage 接管"""
         from ...simulation.tile_based_mortality import TileBasedMortalityEngine
-        
-        with caplog.at_level(logging.WARNING):
-            engine = TileBasedMortalityEngine()
-        
-        # 应该有警告日志
-        assert "未注入" in caplog.text or "使用默认值" in caplog.text
+
+        engine = TileBasedMortalityEngine()
+
+        assert engine.evaluate([]) == []
+        assert engine.get_speciation_candidates() == {}
+        assert engine.export_tensor_state() is None
     
     def test_tile_mortality_engine_reload_config(self, mock_container):
         """测试 TileBasedMortalityEngine 热加载配置"""
