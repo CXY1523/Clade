@@ -16,7 +16,7 @@
 - Do not change simulation rules, stage execution order, APIs, configuration semantics, database schema, save format, or frontend behavior.
 - Do not restore `preliminary_mortality`, `migration`, or `final_mortality` to `stage_registry`; current GPU processing is represented by `tensor_ecology`.
 - Do not delete, skip, broadly weaken, or hide a failing test.
-- Keep backend collection at exactly 555 tests: 553 passing, 0 failing, 0 errors, and 2 expected Windows symlink skips.
+- Keep backend collection at exactly 556 tests: 554 passing, 0 failing, 0 errors, and 2 expected Windows symlink skips.
 - The existing 45 backend warnings are out of scope and must not increase.
 - Keep frontend results at 52/52 tests, lint exit 0 with no more than the existing 162 warnings, and a successful production build.
 - Reuse the Phase 2B-2 Python environment and frontend dependencies; do not install or upgrade dependencies.
@@ -471,7 +471,7 @@ Push-Location backend
 Pop-Location
 ```
 
-Expected: all 154 focused tests pass with 0 failures and 0 errors.
+Expected: all 155 focused tests pass with 0 failures and 0 errors.
 
 - [ ] **Step 2: Run complete backend collection and regression**
 
@@ -483,7 +483,7 @@ Push-Location backend
 Pop-Location
 ```
 
-Expected: collection reports exactly 555 tests; execution reports `553 passed, 2 skipped, 45 warnings`, with 0 failures and 0 errors.
+Expected: collection reports exactly 556 tests; execution reports `554 passed, 2 skipped, 45 warnings`, with 0 failures and 0 errors.
 
 - [ ] **Step 3: Re-run the fresh-process plugin guard**
 
