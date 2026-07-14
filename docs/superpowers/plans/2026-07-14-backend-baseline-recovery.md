@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Clear the stable backend baseline of 14 failures and 9 setup errors without changing simulation rules or current product contracts.
+**Goal:** Clear the stable backend baseline of 14 failures and 9 setup errors, including the confirmed ancestry-index defect revealed by plugin isolation, without changing simulation rules.
 
-**Architecture:** Treat the current runtime behavior as the source of truth and update only the five stale test files. Restore deterministic plugin-test state through explicit registry fixtures, align configuration and stage assertions with the GPU-only architecture, and use a narrow float32 tolerance for the three affected values.
+**Architecture:** Treat current runtime contracts as the source of truth and update the five stale test files. Restore deterministic plugin-test state through explicit registry fixtures, repair the confirmed pre-embedding ancestry filter in one product file, align configuration and stage assertions with the GPU-only architecture, and use a narrow float32 tolerance for the three affected values.
 
 **Tech Stack:** Python 3.12, pytest 9, Pydantic v2, NumPy/float32, existing Clade simulation and plugin registries, Vitest, TypeScript, Vite, ESLint.
 
@@ -12,7 +12,7 @@
 
 - Execute in worktree `.worktrees/backend-baseline-recovery` on branch `backend-baseline-recovery`.
 - The approved starting point is `329d895b56307eee32faa8d3924a602aa4ce58de`; the approved design commit is `0d30c7b59ccc3c3f4b4edfc0e8e4d0774fa51399`.
-- Modify only the five test files listed in Tasks 1-4; product code is out of scope.
+- Modify only the five test files listed in Tasks 1-4 plus `backend/app/services/embedding_plugins/ancestry_embedding.py`; no other product code is in scope.
 - Do not change simulation rules, stage execution order, APIs, configuration semantics, database schema, save format, or frontend behavior.
 - Do not restore `preliminary_mortality`, `migration`, or `final_mortality` to `stage_registry`; current GPU processing is represented by `tensor_ecology`.
 - Do not delete, skip, broadly weaken, or hide a failing test.
@@ -21,23 +21,24 @@
 - Keep frontend results at 52/52 tests, lint exit 0 with no more than the existing 162 warnings, and a successful production build.
 - Reuse the Phase 2B-2 Python environment and frontend dependencies; do not install or upgrade dependencies.
 - Each task is a separate commit and must pass its focused verification before the next task begins.
-- If a fresh-process plugin check fails, a new failure appears outside the five files, or product code appears necessary, stop and re-scope instead of expanding the patch.
+- The only approved product behavior change is allowing `AncestryEmbeddingPlugin.build_index()` to generate embeddings before requiring a non-empty vector; do not change the inertia formula, thresholds, or return fields.
+- If a fresh-process plugin check fails, a new failure appears outside the approved files, or other product code appears necessary, stop and re-scope instead of expanding the patch.
 - Do not merge to `main` or push a remote branch during this plan.
 
 ---
 
-### Task 1: Make embedding plugin tests independent of module import cache
+### Task 1: Isolate plugin tests and restore ancestry indexing
 
 **Files:**
 - Modify: `backend/app/services/embedding_plugins/tests/test_plugins.py:1-616`
+- Modify: `backend/app/services/embedding_plugins/ancestry_embedding.py:75-112`
 
 **Interfaces:**
 - Consumes: `PluginRegistry.register(name: str, plugin_class: type[EmbeddingPlugin]) -> None` and `PluginRegistry.clear() -> None`.
-- Produces: pytest fixture `registered_builtin_plugins()` that explicitly registers the five plugin classes used by this test file and clears all registry state after each marked test.
+- Produces: pytest fixture `registered_builtin_plugins()` that explicitly registers the five plugin classes used by this test file and clears all registry state after every marked test.
+- Produces: `AncestryEmbeddingPlugin.build_index()` that accepts pre-embedding ancestry records, creates embeddings, writes vectors back to the cache, and returns the indexed count.
 
 - [ ] **Step 1: Reproduce the plugin-test RED baseline**
-
-Run from the worktree root:
 
 ```powershell
 $Python = (Resolve-Path "..\phase-2b2-save-path-boundary\backend\.venv\Scripts\python.exe").Path
@@ -46,11 +47,11 @@ Push-Location backend
 Pop-Location
 ```
 
-Expected: `8 failed, 9 passed, 9 errors`; every failure/error resolves to `PluginRegistry.get_instance(...)` returning `None` after `PluginRegistry.clear()`.
+Expected: `8 failed, 9 passed, 9 errors`; failures/errors follow `PluginRegistry.clear()` and cached imports.
 
 - [ ] **Step 2: Add one explicit built-in registry fixture**
 
-Add this fixture after `MockEmbeddingService` and before `TestPluginRegistry`:
+Add after `MockEmbeddingService` and before `TestPluginRegistry`:
 
 ```python
 @pytest.fixture
@@ -79,46 +80,15 @@ def registered_builtin_plugins():
     PluginRegistry.clear()
 ```
 
-This fixture intentionally imports the concrete classes first, clears any decorator side effects, and then rebuilds the registry explicitly. Do not use `importlib.reload()`.
+Do not use `importlib.reload()`.
 
-- [ ] **Step 3: Apply the fixture to the six affected classes**
+- [ ] **Step 3: Make class initialization depend on the registry fixture**
 
-Add `@pytest.mark.usefixtures("registered_builtin_plugins")` immediately above these classes:
-
-```python
-@pytest.mark.usefixtures("registered_builtin_plugins")
-class TestBehaviorStrategyPlugin:
-```
+Replace the first five classes' `setup_method`/`teardown_method` pairs with the corresponding autouse fixture method. The explicit `registered_builtin_plugins` parameter is required because pytest 9 runs xunit `setup_method` before a class-level `usefixtures` fixture.
 
 ```python
-@pytest.mark.usefixtures("registered_builtin_plugins")
-class TestFoodWebPlugin:
-```
-
-```python
-@pytest.mark.usefixtures("registered_builtin_plugins")
-class TestTileBiomePlugin:
-```
-
-```python
-@pytest.mark.usefixtures("registered_builtin_plugins")
-class TestEvolutionSpacePlugin:
-```
-
-```python
-@pytest.mark.usefixtures("registered_builtin_plugins")
-class TestAncestryPlugin:
-```
-
-```python
-@pytest.mark.usefixtures("registered_builtin_plugins")
-class TestDegradationPaths:
-```
-
-For the first five classes, replace each current `setup_method` with the corresponding exact setup below and delete its `teardown_method`:
-
-```python
-def setup_method(self):
+@pytest.fixture(autouse=True)
+def setup_plugin(self, registered_builtin_plugins):
     from ..registry import PluginRegistry
 
     self.service = MockEmbeddingService()
@@ -127,7 +97,8 @@ def setup_method(self):
 ```
 
 ```python
-def setup_method(self):
+@pytest.fixture(autouse=True)
+def setup_plugin(self, registered_builtin_plugins):
     from ..registry import PluginRegistry
 
     self.service = MockEmbeddingService()
@@ -136,7 +107,8 @@ def setup_method(self):
 ```
 
 ```python
-def setup_method(self):
+@pytest.fixture(autouse=True)
+def setup_plugin(self, registered_builtin_plugins):
     from ..registry import PluginRegistry
 
     self.service = MockEmbeddingService()
@@ -145,7 +117,8 @@ def setup_method(self):
 ```
 
 ```python
-def setup_method(self):
+@pytest.fixture(autouse=True)
+def setup_plugin(self, registered_builtin_plugins):
     from ..registry import PluginRegistry
 
     self.service = MockEmbeddingService()
@@ -154,7 +127,8 @@ def setup_method(self):
 ```
 
 ```python
-def setup_method(self):
+@pytest.fixture(autouse=True)
+def setup_plugin(self, registered_builtin_plugins):
     from ..registry import PluginRegistry
 
     self.service = MockEmbeddingService()
@@ -162,9 +136,64 @@ def setup_method(self):
     self.plugin.initialize()
 ```
 
-Delete `TestDegradationPaths.setup_method` and `TestDegradationPaths.teardown_method`; the fixture now owns that state. Inside its eight test methods, delete the stale `from .. import behavior_strategy`, `from .. import tile_embedding`, `from .. import food_web_embedding`, and `from .. import ancestry_embedding` statements. Keep the existing `PluginRegistry`, behavior, degradation, search, and statistics assertions unchanged.
+Add `@pytest.mark.usefixtures("registered_builtin_plugins")` only above `TestDegradationPaths`. Delete its `setup_method` and `teardown_method`. Inside its eight test methods, delete stale `from .. import behavior_strategy`, `from .. import tile_embedding`, `from .. import food_web_embedding`, and `from .. import ancestry_embedding` statements. Keep behavior assertions unchanged.
 
-- [ ] **Step 4: Verify the fixture and normal runtime loading independently**
+- [ ] **Step 4: Verify isolation exposes the hidden ancestry RED state**
+
+```powershell
+$Python = (Resolve-Path "..\phase-2b2-save-path-boundary\backend\.venv\Scripts\python.exe").Path
+Push-Location backend
+& $Python -m pytest app/services/embedding_plugins/tests/test_plugins.py -q
+Pop-Location
+```
+
+Expected: `24 passed, 2 failed`; failures are `test_predict_genetic_inertia` and `test_build_index`.
+
+- [ ] **Step 5: Prepare genetic-inertia state through the real index path**
+
+Replace `test_predict_genetic_inertia` with:
+
+```python
+def test_predict_genetic_inertia(self):
+    species = MockSpecies()
+    ctx = MockContext(all_species=[species])
+
+    for _ in range(5):
+        self.plugin.build_index(ctx)
+
+    inertia = self.plugin.predict_genetic_inertia(species, "攻击性")
+    assert inertia["inertia"] > 0.5
+    assert inertia["trend_direction"] == "stable"
+```
+
+Run both ancestry tests before product code changes:
+
+```powershell
+$Python = (Resolve-Path "..\phase-2b2-save-path-boundary\backend\.venv\Scripts\python.exe").Path
+Push-Location backend
+& $Python -m pytest app/services/embedding_plugins/tests/test_plugins.py::TestAncestryPlugin::test_predict_genetic_inertia app/services/embedding_plugins/tests/test_plugins.py::TestAncestryPlugin::test_build_index -q
+Pop-Location
+```
+
+Expected: both fail because `build_index()` rejects every empty placeholder vector before embedding.
+
+- [ ] **Step 6: Allow ancestry records to reach embedding**
+
+In `AncestryEmbeddingPlugin.build_index()`, replace:
+
+```python
+if ancestry and len(ancestry.vector) > 0:
+```
+
+with:
+
+```python
+if ancestry:
+```
+
+Keep the existing post-embedding assignment into `_ancestry_cache`. Do not change `_compute_ancestry_vector()`, `predict_genetic_inertia()`, the inertia formula, or vector-store behavior.
+
+- [ ] **Step 7: Verify plugin behavior and fresh-process loading**
 
 ```powershell
 $Python = (Resolve-Path "..\phase-2b2-save-path-boundary\backend\.venv\Scripts\python.exe").Path
@@ -174,18 +203,18 @@ Push-Location backend
 Pop-Location
 ```
 
-Expected: `26 passed`; the fresh-process command exits 0 and prints all six built-ins, including `prompt_optimizer`. This command is the runtime guard and does not add a 556th test.
+Expected: `26 passed`; the fresh-process command exits 0 and prints all six built-ins. No additional permanent test is added.
 
-- [ ] **Step 5: Review and commit Task 1**
+- [ ] **Step 8: Review and commit Task 1**
 
 ```powershell
 git diff --check
-git diff -- backend/app/services/embedding_plugins/tests/test_plugins.py
-git add backend/app/services/embedding_plugins/tests/test_plugins.py
-git commit -m "test: isolate embedding plugin registry"
+git diff -- backend/app/services/embedding_plugins/tests/test_plugins.py backend/app/services/embedding_plugins/ancestry_embedding.py
+git add backend/app/services/embedding_plugins/tests/test_plugins.py backend/app/services/embedding_plugins/ancestry_embedding.py
+git commit -m "fix: restore ancestry plugin indexing"
 ```
 
-Expected: the diff contains only fixture/state-isolation changes; no plugin implementation file is staged.
+Expected: registry isolation, real index-path preparation, and the one-condition ancestry fix only.
 
 ---
 
@@ -495,6 +524,7 @@ Expected changed implementation files after the plan commit are exactly:
 
 ```text
 backend/app/api/tests/test_api_integration.py
+backend/app/services/embedding_plugins/ancestry_embedding.py
 backend/app/services/embedding_plugins/tests/test_plugins.py
 backend/app/simulation/tests/test_ecological_realism.py
 backend/app/simulation/tests/test_pipeline.py
