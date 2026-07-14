@@ -372,6 +372,219 @@ class TestNewRouterIntegration:
         assert response.status_code == 200
         mock_container.environment_repository.save_ui_config.assert_called_once()
 
+    def test_post_config_ordinary_save_does_not_require_admin_token(
+        self, client, mock_container
+    ):
+        from ...models.config import UIConfig
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig(
+            allow_local_ai_endpoints=False,
+        )
+        mock_container.settings.clade_admin_token = "expected-token"
+        mock_container.settings.ui_config_path = "data/test-settings.json"
+        mock_container.environment_repository.save_ui_config.side_effect = (
+            lambda _path, config: config
+        )
+        runtime_routes = MagicMock()
+
+        with (
+            patch("app.api.analytics.configure_model_router"),
+            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
+        ):
+            response = client.post(
+                "/api/config/ui",
+                json={
+                    "config": {
+                        "providers": {},
+                        "allow_local_ai_endpoints": False,
+                        "autosave_enabled": False,
+                    }
+                },
+            )
+
+        assert response.status_code == 200
+        saved = mock_container.environment_repository.save_ui_config.call_args.args[1]
+        assert saved.allow_local_ai_endpoints is False
+        assert saved.autosave_enabled is False
+
+    @pytest.mark.parametrize(
+        ("current_value", "requested_value"),
+        [(False, True), (True, False)],
+        ids=["enable", "disable"],
+    )
+    def test_post_config_local_ai_change_returns_structured_503_when_unconfigured(
+        self, client, mock_container, current_value, requested_value
+    ):
+        from ...models.config import UIConfig
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig(
+            allow_local_ai_endpoints=current_value,
+        )
+        mock_container.settings.clade_admin_token = None
+        runtime_routes = MagicMock()
+
+        with (
+            patch("app.api.analytics.merge_ui_config_secrets") as merge_secrets,
+            patch("app.api.analytics.configure_model_router") as configure_router,
+            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
+        ):
+            response = client.post(
+                "/api/config/ui",
+                json={
+                    "config": {
+                        "providers": {},
+                        "allow_local_ai_endpoints": requested_value,
+                    }
+                },
+            )
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": {
+                "code": "admin_token_unconfigured",
+                "message": "管理员功能未启用",
+            }
+        }
+        merge_secrets.assert_not_called()
+        mock_container.environment_repository.save_ui_config.assert_not_called()
+        mock_container.config_service.invalidate_cache.assert_not_called()
+        configure_router.assert_not_called()
+        runtime_routes.apply_ui_config.assert_not_called()
+        runtime_routes.simulation_engine.reload_configs.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("current_value", "requested_value"),
+        [(False, True), (True, False)],
+        ids=["enable", "disable"],
+    )
+    @pytest.mark.parametrize(
+        ("provided_token", "header"),
+        [
+            (None, {}),
+            ("wrong-token", {"X-Clade-Admin-Token": "wrong-token"}),
+        ],
+        ids=["missing", "wrong"],
+    )
+    def test_post_config_local_ai_change_returns_same_structured_403(
+        self,
+        client,
+        mock_container,
+        current_value,
+        requested_value,
+        provided_token,
+        header,
+    ):
+        from ...models.config import UIConfig
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig(
+            allow_local_ai_endpoints=current_value,
+        )
+        mock_container.settings.clade_admin_token = "expected-token"
+        runtime_routes = MagicMock()
+
+        with (
+            patch("app.api.analytics.merge_ui_config_secrets") as merge_secrets,
+            patch("app.api.analytics.configure_model_router") as configure_router,
+            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
+        ):
+            response = client.post(
+                "/api/config/ui",
+                json={
+                    "config": {
+                        "providers": {},
+                        "allow_local_ai_endpoints": requested_value,
+                    }
+                },
+                headers=header,
+            )
+
+        assert response.status_code == 403
+        assert response.json() == {
+            "detail": {
+                "code": "admin_token_invalid",
+                "message": "管理员令牌无效",
+            }
+        }
+        if provided_token:
+            assert provided_token not in response.text
+        assert "expected-token" not in response.text
+        merge_secrets.assert_not_called()
+        mock_container.environment_repository.save_ui_config.assert_not_called()
+        mock_container.config_service.invalidate_cache.assert_not_called()
+        configure_router.assert_not_called()
+        runtime_routes.apply_ui_config.assert_not_called()
+        runtime_routes.simulation_engine.reload_configs.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("current_value", "requested_value"),
+        [(False, True), (True, False)],
+        ids=["enable", "disable"],
+    )
+    def test_post_config_local_ai_change_with_correct_token_saves_once_and_refreshes(
+        self, client, mock_container, current_value, requested_value
+    ):
+        from ...models.config import UIConfig
+
+        current = UIConfig(
+            allow_local_ai_endpoints=current_value,
+            autosave_enabled=True,
+        )
+        mock_container.config_service.get_ui_config.return_value = current
+        mock_container.settings.clade_admin_token = "expected-token"
+        mock_container.settings.ui_config_path = "data/test-settings.json"
+        refresh_order = []
+
+        def save_once(_path, config):
+            refresh_order.append("save")
+            return config
+
+        mock_container.environment_repository.save_ui_config.side_effect = save_once
+        mock_container.config_service.invalidate_cache.side_effect = (
+            lambda: refresh_order.append("cache")
+        )
+        runtime_routes = MagicMock()
+        runtime_routes.apply_ui_config.side_effect = (
+            lambda _saved: refresh_order.append("apply")
+        )
+        runtime_routes.simulation_engine.reload_configs.side_effect = (
+            lambda _configs: refresh_order.append("reload")
+        )
+
+        with (
+            patch(
+                "app.api.analytics.configure_model_router",
+                side_effect=lambda *_args: refresh_order.append("configure"),
+            ) as configure_router,
+            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
+        ):
+            response = client.post(
+                "/api/config/ui",
+                json={
+                    "config": {
+                        "providers": {},
+                        "allow_local_ai_endpoints": requested_value,
+                        "autosave_enabled": False,
+                    }
+                },
+                headers={"X-Clade-Admin-Token": "expected-token"},
+            )
+
+        assert response.status_code == 200
+        mock_container.environment_repository.save_ui_config.assert_called_once()
+        saved = mock_container.environment_repository.save_ui_config.call_args.args[1]
+        assert saved.allow_local_ai_endpoints is requested_value
+        assert saved.autosave_enabled is False
+        configure_router.assert_called_once_with(
+            saved,
+            mock_container.model_router,
+            mock_container.embedding_service,
+            mock_container.settings,
+        )
+        runtime_routes.apply_ui_config.assert_called_once_with(saved)
+        runtime_routes.simulation_engine.reload_configs.assert_called_once()
+        mock_container.config_service.invalidate_cache.assert_called_once_with()
+        assert refresh_order == ["save", "cache", "configure", "apply", "reload"]
+
     def test_post_config_preserves_empty_key(self, client, mock_container):
         from ...models.config import ProviderConfig, UIConfig
 

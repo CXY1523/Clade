@@ -17,9 +17,10 @@ from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import ValidationError
 
+from ..security.admin_token import AdminTokenValidationError, validate_admin_token
 from ..security.config_secrets import (
     UIConfigUpdateRequest,
     merge_ui_config_secrets,
@@ -405,21 +406,37 @@ def _json_object_request_openapi() -> dict[str, Any]:
 )
 def update_ui_config(
     request: UIConfigUpdateRequest = Depends(_parse_ui_config_update),
+    x_clade_admin_token: str | None = Header(
+        default=None, alias="X-Clade-Admin-Token"
+    ),
     container: 'ServiceContainer' = Depends(get_container),
 ) -> dict:
     with _UI_CONFIG_UPDATE_LOCK:
-        return _update_ui_config(request, container)
+        return _update_ui_config(request, container, x_clade_admin_token)
 
 
 def _update_ui_config(
     request: UIConfigUpdateRequest,
     container: 'ServiceContainer',
+    x_clade_admin_token: str | None,
 ) -> dict:
     """更新 UI 配置"""
     env_repo = container.environment_repository
     config_service = container.config_service
 
     current = config_service.get_ui_config()
+    if request.config.allow_local_ai_endpoints != current.allow_local_ai_endpoints:
+        try:
+            validate_admin_token(
+                x_clade_admin_token,
+                container.settings.clade_admin_token,
+            )
+        except AdminTokenValidationError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.public_message},
+            ) from None
+
     merged = merge_ui_config_secrets(
         current,
         request.config,

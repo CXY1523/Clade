@@ -6,7 +6,64 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.core.config import Settings, get_settings
-from app.security.admin_token import require_admin_token
+from app.models.config import UIConfig
+from app.security.admin_token import (
+    AdminTokenValidationError,
+    require_admin_token,
+    validate_admin_token,
+)
+
+
+def test_ui_config_defaults_local_ai_endpoints_to_disabled():
+    assert UIConfig.model_validate({"providers": {}}).allow_local_ai_endpoints is False
+
+
+def test_ui_config_round_trips_local_ai_endpoint_setting():
+    config = UIConfig(allow_local_ai_endpoints=True)
+    restored = UIConfig.model_validate_json(config.model_dump_json())
+
+    assert restored.allow_local_ai_endpoints is True
+
+
+@pytest.mark.parametrize("provided", [None, "wrong-token"])
+def test_validate_admin_token_uses_same_safe_rejection(provided):
+    with pytest.raises(AdminTokenValidationError) as exc_info:
+        validate_admin_token(provided, "expected-token")
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.code == "admin_token_invalid"
+
+
+@pytest.mark.parametrize("configured", [None, ""])
+def test_validate_admin_token_rejects_unconfigured_token(configured):
+    with pytest.raises(AdminTokenValidationError) as exc_info:
+        validate_admin_token("provided-token", configured)
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.code == "admin_token_unconfigured"
+    assert exc_info.value.public_message == "管理员功能未启用"
+
+
+def test_validate_admin_token_accepts_exact_token():
+    assert validate_admin_token("expected-token", "expected-token") is None
+
+
+@pytest.mark.parametrize(
+    ("provided", "configured"),
+    [
+        ("supplied-secret", "configured-secret"),
+        (None, "configured-secret"),
+        ("supplied-secret", None),
+    ],
+)
+def test_validate_admin_token_errors_do_not_echo_tokens(provided, configured):
+    with pytest.raises(AdminTokenValidationError) as exc_info:
+        validate_admin_token(provided, configured)
+
+    error_text = str(exc_info.value)
+    if provided:
+        assert provided not in error_text
+    if configured:
+        assert configured not in error_text
 
 
 def make_client(server_token: str | None) -> TestClient:
