@@ -86,6 +86,112 @@ def test_mixed_public_and_private_resolution_rejects_entire_host() -> None:
     assert exc_info.value.code == "private_network_blocked"
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://[fec0::1]/v1",
+        "https://[64:ff9b::8.8.8.8]/v1",
+        "https://[64:ff9b::127.0.0.1]/v1",
+        "https://[::ffff:8.8.8.8]/v1",
+        "https://[::ffff:127.0.0.1]/v1",
+        "https://[::127.0.0.1]/v1",
+        "https://[2002:0808:0808::]/v1",
+        "https://[2002:7f00:1::]/v1",
+        "https://[2001:0000:4136:e378:8000:63bf:f5ff:fffe]/v1",
+    ],
+    ids=[
+        "site-local",
+        "nat64-public-v4",
+        "nat64-loopback-v4",
+        "mapped-public-v4",
+        "mapped-loopback-v4",
+        "compatible-loopback-v4",
+        "6to4-public-v4",
+        "6to4-loopback-v4",
+        "teredo-private-v4",
+    ],
+)
+def test_ipv6_special_and_transition_literals_never_expand_local_allowlist(
+    url: str,
+) -> None:
+    resolver = FakeResolver({})
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        OutboundURLPolicy(resolver=resolver).validate(url, allow_local=True)
+
+    assert exc_info.value.code == "private_network_blocked"
+    assert resolver.calls == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "fec0::1",
+        "64:ff9b::8.8.8.8",
+        "64:ff9b::10.0.0.1",
+        "64:ff9b:1::8.8.8.8",
+        "100::1",
+        "2001:20::1",
+        "2002:0808:0808::",
+        "2620:4f:8000::1",
+        "3fff::1",
+        "5f00::1",
+    ],
+    ids=[
+        "site-local-python-312-global",
+        "nat64-public-python-312-global",
+        "nat64-private-python-312-global",
+        "local-nat64",
+        "discard-only",
+        "orchidv2",
+        "6to4",
+        "as112",
+        "documentation-v6-2",
+        "segment-routing-sids",
+    ],
+)
+def test_dns_rejects_iana_special_purpose_ipv6_answers(answer: str) -> None:
+    resolver = FakeResolver({"special.example": [answer]})
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        OutboundURLPolicy(resolver=resolver).validate(
+            "https://special.example/v1", allow_local=False
+        )
+
+    assert exc_info.value.code == "private_network_blocked"
+    assert resolver.calls == [("special.example", 443)]
+
+
+@pytest.mark.parametrize(
+    "unsafe_answer",
+    [
+        "fec0::1",
+        "64:ff9b::127.0.0.1",
+        "::ffff:127.0.0.1",
+        "2002:7f00:1::",
+    ],
+    ids=["site-local", "nat64-loopback", "mapped-loopback", "6to4-loopback"],
+)
+def test_mixed_dns_answer_rejects_ipv6_special_or_embedded_private_address(
+    unsafe_answer: str,
+) -> None:
+    resolver = FakeResolver(
+        {
+            "mixed-v6.example": [
+                "2606:2800:220:1:248:1893:25c8:1946",
+                unsafe_answer,
+            ]
+        }
+    )
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        OutboundURLPolicy(resolver=resolver).validate(
+            "https://mixed-v6.example/v1", allow_local=True
+        )
+
+    assert exc_info.value.code == "private_network_blocked"
+
+
 @pytest.mark.parametrize("answers", [[], ["127.0.0.1", "93.184.216.34"]])
 def test_localhost_requires_nonempty_all_loopback_resolution(answers: list[str]) -> None:
     resolver = FakeResolver({"localhost": answers})

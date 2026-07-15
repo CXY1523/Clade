@@ -603,14 +603,26 @@ def fetch_models(
             "models": [],
         }
 
-    data = response.data or {}
-    models = data.get("data", [])
+    data = response.data
+    models = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(models, list) or any(
+        not isinstance(model, dict) or not isinstance(model.get("id"), str)
+        for model in models
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "outbound_bad_response",
+                "message": "外部服务响应无效",
+            },
+        )
+
     return {
         "success": True,
         "models": [
-            {"id": model.get("id", ""), "name": model.get("id", "")}
+            {"id": model["id"], "name": model["id"]}
             for model in models
-            if model.get("id")
+            if model["id"]
         ],
     }
 

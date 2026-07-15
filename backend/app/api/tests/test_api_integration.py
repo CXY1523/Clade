@@ -1108,7 +1108,7 @@ class TestNewRouterIntegration:
         from ...models.config import UIConfig
         from ...security import ProbeJSONResponse, SafeProbeClient
 
-        secrets = ("sk-model-key", "query-model-secret", "upstream-model-secret")
+        secrets = ("sk-model-key", "query-model-secret")
         mock_container.config_service.get_ui_config.return_value = UIConfig()
         safe_client = MagicMock(spec=SafeProbeClient)
         safe_client.fetch_json_response.return_value = ProbeJSONResponse(
@@ -1136,13 +1136,66 @@ class TestNewRouterIntegration:
             assert secret not in response.text
             assert secret not in caplog.text
 
-    def test_probe_response_and_logs_redact_credentials_query_and_upstream_body(
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"data": None},
+            {"data": "upstream-schema-sentinel"},
+            {"data": [None]},
+            {"data": [1]},
+            {"data": [{}]},
+            {"data": [{"id": 1}]},
+        ],
+        ids=[
+            "null-data",
+            "string-data",
+            "null-item",
+            "scalar-item",
+            "missing-id",
+            "non-string-id",
+        ],
+    )
+    def test_fetch_models_malformed_200_schema_is_fixed_redacted_502(
+        self, client, mock_container, caplog, payload
+    ):
+        from ...models.config import UIConfig
+        from ...security import ProbeJSONResponse, SafeProbeClient
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig()
+        safe_client = MagicMock(spec=SafeProbeClient)
+        safe_client.fetch_json_response.return_value = ProbeJSONResponse(
+            status_code=200,
+            data=payload,
+        )
+
+        with patch("app.api.analytics._SAFE_PROBE_CLIENT", safe_client):
+            response = client.post(
+                "/api/config/fetch-models",
+                json={
+                    "base_url": "https://public.example/v1",
+                    "api_key": "sk-schema-secret",
+                },
+            )
+
+        assert response.status_code == 502
+        assert response.json() == {
+            "detail": {
+                "code": "outbound_bad_response",
+                "message": "外部服务响应无效",
+            }
+        }
+        safe_client.fetch_json_response.assert_called_once()
+        assert "sk-schema-secret" not in response.text
+        assert "upstream-schema-sentinel" not in response.text
+        assert "upstream-schema-sentinel" not in caplog.text
+
+    def test_probe_response_and_logs_redact_credentials_and_query(
         self, client, mock_container, caplog
     ):
         from ...models.config import UIConfig
         from ...security import SafeProbeClient
 
-        secrets = ("sk-sentinel-key", "query-sentinel", "upstream-body-sentinel")
+        secrets = ("sk-sentinel-key", "query-sentinel")
         mock_container.config_service.get_ui_config.return_value = UIConfig()
         safe_client = MagicMock(spec=SafeProbeClient)
         safe_client.probe_status.return_value = 503
