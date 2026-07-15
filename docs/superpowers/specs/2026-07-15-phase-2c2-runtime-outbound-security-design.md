@@ -108,12 +108,25 @@ Phase 2C-1 已经建立统一的 URL 规范化、特殊地址分类、DNS 解析
 - 同步 JSON POST；
 - 异步 JSON POST；
 - 异步逐行流式 POST；
+- 分开接收不含 query/fragment 的 `base_url` 与同源 `request_target`；
 - 按响应类型传入限制和超时；
 - 按请求传入当前 `allow_local_ai_endpoints` 快照；
 - 返回状态码与已验证的 JSON 对象，或返回受控流事件；
 - 只抛出固定的 `OutboundRequestError`。
 
 客户端每次请求都执行完整流程，不接受业务代码预先校验后再交给普通 `httpx` 的用法。
+
+`OutboundURLPolicy` 继续严格拒绝任何带 query 或 fragment 的输入。运行时客户端只把 `base_url` 交给策略；请求路径和 Google query key 使用独立的 `request_target`。`request_target` 必须满足：
+
+- 以单个 `/` 开头，不能以 `//` 开头；
+- 解析后 scheme 和 netloc 都为空；
+- 不含 fragment、反斜杠、空白或控制字符；
+- 不能包含第二个绝对 URL 或改变协议、域名、端口的语法；
+- 动态模型名使用路径段百分号编码，query 使用 `urlencode` 构造；
+- 只允许在 `OutboundURLPolicy` 已返回 `ValidatedOutboundURL` 后拼接；
+- 使用 `validated.url.rstrip("/") + request_target`，不得使用会丢弃 base path 的 `urljoin`。
+
+固定目标传输层仍会核对最终 `httpx.Request` 的 host 和 port 与批准结果一致，因此 query 永远不能改变连接 origin。
 
 ### 6.4 业务适配层
 
@@ -127,16 +140,17 @@ Phase 2C-1 已经建立统一的 URL 规范化、特殊地址分类、DNS 解析
 
 1. 解析 capability 配置。
 2. 按现有策略选择负载均衡 provider；没有负载均衡时使用 override 或默认 provider。
-3. 生成最终 URL、headers 和 body。
+3. 生成不含 query/fragment 的 `base_url`、同源 `request_target`、headers 和 body。
 4. 读取当前 `allow_local_ai_endpoints` 的不可变快照。
-5. 由 `OutboundURLPolicy` 验证最终 URL 并完成唯一一次 DNS 解析。
-6. 使用本次 `ValidatedOutboundURL.resolved_ips` 建立连接。
-7. 以原始 host 执行 Host、SNI 和证书验证。
-8. 在响应类型对应的时限与大小限制内读取。
-9. 把正常结果交还现有业务解析器；把异常映射为固定、脱敏错误。
-10. 在所有退出路径关闭 response、stream、client 和 pool。
+5. 由 `OutboundURLPolicy` 验证 `base_url` 并完成唯一一次 DNS 解析。
+6. 验证 `request_target` 后与 `validated.url` 拼接；该步骤不得重新解析 URL origin。
+7. 使用本次 `ValidatedOutboundURL.resolved_ips` 建立连接。
+8. 以原始 host 执行 Host、SNI 和证书验证。
+9. 在响应类型对应的时限与大小限制内读取。
+10. 把正常结果交还现有业务解析器；把异常映射为固定、脱敏错误。
+11. 在所有退出路径关闭 response、stream、client 和 pool。
 
-Google API key 位于查询参数时，策略可以验证最终 URL，但任何日志、错误和诊断字段都不得包含 query。
+Google API key 位于查询参数时，策略只验证不含 query 的 provider `base_url`；Google adapter 使用 `urlencode({"key": api_key})` 构造相对 `request_target`。任何日志、错误和诊断字段都不得包含 query 或完整 target。
 
 ## 8. 配置来源与本地 AI 开关
 
@@ -306,6 +320,10 @@ Embedding 的文本截断、批次大小、并发 worker、指数退避、向量
 ### 16.2 运行时客户端测试
 
 - 默认禁止本地地址，开关开启仅允许三个精确回环形式；
+- `base_url` 含 query/fragment 时继续由 2C-1 策略拒绝；
+- 合法 Google 相对 target 保留 base path、编码模型名并发送 query key；
+- `//evil.example`、绝对 URL、反斜杠、fragment、控制字符和嵌套 URL target 全部拒绝；
+- target 无法改变批准的 host、port、Host header 或 TLS SNI；
 - 每次重试重新验证，但只使用本次结果；
 - 8 MiB、16 MiB、1 MiB 事件和“上限加 1”边界；
 - `Content-Length` 超限时零正文读取；
@@ -423,6 +441,12 @@ Embedding 的文本截断、批次大小、并发 worker、指数退避、向量
 
 控制：底层异常在安全客户端边界转换；哨兵值覆盖 headers、query、body、DNS 和响应；生产代码与文档执行扫描。
 
+### 19.7 相对请求目标逃逸
+
+风险：Google query key 需要出现在实际请求 target 中；如果使用通用 URL 拼接，恶意模型名或 target 可能改变 origin，或把 key 暴露给日志。
+
+控制：地址策略只接收无 query/fragment 的 base URL；target 使用独立严格校验、路径段编码和 `urlencode`；禁止 `urljoin`、绝对 target 与 network-path reference；固定传输再次核对最终 host/port。
+
 ## 20. 验收标准
 
 Phase 2C-2 只有在以下条件全部满足时才完成：
@@ -431,13 +455,14 @@ Phase 2C-2 只有在以下条件全部满足时才完成：
 2. 默认 provider、override、provider pool、环境变量和旧配置没有旁路。
 3. Embedding 每个批次通过统一安全客户端。
 4. DNS 校验结果真正固定到同步和异步连接。
-5. proxy、redirect、Unix socket 和非 identity 编码全部阻止。
-6. 所有大小、空闲和总时限边界有自动测试。
-7. 安全错误不触发 provider 切换或假向量降级。
-8. 正常网络错误的现有合法重试和降级保持兼容。
-9. 敏感信息不出现在响应、事件、异常、日志和文档中。
-10. 现有后端、前端、类型、lint 和 production build 门禁通过。
-11. 完整 Phase 2C 提交范围通过独立安全审查，没有未解决的 Critical 或 Important 问题。
-12. 分支在完成最终审查前不合并、不发布。
+5. Google query key 只存在于严格同源的相对 target，不能改变已批准 origin，也不能进入日志和错误。
+6. proxy、redirect、Unix socket 和非 identity 编码全部阻止。
+7. 所有大小、空闲和总时限边界有自动测试。
+8. 安全错误不触发 provider 切换或假向量降级。
+9. 正常网络错误的现有合法重试和降级保持兼容。
+10. 敏感信息不出现在响应、事件、异常、日志和文档中。
+11. 现有后端、前端、类型、lint 和 production build 门禁通过。
+12. 完整 Phase 2C 提交范围通过独立安全审查，没有未解决的 Critical 或 Important 问题。
+13. 分支在完成最终审查前不合并、不发布。
 
 满足全部条件后，Phase 2C 才可以被标记为完整，并进入分支合并选项。
