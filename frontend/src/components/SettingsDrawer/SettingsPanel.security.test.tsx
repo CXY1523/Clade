@@ -1,3 +1,4 @@
+import { useState, type ComponentProps } from "react";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -34,6 +35,38 @@ function renderPanel(onSave = vi.fn().mockResolvedValue(undefined), onClose = vi
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+type SettingsOnSave = ComponentProps<typeof SettingsPanel>["onSave"];
+
+function LifecycleHarness({ onSave }: { onSave: SettingsOnSave }) {
+  const [open, setOpen] = useState(true);
+  return open ? (
+    <SettingsPanel config={makeConfig()} onSave={onSave} onClose={() => setOpen(false)} />
+  ) : null;
+}
+
+async function startDeferredSecuritySave(
+  user: ReturnType<typeof userEvent.setup>,
+  onSave: SettingsOnSave
+) {
+  render(<LifecycleHarness onSave={onSave} />);
+  await changeSecuritySetting(user);
+  await act(async () => {
+    await user.type(screen.getByLabelText("管理员令牌"), "admin-secret");
+  });
+  await save(user);
+  await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+}
+
 async function changeSecuritySetting(user: ReturnType<typeof userEvent.setup>) {
   await act(async () => {
     await user.click(screen.getByRole("checkbox", { name: "允许访问本机 AI 服务" }));
@@ -48,6 +81,7 @@ async function save(user: ReturnType<typeof userEvent.setup>) {
 
 describe("SettingsPanel local AI security lifecycle", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -199,5 +233,84 @@ describe("SettingsPanel local AI security lifecycle", () => {
     expect(localSetItem).not.toHaveBeenCalled();
     expect(sessionSetItem).not.toHaveBeenCalled();
     expect(JSON.stringify(onSave.mock.calls[0][0])).not.toContain("admin-secret");
+  });
+
+  it("does not update state or schedule success work when a pending save resolves after close", async () => {
+    const user = userEvent.setup();
+    const pendingSave = deferred<void>();
+    const onSave = vi.fn().mockReturnValue(pendingSave.promise);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await startDeferredSecuritySave(user, onSave);
+
+    await act(async () => {
+      await user.click(screen.getByRole("button", { name: "取消" }));
+    });
+    expect(
+      screen.queryByRole("checkbox", { name: "允许访问本机 AI 服务" })
+    ).not.toBeInTheDocument();
+
+    vi.useFakeTimers();
+    await act(async () => {
+      pendingSave.resolve();
+      await pendingSave.promise;
+    });
+
+    expect(vi.getTimerCount()).toBe(0);
+    expect(consoleError).not.toHaveBeenCalled();
+    expect(consoleWarn).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it("does not map errors or update state when a pending save rejects after close", async () => {
+    const user = userEvent.setup();
+    const pendingSave = deferred<void>();
+    const onSave = vi.fn().mockReturnValue(pendingSave.promise);
+    const statusRead = vi.fn(() => 403);
+    const error = Object.assign(new Error("request failed"), {
+      statusText: "Forbidden",
+      code: "admin_token_invalid",
+    });
+    Object.defineProperty(error, "status", { get: statusRead });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await startDeferredSecuritySave(user, onSave);
+
+    await act(async () => {
+      await user.click(screen.getByRole("button", { name: "取消" }));
+    });
+    await act(async () => {
+      pendingSave.reject(error);
+      try {
+        await pendingSave.promise;
+      } catch {
+        // SettingsPanel owns the rejection and must ignore it after unmount.
+      }
+    });
+
+    expect(statusRead).not.toHaveBeenCalled();
+    expect(consoleError).not.toHaveBeenCalled();
+    expect(consoleWarn).not.toHaveBeenCalled();
+  });
+
+  it("clears the save-success timer when the panel unmounts", async () => {
+    const user = userEvent.setup();
+    const pendingSave = deferred<void>();
+    const onSave = vi.fn().mockReturnValue(pendingSave.promise);
+    await startDeferredSecuritySave(user, onSave);
+
+    vi.useFakeTimers();
+    await act(async () => {
+      pendingSave.resolve();
+      await pendingSave.promise;
+    });
+    expect(vi.getTimerCount()).toBe(1);
+
+    act(() => {
+      screen.getByRole("button", { name: "取消" }).click();
+    });
+
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
   });
 });

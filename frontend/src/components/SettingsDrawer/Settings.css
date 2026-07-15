@@ -963,6 +963,11 @@
   border-left-color: var(--s-success);
 }
 
+.local-ai-control .switch input:focus-visible + .switch-track {
+  outline: 2px solid var(--s-primary);
+  outline-offset: 3px;
+}
+
 .local-ai-control__header {
   display: flex;
   align-items: flex-start;

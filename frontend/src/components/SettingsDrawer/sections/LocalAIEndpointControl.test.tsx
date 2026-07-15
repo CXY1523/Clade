@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
@@ -77,5 +79,24 @@ describe("LocalAIEndpointControl", () => {
 
     rerender(<LocalAIEndpointControl {...props} enabled />);
     expect(screen.getByLabelText("管理员令牌")).toBeInTheDocument();
+  });
+
+  it("keeps keyboard focus visible on the switch track", async () => {
+    const user = userEvent.setup();
+    renderControl({}, { enabled: false, savedEnabled: false });
+
+    await user.tab();
+
+    const checkbox = screen.getByRole("checkbox", { name: "允许访问本机 AI 服务" });
+    expect(checkbox).toHaveFocus();
+    expect(checkbox.nextElementSibling).toHaveClass("switch-track");
+
+    const stylesheet = readFileSync(
+      resolve(process.cwd(), "src/components/SettingsDrawer/Settings.css"),
+      "utf8"
+    );
+    expect(stylesheet).toMatch(
+      /\.local-ai-control \.switch input:focus-visible \+ \.switch-track\s*\{[^}]*outline:/s
+    );
   });
 });

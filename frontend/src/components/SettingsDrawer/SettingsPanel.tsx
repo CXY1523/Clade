@@ -72,9 +72,26 @@ export function SettingsPanel({ config, onClose, onSave }: Props) {
   const [adminToken, setAdminToken] = useState("");
   const [saveError, setSaveError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mountedRef = useRef(true);
+  const saveSuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const savedLocalAI = config.allow_local_ai_endpoints ?? false;
   const draftLocalAI = state.form.allow_local_ai_endpoints ?? false;
   const localAIChanged = draftLocalAI !== savedLocalAI;
+
+  const clearSaveSuccessTimer = useCallback(() => {
+    if (saveSuccessTimerRef.current !== null) {
+      clearTimeout(saveSuccessTimerRef.current);
+      saveSuccessTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      clearSaveSuccessTimer();
+    };
+  }, [clearSaveSuccessTimer]);
 
   // 同步外部配置（确保预设服务商始终存在）
   useEffect(() => {
@@ -100,21 +117,33 @@ export function SettingsPanel({ config, onClose, onSave }: Props) {
       } else {
         await onSave(state.form);
       }
+      if (!mountedRef.current) return;
       dispatch({ type: "SET_SAVE_SUCCESS", success: true });
-      setTimeout(() => dispatch({ type: "SET_SAVE_SUCCESS", success: false }), 2000);
+      clearSaveSuccessTimer();
+      saveSuccessTimerRef.current = setTimeout(() => {
+        saveSuccessTimerRef.current = null;
+        if (mountedRef.current) {
+          dispatch({ type: "SET_SAVE_SUCCESS", success: false });
+        }
+      }, 2000);
     } catch (error) {
-      setSaveError(getConfigErrorMessage(error));
+      if (mountedRef.current) {
+        setSaveError(getConfigErrorMessage(error));
+      }
     } finally {
-      setAdminToken("");
-      dispatch({ type: "SET_SAVING", saving: false });
+      if (mountedRef.current) {
+        setAdminToken("");
+        dispatch({ type: "SET_SAVING", saving: false });
+      }
     }
-  }, [adminToken, localAIChanged, onSave, state.form]);
+  }, [adminToken, clearSaveSuccessTimer, localAIChanged, onSave, state.form]);
 
   const handleClose = useCallback(() => {
+    clearSaveSuccessTimer();
     setAdminToken("");
     setSaveError(null);
     onClose();
-  }, [onClose]);
+  }, [clearSaveSuccessTimer, onClose]);
 
   // 键盘快捷键
   useEffect(() => {
