@@ -825,6 +825,9 @@ export interface MapEnvironmentConfig {
 export interface UIConfig {
   // 1. 服务商库
   providers: Record<string, ProviderConfig>;
+
+  // 是否允许访问本机 AI 服务（默认关闭）
+  allow_local_ai_endpoints?: boolean;
   
   // 2. 全局默认设置
   default_provider_id?: string | null;

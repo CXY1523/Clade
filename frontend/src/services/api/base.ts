@@ -8,6 +8,7 @@ export interface ApiError extends Error {
   status: number;
   statusText: string;
   detail?: string;
+  code?: string;
 }
 
 export interface RequestConfig {
@@ -18,22 +19,61 @@ export interface RequestConfig {
 
 // ============ 工具函数 ============
 
-function createApiError(message: string, status: number, statusText: string, detail?: string): ApiError {
+function createApiError(
+  message: string,
+  status: number,
+  statusText: string,
+  detail?: string,
+  code?: string,
+): ApiError {
   const error = new Error(message) as ApiError;
   error.name = "ApiError";
   error.status = status;
   error.statusText = statusText;
   error.detail = detail;
+  if (code) {
+    error.code = code;
+  }
   return error;
 }
 
-async function parseErrorResponse(response: Response): Promise<string> {
+interface ParsedErrorResponse {
+  message: string;
+  code?: string;
+}
+
+async function parseErrorResponse(response: Response): Promise<ParsedErrorResponse> {
   try {
-    const data = await response.json();
-    return data.detail || data.message || data.error || response.statusText;
+    const data: unknown = await response.json();
+    if (typeof data === "object" && data !== null) {
+      const payload = data as Record<string, unknown>;
+      if (typeof payload.detail === "string") {
+        return { message: payload.detail };
+      }
+      if (typeof payload.detail === "object" && payload.detail !== null) {
+        const detail = payload.detail as Record<string, unknown>;
+        if (typeof detail.message === "string") {
+          return {
+            message: detail.message,
+            ...(typeof detail.code === "string" ? { code: detail.code } : {}),
+          };
+        }
+      }
+      if (typeof payload.message === "string") {
+        return { message: payload.message };
+      }
+      if (typeof payload.error === "string") {
+        return { message: payload.error };
+      }
+    }
   } catch {
-    return response.statusText;
+    // Fall through to the response status text.
   }
+  return { message: response.statusText };
+}
+
+export function isApiError(error: unknown): error is ApiError {
+  return error instanceof Error && typeof (error as Partial<ApiError>).status === "number";
 }
 
 // ============ 核心请求方法 ============
@@ -72,8 +112,8 @@ async function request<T>(
     clearTimeout(timeoutId);
 
     if (!response.ok) {
-      const detail = await parseErrorResponse(response);
-      throw createApiError(`请求失败: ${detail}`, response.status, response.statusText, detail);
+      const { message, code } = await parseErrorResponse(response);
+      throw createApiError(`请求失败: ${message}`, response.status, response.statusText, message, code);
     }
 
     // 处理空响应
@@ -107,8 +147,8 @@ async function requestBinary(path: string, config: RequestConfig = {}): Promise<
     clearTimeout(timeoutId);
 
     if (!response.ok) {
-      const detail = await parseErrorResponse(response);
-      throw createApiError(`请求失败: ${detail}`, response.status, response.statusText, detail);
+      const { message, code } = await parseErrorResponse(response);
+      throw createApiError(`请求失败: ${message}`, response.status, response.statusText, message, code);
     }
 
     return response.arrayBuffer();
