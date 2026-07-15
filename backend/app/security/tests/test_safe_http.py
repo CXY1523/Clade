@@ -18,6 +18,7 @@ from app.security.outbound_url import (
     OutboundURLPolicy,
     ValidatedOutboundURL,
 )
+from app.security.pinned_transport import _PinnedNetworkBackend
 from app.security.safe_http import (
     CONNECTION_TEST_TIMEOUTS,
     MODEL_LIST_MAX_BYTES,
@@ -25,7 +26,6 @@ from app.security.safe_http import (
     ProbeTimeouts,
     SafeProbeClient,
     _BoundedDaemonRunner,
-    _PinnedNetworkBackend,
 )
 
 
