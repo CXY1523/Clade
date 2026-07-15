@@ -8,8 +8,9 @@
  * - 模块化的 Section 组件
  */
 
-import { useReducer, useCallback, useEffect, useRef, type ReactNode } from "react";
+import { useReducer, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import type { UIConfig } from "@/services/api.types";
+import { getConfigErrorMessage, type UpdateUIConfigOptions } from "@/services/api";
 import { createDefaultConfig, settingsReducer, createInitialState, getInitialProviders } from "./reducer";
 import type { SettingsTab, ConfirmState } from "./types";
 import "./Settings.css";
@@ -17,6 +18,7 @@ import "./Settings.css";
 // Section 组件
 import {
   ConnectionSection,
+  LocalAIEndpointControl,
   EmbeddingSection,
   PerformanceSection,
   SpeciationSection,
@@ -32,7 +34,7 @@ import {
 interface Props {
   config: UIConfig;
   onClose: () => void;
-  onSave: (config: UIConfig) => Promise<void>;
+  onSave: (config: UIConfig, options?: UpdateUIConfigOptions) => Promise<void>;
 }
 
 // Tab 配置
@@ -67,7 +69,12 @@ const GROUP_LABELS = {
 
 export function SettingsPanel({ config, onClose, onSave }: Props) {
   const [state, dispatch] = useReducer(settingsReducer, config, createInitialState);
+  const [adminToken, setAdminToken] = useState("");
+  const [saveError, setSaveError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const savedLocalAI = config.allow_local_ai_endpoints ?? false;
+  const draftLocalAI = state.form.allow_local_ai_endpoints ?? false;
+  const localAIChanged = draftLocalAI !== savedLocalAI;
 
   // 同步外部配置（确保预设服务商始终存在）
   useEffect(() => {
@@ -81,17 +88,33 @@ export function SettingsPanel({ config, onClose, onSave }: Props) {
 
   // 保存配置
   const handleSave = useCallback(async () => {
+    if (localAIChanged && !adminToken) {
+      setSaveError("请输入管理员令牌");
+      return;
+    }
     dispatch({ type: "SET_SAVING", saving: true });
+    setSaveError(null);
     try {
-      await onSave(state.form);
+      if (localAIChanged) {
+        await onSave(state.form, { adminToken });
+      } else {
+        await onSave(state.form);
+      }
       dispatch({ type: "SET_SAVE_SUCCESS", success: true });
       setTimeout(() => dispatch({ type: "SET_SAVE_SUCCESS", success: false }), 2000);
-    } catch (err) {
-      console.error("保存配置失败:", err);
+    } catch (error) {
+      setSaveError(getConfigErrorMessage(error));
     } finally {
+      setAdminToken("");
       dispatch({ type: "SET_SAVING", saving: false });
     }
-  }, [state.form, onSave]);
+  }, [adminToken, localAIChanged, onSave, state.form]);
+
+  const handleClose = useCallback(() => {
+    setAdminToken("");
+    setSaveError(null);
+    onClose();
+  }, [onClose]);
 
   // 键盘快捷键
   useEffect(() => {
@@ -101,12 +124,12 @@ export function SettingsPanel({ config, onClose, onSave }: Props) {
         handleSave();
       }
       if (e.key === "Escape") {
-        onClose();
+        handleClose();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [handleSave, onClose]);
+  }, [handleClose, handleSave]);
 
   // 导出配置
   const handleExport = useCallback(() => {
@@ -217,14 +240,27 @@ export function SettingsPanel({ config, onClose, onSave }: Props) {
     switch (state.tab) {
       case "connection":
         return (
-          <ConnectionSection
-            providers={state.form.providers || {}}
-            selectedProviderId={state.selectedProviderId}
-            testResults={state.testResults}
-            testingProviderId={state.testingProviderId}
-            showApiKeys={state.showApiKeys}
-            dispatch={dispatch}
-          />
+          <>
+            <LocalAIEndpointControl
+              enabled={draftLocalAI}
+              savedEnabled={savedLocalAI}
+              providers={state.form.providers || {}}
+              adminToken={adminToken}
+              saveError={saveError}
+              onEnabledChange={(enabled) =>
+                dispatch({ type: "UPDATE_GLOBAL", field: "allow_local_ai_endpoints", value: enabled })
+              }
+              onAdminTokenChange={setAdminToken}
+            />
+            <ConnectionSection
+              providers={state.form.providers || {}}
+              selectedProviderId={state.selectedProviderId}
+              testResults={state.testResults}
+              testingProviderId={state.testingProviderId}
+              showApiKeys={state.showApiKeys}
+              dispatch={dispatch}
+            />
+          </>
         );
       case "embedding":
         return (
@@ -278,7 +314,7 @@ export function SettingsPanel({ config, onClose, onSave }: Props) {
   }, {} as Record<string, typeof TABS>);
 
   return (
-    <div className="settings-panel" onClick={onClose}>
+    <div className="settings-panel" onClick={handleClose}>
       <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
         {/* 头部 */}
         <header className="settings-header">
@@ -291,7 +327,7 @@ export function SettingsPanel({ config, onClose, onSave }: Props) {
               </div>
             </div>
           </div>
-          <button className="settings-close" onClick={onClose} title="关闭 (Esc)">
+          <button className="settings-close" onClick={handleClose} title="关闭 (Esc)">
             ✕
           </button>
         </header>
@@ -352,7 +388,7 @@ export function SettingsPanel({ config, onClose, onSave }: Props) {
             </div>
           </div>
           <div className="footer-right">
-            <button className="btn btn-outline" onClick={onClose}>
+            <button className="btn btn-outline" onClick={handleClose}>
               取消
             </button>
             <button
