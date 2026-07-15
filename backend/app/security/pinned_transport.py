@@ -163,6 +163,7 @@ class PinnedSyncTransport(httpx.BaseTransport):
             if network_backend is None
             else network_backend
         )
+        self._validated = validated
         self._pool = httpcore.ConnectionPool(
             ssl_context=ssl.create_default_context(),
             retries=0,
@@ -172,6 +173,11 @@ class PinnedSyncTransport(httpx.BaseTransport):
         )
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.scheme != self._validated.scheme:
+            raise httpcore.ConnectError("outbound origin does not match approval")
+
+        extensions = request.extensions.copy()
+        extensions.pop("sni_hostname", None)
         core_request = httpcore.Request(
             method=request.method,
             url=httpcore.URL(
@@ -182,7 +188,7 @@ class PinnedSyncTransport(httpx.BaseTransport):
             ),
             headers=request.headers.raw,
             content=request.stream,
-            extensions=request.extensions,
+            extensions=extensions,
         )
         core_response = self._pool.handle_request(core_request)
         return httpx.Response(

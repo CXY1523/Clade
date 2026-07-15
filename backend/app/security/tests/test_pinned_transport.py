@@ -186,6 +186,24 @@ def test_sync_transport_rejects_request_origin_mismatch(
     assert backend.connect_calls == []
 
 
+def test_sync_transport_rejects_request_scheme_mismatch() -> None:
+    stream = RecordingStream()
+    backend = RecordingBackend(stream)
+    transport = PinnedSyncTransport(_validated("93.184.216.34"), backend)
+
+    try:
+        with pytest.raises(httpcore.ConnectError) as exc_info:
+            transport.handle_request(
+                _request("http://public.example:443/v1/models")
+            )
+    finally:
+        transport.close()
+
+    assert str(exc_info.value) == "outbound origin does not match approval"
+    assert backend.connect_calls == []
+    assert stream.request_bytes == b""
+
+
 def test_sync_transport_rejects_unix_socket() -> None:
     backend = RecordingBackend(RecordingStream())
     transport = PinnedSyncTransport(_validated("93.184.216.34"), backend)
@@ -212,6 +230,30 @@ def test_sync_transport_keeps_original_host_and_tls_server_name() -> None:
     assert b"Host: public.example\r\n" in stream.request_bytes
     assert stream.tls_server_names == ["public.example"]
     assert [call[0] for call in backend.connect_calls] == ["93.184.216.34"]
+
+
+def test_sync_transport_ignores_sni_override_and_preserves_timeout() -> None:
+    sentinel = "sni-override-secret-sentinel"
+    stream = RecordingStream()
+    backend = RecordingBackend(stream)
+    transport = PinnedSyncTransport(_validated("93.184.216.34"), backend)
+    request = httpx.Request(
+        "GET",
+        "https://public.example/v1/models",
+        extensions={
+            "sni_hostname": sentinel,
+            "timeout": {"connect": 3.25},
+        },
+    )
+
+    response = transport.handle_request(request)
+    _close_response_and_transport(response, transport)
+
+    assert stream.tls_server_names == ["public.example"]
+    assert sentinel not in repr(stream.tls_server_names)
+    assert backend.connect_calls == [("93.184.216.34", 443, 3.25, None, None)]
+    assert request.extensions["sni_hostname"] == sentinel
+    assert request.extensions["timeout"] == {"connect": 3.25}
 
 
 @pytest.mark.parametrize(
