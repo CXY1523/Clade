@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import ValidationError
 
+from ..security import OutboundRequestError, SafeProbeClient
 from ..security.admin_token import AdminTokenValidationError, validate_admin_token
 from ..security.config_secrets import (
     UIConfigUpdateRequest,
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="", tags=["analytics"])
 _UI_CONFIG_UPDATE_LOCK = RLock()
+_SAFE_PROBE_CLIENT = SafeProbeClient()
 
 
 # ========== 导出 ==========
@@ -507,13 +509,9 @@ def test_api_connection(
     container: 'ServiceContainer' = Depends(get_container),
 ) -> dict:
     """测试 API 连接是否有效"""
-    import httpx
-
+    current = container.config_service.get_ui_config()
     try:
-        credentials = resolve_provider_credentials(
-            request,
-            container.config_service.get_ui_config(),
-        )
+        credentials = resolve_provider_credentials(request, current)
     except ValueError as exc:
         return {"success": False, "error": str(exc)}
 
@@ -524,35 +522,32 @@ def test_api_connection(
     if not base_url or not api_key:
         return {"success": False, "error": "缺少必要参数"}
     
+    headers = {"Authorization": f"Bearer {api_key}"}
+    endpoint = "models"
+
+    if provider_type == "anthropic":
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+        endpoint = "messages"
+
     try:
-        headers = {"Authorization": f"Bearer {api_key}"}
-        
-        if provider_type == "anthropic":
-            headers = {
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-            }
-            test_url = f"{base_url.rstrip('/')}/messages"
-        else:
-            test_url = f"{base_url.rstrip('/')}/models"
-        
-        with httpx.Client(timeout=10) as client:
-            response = client.get(test_url, headers=headers)
-        
-        if response.status_code == 200:
-            return {"success": True, "message": "连接成功"}
-        else:
-            return {
-                "success": False,
-                "error": f"API 返回状态码: {response.status_code}",
-            }
-            
-    except httpx.TimeoutException:
-        return {"success": False, "error": "连接超时"}
-    except httpx.ConnectError:
-        return {"success": False, "error": "连接失败"}
-    except Exception:
-        return {"success": False, "error": "请求失败"}
+        status_code = _SAFE_PROBE_CLIENT.probe_status(
+            base_url,
+            endpoint=endpoint,
+            headers=headers,
+            allow_local=current.allow_local_ai_endpoints,
+        )
+    except OutboundRequestError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.public_message},
+        ) from None
+
+    if status_code == 200:
+        return {"success": True, "message": "连接成功"}
+    return {"success": False, "error": "API 返回非成功状态"}
 
 
 @router.post("/config/fetch-models", openapi_extra=_json_object_request_openapi())
@@ -561,13 +556,9 @@ def fetch_models(
     container: 'ServiceContainer' = Depends(get_container),
 ) -> dict:
     """获取服务商的可用模型列表"""
-    import httpx
-
+    current = container.config_service.get_ui_config()
     try:
-        credentials = resolve_provider_credentials(
-            request,
-            container.config_service.get_ui_config(),
-        )
+        credentials = resolve_provider_credentials(request, current)
     except ValueError as exc:
         return {"success": False, "error": str(exc), "models": []}
 
@@ -578,47 +569,50 @@ def fetch_models(
     if not base_url or not api_key:
         return {"success": False, "error": "缺少必要参数", "models": []}
     
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    if provider_type == "anthropic":
+        # Anthropic 没有 models API，返回硬编码列表
+        return {
+            "success": True,
+            "models": [
+                {"id": "claude-3-opus-20240229", "name": "Claude 3 Opus"},
+                {"id": "claude-3-sonnet-20240229", "name": "Claude 3 Sonnet"},
+                {"id": "claude-3-haiku-20240307", "name": "Claude 3 Haiku"},
+                {"id": "claude-3-5-sonnet-20240620", "name": "Claude 3.5 Sonnet"},
+            ],
+        }
+
     try:
-        headers = {"Authorization": f"Bearer {api_key}"}
-        
-        if provider_type == "anthropic":
-            # Anthropic 没有 models API，返回硬编码列表
-            return {
-                "success": True,
-                "models": [
-                    {"id": "claude-3-opus-20240229", "name": "Claude 3 Opus"},
-                    {"id": "claude-3-sonnet-20240229", "name": "Claude 3 Sonnet"},
-                    {"id": "claude-3-haiku-20240307", "name": "Claude 3 Haiku"},
-                    {"id": "claude-3-5-sonnet-20240620", "name": "Claude 3.5 Sonnet"},
-                ],
-            }
-        
-        models_url = f"{base_url.rstrip('/')}/models"
-        
-        with httpx.Client(timeout=15) as client:
-            response = client.get(models_url, headers=headers)
-        
-        if response.status_code == 200:
-            data = response.json()
-            models = data.get("data", [])
-            
-            return {
-                "success": True,
-                "models": [
-                    {"id": m.get("id", ""), "name": m.get("id", "")}
-                    for m in models
-                    if m.get("id")
-                ],
-            }
-        else:
-            return {
-                "success": False,
-                "error": f"获取模型列表失败: {response.status_code}",
-                "models": [],
-            }
-            
-    except Exception:
-        return {"success": False, "error": "请求失败", "models": []}
+        response = _SAFE_PROBE_CLIENT.fetch_json_response(
+            base_url,
+            endpoint="models",
+            headers=headers,
+            allow_local=current.allow_local_ai_endpoints,
+        )
+    except OutboundRequestError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.public_message},
+        ) from None
+
+    if response.status_code != 200:
+        return {
+            "success": False,
+            "error": "API 返回非成功状态",
+            "models": [],
+        }
+
+    data = response.data or {}
+    models = data.get("data", [])
+    return {
+        "success": True,
+        "models": [
+            {"id": model.get("id", ""), "name": model.get("id", "")}
+            for model in models
+            if model.get("id")
+        ],
+    }
 
 
 # ========== 地图 ==========

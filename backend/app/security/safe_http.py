@@ -52,6 +52,12 @@ class ProbeTimeouts:
     total: float
 
 
+@dataclass(frozen=True)
+class ProbeJSONResponse:
+    status_code: int
+    data: dict[str, Any] | None
+
+
 CONNECTION_TEST_TIMEOUTS = ProbeTimeouts(5.0, 5.0, 5.0, 5.0, 10.0)
 MODEL_LIST_TIMEOUTS = ProbeTimeouts(5.0, 10.0, 5.0, 5.0, 15.0)
 MODEL_LIST_MAX_BYTES = 1_048_576
@@ -372,8 +378,28 @@ class SafeProbeClient:
         allow_local: bool,
         max_bytes: int = MODEL_LIST_MAX_BYTES,
     ) -> dict[str, Any]:
+        response = self.fetch_json_response(
+            base_url,
+            endpoint=endpoint,
+            headers=headers,
+            allow_local=allow_local,
+            max_bytes=max_bytes,
+        )
+        if response.status_code != 200 or response.data is None:
+            raise _bad_response()
+        return response.data
+
+    def fetch_json_response(
+        self,
+        base_url: str,
+        *,
+        endpoint: Literal["models", "messages"],
+        headers: Mapping[str, str],
+        allow_local: bool,
+        max_bytes: int = MODEL_LIST_MAX_BYTES,
+    ) -> ProbeJSONResponse:
         return self._run_with_deadline(
-            lambda: self._fetch_json(
+            lambda: self._fetch_json_response(
                 base_url,
                 endpoint=endpoint,
                 headers=headers,
@@ -471,7 +497,7 @@ class SafeProbeClient:
         finally:
             client.close()
 
-    def _fetch_json(
+    def _fetch_json_response(
         self,
         base_url: str,
         *,
@@ -480,7 +506,7 @@ class SafeProbeClient:
         allow_local: bool,
         max_bytes: int,
         timeouts: ProbeTimeouts,
-    ) -> dict[str, Any]:
+    ) -> ProbeJSONResponse:
         if max_bytes < 0:
             raise _invalid_url()
         max_bytes = min(max_bytes, MODEL_LIST_MAX_BYTES)
@@ -492,6 +518,12 @@ class SafeProbeClient:
             with client.stream(
                 "GET", request_url, headers=self._request_headers(headers)
             ) as response:
+                if response.status_code != 200:
+                    return ProbeJSONResponse(
+                        status_code=response.status_code,
+                        data=None,
+                    )
+
                 content_encoding = response.headers.get("Content-Encoding")
                 if content_encoding is not None:
                     encodings = [
@@ -527,6 +559,9 @@ class SafeProbeClient:
                     raise _bad_response() from None
                 if not isinstance(parsed, dict):
                     raise _bad_response()
-                return cast(dict[str, Any], parsed)
+                return ProbeJSONResponse(
+                    status_code=200,
+                    data=cast(dict[str, Any], parsed),
+                )
         finally:
             client.close()

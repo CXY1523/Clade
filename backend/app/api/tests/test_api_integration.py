@@ -14,6 +14,20 @@ import sys
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from fastapi.testclient import TestClient
+from ...security import OutboundRequestError
+
+
+ERROR_CASES = [
+    (OutboundRequestError("local_ai_disabled", 400, "本地 AI 访问未开启"), 400),
+    (
+        OutboundRequestError(
+            "private_network_blocked", 400, "该网络地址不允许访问"
+        ),
+        400,
+    ),
+    (OutboundRequestError("outbound_dns_failed", 502, "域名解析失败"), 502),
+    (OutboundRequestError("outbound_timeout", 504, "外部服务请求超时"), 504),
+]
 
 
 # ============================================================================
@@ -906,102 +920,250 @@ class TestNewRouterIntegration:
         assert save_order == ["replacement", "unrelated"]
         assert refresh_order == save_order
 
-    def test_api_connection_uses_stored_credentials_without_echoing_them(
-        self, client, mock_container, caplog
+    @pytest.mark.parametrize(
+        ("route", "payload", "client_method", "endpoint", "headers"),
+        [
+            (
+                "/api/config/test-api",
+                {
+                    "base_url": "http://127.0.0.1:1/v1/",
+                    "api_key": "sk-request",
+                    "provider_type": "anthropic",
+                },
+                "probe_status",
+                "messages",
+                {
+                    "x-api-key": "sk-request",
+                    "anthropic-version": "2023-06-01",
+                },
+            ),
+            (
+                "/api/config/fetch-models",
+                {"provider_id": "main"},
+                "fetch_json_response",
+                "models",
+                {"Authorization": "Bearer sk-stored"},
+            ),
+        ],
+        ids=["request-connection", "stored-model-list"],
+    )
+    def test_probe_routes_pass_current_local_flag_before_network(
+        self,
+        client,
+        mock_container,
+        route,
+        payload,
+        client_method,
+        endpoint,
+        headers,
     ):
         from ...models.config import ProviderConfig, UIConfig
+        from ...security import ProbeJSONResponse, SafeProbeClient
 
-        mock_container.config_service.get_ui_config.return_value = UIConfig(
+        current = UIConfig(
             providers={
                 "main": ProviderConfig(
                     id="main",
                     name="Main",
-                    base_url="https://stored.example/v1",
-                    api_key="sk-secret",
+                    base_url="http://127.0.0.1:1/v1/",
+                    api_key="sk-stored",
                 )
-            }
+            },
+            allow_local_ai_endpoints=True,
         )
-        upstream_response = MagicMock(
-            status_code=401,
-            text="upstream echoed sk-secret",
+        mock_container.config_service.get_ui_config.return_value = current
+        safe_client = MagicMock(spec=SafeProbeClient)
+        safe_client.probe_status.return_value = 200
+        safe_client.fetch_json_response.return_value = ProbeJSONResponse(
+            status_code=200,
+            data={"data": [{"id": "model-1"}]},
         )
-        http_client = MagicMock()
-        http_client.__enter__.return_value = http_client
-        http_client.get.return_value = upstream_response
 
-        with patch("httpx.Client", return_value=http_client):
-            response = client.post(
-                "/api/config/test-api", json={"provider_id": "main"}
-            )
+        with patch("app.api.analytics._SAFE_PROBE_CLIENT", safe_client):
+            response = client.post(route, json=payload)
 
         assert response.status_code == 200
-        assert response.json()["success"] is False
-        http_client.get.assert_called_once_with(
-            "https://stored.example/v1/models",
-            headers={"Authorization": "Bearer sk-secret"},
+        mock_container.config_service.get_ui_config.assert_called_once_with()
+        getattr(safe_client, client_method).assert_called_once_with(
+            "http://127.0.0.1:1/v1/",
+            endpoint=endpoint,
+            headers=headers,
+            allow_local=True,
         )
-        assert "sk-secret" not in response.text
-        assert "sk-secret" not in caplog.text
 
-    def test_fetch_models_uses_stored_credentials(self, client, mock_container):
-        from ...models.config import ProviderConfig, UIConfig
+    @pytest.mark.parametrize(
+        ("error", "expected_status"),
+        ERROR_CASES,
+    )
+    @pytest.mark.parametrize(
+        ("route", "client_method"),
+        [
+            ("/api/config/test-api", "probe_status"),
+            ("/api/config/fetch-models", "fetch_json_response"),
+        ],
+        ids=["connection", "model-list"],
+    )
+    def test_probe_routes_return_stable_redacted_errors(
+        self,
+        client,
+        mock_container,
+        route,
+        client_method,
+        error,
+        expected_status,
+    ):
+        from ...models.config import UIConfig
+        from ...security import SafeProbeClient
+
+        mock_container.config_service.get_ui_config.return_value = UIConfig()
+        safe_client = MagicMock(spec=SafeProbeClient)
+        getattr(safe_client, client_method).side_effect = error
+
+        with patch("app.api.analytics._SAFE_PROBE_CLIENT", safe_client):
+            response = client.post(
+                route,
+                json={
+                    "base_url": "http://127.0.0.1:1/v1",
+                    "api_key": "sk-secret",
+                },
+            )
+
+        assert response.status_code == expected_status
+        assert response.json() == {
+            "detail": {"code": error.code, "message": error.public_message}
+        }
+
+    def test_fetch_models_keeps_anthropic_hardcoded_list_without_network(
+        self, client, mock_container
+    ):
+        from ...models.config import UIConfig
+        from ...security import SafeProbeClient
 
         mock_container.config_service.get_ui_config.return_value = UIConfig(
-            providers={
-                "main": ProviderConfig(
-                    id="main",
-                    name="Main",
-                    base_url="https://stored.example/v1",
-                    api_key="sk-secret",
-                )
-            }
+            allow_local_ai_endpoints=True
         )
-        upstream_response = MagicMock()
-        upstream_response.status_code = 200
-        upstream_response.json.return_value = {"data": [{"id": "model-1"}]}
-        http_client = MagicMock()
-        http_client.__enter__.return_value = http_client
-        http_client.get.return_value = upstream_response
+        safe_client = MagicMock(spec=SafeProbeClient)
 
-        with patch("httpx.Client", return_value=http_client):
+        with patch("app.api.analytics._SAFE_PROBE_CLIENT", safe_client):
             response = client.post(
-                "/api/config/fetch-models", json={"provider_id": "main"}
+                "/api/config/fetch-models",
+                json={
+                    "base_url": "http://127.0.0.1:1/v1",
+                    "api_key": "sk-anthropic",
+                    "provider_type": "anthropic",
+                },
             )
 
         assert response.status_code == 200
         assert response.json() == {
             "success": True,
-            "models": [{"id": "model-1", "name": "model-1"}],
+            "models": [
+                {"id": "claude-3-opus-20240229", "name": "Claude 3 Opus"},
+                {"id": "claude-3-sonnet-20240229", "name": "Claude 3 Sonnet"},
+                {"id": "claude-3-haiku-20240307", "name": "Claude 3 Haiku"},
+                {
+                    "id": "claude-3-5-sonnet-20240620",
+                    "name": "Claude 3.5 Sonnet",
+                },
+            ],
         }
-        http_client.get.assert_called_once_with(
-            "https://stored.example/v1/models",
-            headers={"Authorization": "Bearer sk-secret"},
-        )
-        assert "sk-secret" not in response.text
+        safe_client.probe_status.assert_not_called()
+        safe_client.fetch_json_response.assert_not_called()
 
-    def test_fetch_models_does_not_echo_key_from_exception(
-        self, client, mock_container, caplog
+    @pytest.mark.parametrize(
+        ("code", "message"),
+        [
+            ("outbound_response_too_large", "外部服务响应过大"),
+            ("outbound_bad_response", "外部服务响应无效"),
+        ],
+        ids=["over-1-mib", "invalid-json"],
+    )
+    def test_fetch_models_returns_stable_502_for_unsafe_response_body(
+        self, client, mock_container, code, message
     ):
         from ...models.config import UIConfig
+        from ...security import OutboundRequestError, SafeProbeClient
 
         mock_container.config_service.get_ui_config.return_value = UIConfig()
-        http_client = MagicMock()
-        http_client.__enter__.return_value = http_client
-        http_client.get.side_effect = RuntimeError("request rejected for sk-unsaved")
+        safe_client = MagicMock(spec=SafeProbeClient)
+        safe_client.fetch_json_response.side_effect = OutboundRequestError(
+            code, 502, message
+        )
 
-        with patch("httpx.Client", return_value=http_client):
+        with patch("app.api.analytics._SAFE_PROBE_CLIENT", safe_client):
             response = client.post(
                 "/api/config/fetch-models",
                 json={
-                    "base_url": "https://new.example/v1",
-                    "api_key": "sk-unsaved",
+                    "base_url": "http://127.0.0.1:1/v1",
+                    "api_key": "sk-secret",
+                },
+            )
+
+        assert response.status_code == 502
+        assert response.json() == {"detail": {"code": code, "message": message}}
+
+    def test_fetch_models_non_200_is_one_redacted_business_failure(
+        self, client, mock_container, caplog
+    ):
+        from ...models.config import UIConfig
+        from ...security import ProbeJSONResponse, SafeProbeClient
+
+        secrets = ("sk-model-key", "query-model-secret", "upstream-model-secret")
+        mock_container.config_service.get_ui_config.return_value = UIConfig()
+        safe_client = MagicMock(spec=SafeProbeClient)
+        safe_client.fetch_json_response.return_value = ProbeJSONResponse(
+            status_code=401,
+            data=None,
+        )
+
+        with patch("app.api.analytics._SAFE_PROBE_CLIENT", safe_client):
+            response = client.post(
+                "/api/config/fetch-models",
+                json={
+                    "base_url": "https://public.example/v1?token=query-model-secret",
+                    "api_key": "sk-model-key",
                 },
             )
 
         assert response.status_code == 200
-        assert response.json()["success"] is False
-        assert "sk-unsaved" not in response.text
-        assert "sk-unsaved" not in caplog.text
+        assert response.json() == {
+            "success": False,
+            "error": "API 返回非成功状态",
+            "models": [],
+        }
+        safe_client.fetch_json_response.assert_called_once()
+        for secret in secrets:
+            assert secret not in response.text
+            assert secret not in caplog.text
+
+    def test_probe_response_and_logs_redact_credentials_query_and_upstream_body(
+        self, client, mock_container, caplog
+    ):
+        from ...models.config import UIConfig
+        from ...security import SafeProbeClient
+
+        secrets = ("sk-sentinel-key", "query-sentinel", "upstream-body-sentinel")
+        mock_container.config_service.get_ui_config.return_value = UIConfig()
+        safe_client = MagicMock(spec=SafeProbeClient)
+        safe_client.probe_status.return_value = 503
+
+        with patch("app.api.analytics._SAFE_PROBE_CLIENT", safe_client):
+            response = client.post(
+                "/api/config/test-api",
+                json={
+                    "base_url": "http://127.0.0.1:1/v1?token=query-sentinel",
+                    "api_key": "sk-sentinel-key",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": False,
+            "error": "API 返回非成功状态",
+        }
+        for secret in secrets:
+            assert secret not in response.text
+            assert secret not in caplog.text
 
     @pytest.mark.parametrize(
         "endpoint",

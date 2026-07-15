@@ -307,6 +307,87 @@ def test_probe_disables_environment_proxy_and_redirect_following(
     assert "redirect-secret.invalid" not in repr(backend.connect_calls)
 
 
+def test_probe_json_response_is_public_and_immutable() -> None:
+    import app.security as security
+
+    result_type = security.ProbeJSONResponse
+    result = result_type(status_code=200, data={"ok": True})
+
+    assert result.status_code == 200
+    assert result.data == {"ok": True}
+    with pytest.raises(AttributeError):
+        result.status_code = 201
+
+
+def test_fetch_json_response_non_200_skips_body_and_closes_one_request() -> None:
+    stream = CannedHTTPStream(
+        _response_headers(status=401, content_length=2_000_000),
+        [b"upstream-body-secret-must-not-be-read"],
+    )
+    backend = RecordingBackend(stream)
+    client = SafeProbeClient(policy=_public_policy(), network_backend=backend)
+
+    result = client.fetch_json_response(
+        "https://public.example/v1",
+        endpoint="models",
+        headers={"Authorization": "Bearer header-secret"},
+        allow_local=False,
+    )
+
+    assert result.status_code == 401
+    assert result.data is None
+    assert stream.body_bytes_read == 0
+    assert stream.close_count == 1
+    assert stream.request_bytes.count(b"GET /v1/models HTTP/1.1\r\n") == 1
+    assert len(backend.connect_calls) == 1
+
+
+def test_fetch_json_response_200_uses_existing_bounded_json_contract() -> None:
+    body = b'{"data":[{"id":"model-1"}]}'
+    stream = CannedHTTPStream(
+        _response_headers(content_length=len(body)),
+        [body],
+    )
+    backend = RecordingBackend(stream)
+    client = SafeProbeClient(policy=_public_policy(), network_backend=backend)
+
+    result = client.fetch_json_response(
+        "https://public.example/v1",
+        endpoint="models",
+        headers={},
+        allow_local=False,
+    )
+
+    assert result.status_code == 200
+    assert result.data == {"data": [{"id": "model-1"}]}
+    assert stream.body_bytes_read == len(body)
+    assert stream.close_count == 1
+    assert stream.request_bytes.count(b"GET /v1/models HTTP/1.1\r\n") == 1
+    assert len(backend.connect_calls) == 1
+
+
+def test_fetch_json_keeps_dict_contract_and_maps_non_200_to_bad_response() -> None:
+    stream = CannedHTTPStream(
+        _response_headers(status=503, content_length=2_000_000),
+        [b"upstream-body-secret-must-not-be-read"],
+    )
+    client = SafeProbeClient(
+        policy=_public_policy(), network_backend=RecordingBackend(stream)
+    )
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        client.fetch_json(
+            "https://public.example/v1",
+            endpoint="models",
+            headers={},
+            allow_local=False,
+        )
+
+    assert exc_info.value.code == "outbound_bad_response"
+    assert stream.body_bytes_read == 0
+    assert stream.close_count == 1
+
+
 def test_fetch_json_rejects_content_length_over_exact_one_mib() -> None:
     stream = CannedHTTPStream(
         _response_headers(content_length=MODEL_LIST_MAX_BYTES + 1),

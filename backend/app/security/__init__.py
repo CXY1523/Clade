@@ -12,6 +12,7 @@ from .safe_http import (
     CONNECTION_TEST_TIMEOUTS,
     MODEL_LIST_MAX_BYTES,
     MODEL_LIST_TIMEOUTS,
+    ProbeJSONResponse,
     ProbeTimeouts,
     SafeProbeClient,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "MODEL_LIST_TIMEOUTS",
     "OutboundRequestError",
     "OutboundURLPolicy",
+    "ProbeJSONResponse",
     "ProbeTimeouts",
     "SafeProbeClient",
     "UIConfigUpdateRequest",
