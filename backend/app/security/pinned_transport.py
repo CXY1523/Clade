@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ssl
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import httpcore
@@ -56,6 +56,52 @@ class _PinnedNetworkBackend(httpcore.NetworkBackend):
         self._delegate.sleep(seconds)
 
 
+class _PinnedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
+    def __init__(
+        self,
+        validated: ValidatedOutboundURL,
+        delegate: httpcore.AsyncNetworkBackend,
+    ) -> None:
+        self._validated = validated
+        self._delegate = delegate
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        if host != self._validated.hostname or port != self._validated.port:
+            raise httpcore.ConnectError("outbound origin does not match approval")
+
+        last_error: BaseException | None = None
+        for approved_ip in self._validated.resolved_ips:
+            try:
+                return await self._delegate.connect_tcp(
+                    str(approved_ip),
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout, OSError) as exc:
+                last_error = exc
+        raise httpcore.ConnectError("all approved addresses failed") from last_error
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        raise httpcore.ConnectError("unix sockets are not allowed")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._delegate.sleep(seconds)
+
+
 class _SanitizedNetworkStream(httpcore.NetworkStream):
     """Prevent delegate exception details from reaching httpcore trace logs."""
 
@@ -103,6 +149,57 @@ class _SanitizedNetworkStream(httpcore.NetworkStream):
         return _SanitizedNetworkStream(stream)
 
 
+class _SanitizedAsyncNetworkStream(httpcore.AsyncNetworkStream):
+    """Prevent delegate exception details from reaching httpcore trace logs."""
+
+    def __init__(self, delegate: httpcore.AsyncNetworkStream) -> None:
+        self._delegate = delegate
+
+    async def read(
+        self, max_bytes: int, timeout: float | None = None
+    ) -> bytes:
+        try:
+            return await self._delegate.read(max_bytes, timeout=timeout)
+        except httpcore.ReadTimeout:
+            raise httpcore.ReadTimeout("outbound read timed out") from None
+        except Exception:
+            raise httpcore.ReadError("outbound read failed") from None
+
+    async def write(
+        self, buffer: bytes, timeout: float | None = None
+    ) -> None:
+        try:
+            await self._delegate.write(buffer, timeout=timeout)
+        except httpcore.WriteTimeout:
+            raise httpcore.WriteTimeout("outbound write timed out") from None
+        except Exception:
+            raise httpcore.WriteError("outbound write failed") from None
+
+    async def aclose(self) -> None:
+        try:
+            await self._delegate.aclose()
+        except Exception:
+            raise httpcore.NetworkError("outbound close failed") from None
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        try:
+            stream = await self._delegate.start_tls(
+                ssl_context,
+                server_hostname=server_hostname,
+                timeout=timeout,
+            )
+        except httpcore.ConnectTimeout:
+            raise httpcore.ConnectTimeout("outbound TLS timed out") from None
+        except Exception:
+            raise httpcore.ConnectError("outbound TLS failed") from None
+        return _SanitizedAsyncNetworkStream(stream)
+
+
 class _SanitizedNetworkBackend(httpcore.NetworkBackend):
     def __init__(self, delegate: httpcore.NetworkBackend) -> None:
         self._delegate = delegate
@@ -141,6 +238,44 @@ class _SanitizedNetworkBackend(httpcore.NetworkBackend):
         self._delegate.sleep(seconds)
 
 
+class _SanitizedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
+    def __init__(self, delegate: httpcore.AsyncNetworkBackend) -> None:
+        self._delegate = delegate
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        try:
+            stream = await self._delegate.connect_tcp(
+                host,
+                port,
+                timeout=timeout,
+                local_address=local_address,
+                socket_options=socket_options,
+            )
+        except httpcore.ConnectTimeout:
+            raise httpcore.ConnectTimeout("outbound connect timed out") from None
+        except Exception:
+            raise httpcore.ConnectError("outbound connect failed") from None
+        return _SanitizedAsyncNetworkStream(stream)
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        raise httpcore.ConnectError("unix sockets are not allowed")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._delegate.sleep(seconds)
+
+
 class _CoreResponseStream(httpx.SyncByteStream):
     def __init__(self, stream: Any) -> None:
         self._stream = stream
@@ -150,6 +285,18 @@ class _CoreResponseStream(httpx.SyncByteStream):
 
     def close(self) -> None:
         self._stream.close()
+
+
+class _CoreAsyncResponseStream(httpx.AsyncByteStream):
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
 
 
 class PinnedSyncTransport(httpx.BaseTransport):
@@ -200,3 +347,53 @@ class PinnedSyncTransport(httpx.BaseTransport):
 
     def close(self) -> None:
         self._pool.close()
+
+
+class PinnedAsyncTransport(httpx.AsyncBaseTransport):
+    def __init__(
+        self,
+        validated: ValidatedOutboundURL,
+        network_backend: httpcore.AsyncNetworkBackend | None = None,
+    ) -> None:
+        delegate = (
+            httpcore.AnyIOBackend()
+            if network_backend is None
+            else network_backend
+        )
+        self._validated = validated
+        self._pool = httpcore.AsyncConnectionPool(
+            ssl_context=ssl.create_default_context(),
+            retries=0,
+            network_backend=_SanitizedAsyncNetworkBackend(
+                _PinnedAsyncNetworkBackend(validated, delegate)
+            ),
+        )
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.scheme != self._validated.scheme:
+            raise httpcore.ConnectError("outbound origin does not match approval")
+
+        extensions = request.extensions.copy()
+        extensions.pop("sni_hostname", None)
+        core_request = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=extensions,
+        )
+        core_response = await self._pool.handle_async_request(core_request)
+        return httpx.Response(
+            status_code=core_response.status,
+            headers=core_response.headers,
+            stream=_CoreAsyncResponseStream(core_response.stream),
+            extensions=core_response.extensions,
+        )
+
+    async def aclose(self) -> None:
+        await self._pool.aclose()
