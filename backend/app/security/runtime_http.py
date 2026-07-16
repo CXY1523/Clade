@@ -240,6 +240,7 @@ class SafeRuntimeClient:
                 validated,
                 self._sync_network_backend,
             )
+            client: httpx.Client | None = None
             try:
                 client = httpx.Client(
                     transport=transport,
@@ -252,10 +253,6 @@ class SafeRuntimeClient:
                     trust_env=False,
                     follow_redirects=False,
                 )
-            except BaseException:
-                transport.close()
-                raise
-            try:
                 with client.stream(
                     "POST",
                     request_url,
@@ -264,7 +261,10 @@ class SafeRuntimeClient:
                 ) as response:
                     return _read_sync_json(response, max_bytes)
             finally:
-                client.close()
+                if client is None:
+                    transport.close()
+                else:
+                    client.close()
         except OutboundRequestError:
             raise
         except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
@@ -273,6 +273,8 @@ class SafeRuntimeClient:
             raise _bad_response() from None
         except (httpx.RequestError, httpcore.NetworkError, OSError):
             raise _connect_failed() from None
+        except Exception:
+            raise _bad_response() from None
         finally:
             _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
 
@@ -301,6 +303,7 @@ class SafeRuntimeClient:
                 validated,
                 self._async_network_backend,
             )
+            client: httpx.AsyncClient | None = None
             try:
                 client = httpx.AsyncClient(
                     transport=transport,
@@ -313,10 +316,6 @@ class SafeRuntimeClient:
                     trust_env=False,
                     follow_redirects=False,
                 )
-            except BaseException:
-                await transport.aclose()
-                raise
-            try:
                 async with client.stream(
                     "POST",
                     request_url,
@@ -325,7 +324,10 @@ class SafeRuntimeClient:
                 ) as response:
                     return await _read_async_json(response, max_bytes)
             finally:
-                await client.aclose()
+                if client is None:
+                    await transport.aclose()
+                else:
+                    await client.aclose()
         except OutboundRequestError:
             raise
         except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
@@ -334,5 +336,7 @@ class SafeRuntimeClient:
             raise _bad_response() from None
         except (httpx.RequestError, httpcore.NetworkError, OSError):
             raise _connect_failed() from None
+        except Exception:
+            raise _bad_response() from None
         finally:
             _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)

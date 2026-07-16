@@ -400,6 +400,25 @@ def _request_bytes(stream: Any) -> bytes:
     return bytes(stream.request_bytes)
 
 
+def _record_parser_buffer_lengths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[int]:
+    lengths: list[int] = []
+
+    class RecordingParserBuffer(bytearray):
+        def extend(self, data: Any) -> None:
+            super().extend(data)
+            lengths.append(len(self))
+
+    monkeypatch.setattr(
+        runtime_http,
+        "bytearray",
+        RecordingParserBuffer,
+        raising=False,
+    )
+    return lengths
+
+
 def test_public_runtime_contract_is_exported() -> None:
     assert AI_JSON_MAX_BYTES == 8 * 1024 * 1024
     assert EMBEDDING_JSON_MAX_BYTES == 16 * 1024 * 1024
@@ -611,6 +630,76 @@ async def test_json_parser_limits_map_to_fixed_bad_response(
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize(
+    "case",
+    ["header-unicode", "body-unicode", "unserializable", "nan", "recursive"],
+)
+@pytest.mark.asyncio
+async def test_request_construction_errors_are_fixed_and_redacted(
+    mode: Mode,
+    case: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    header_sentinel = "header-construction-secret-sentinel"
+    body_sentinel = "body-construction-secret-sentinel"
+    repr_sentinel = "repr-construction-secret-sentinel"
+    value_sentinel = f"value-{case}-secret-sentinel"
+    headers: Mapping[str, str] = {}
+    json_body: Mapping[str, Any] = {"ok": True}
+
+    if case == "header-unicode":
+        headers = {"X-Secret": header_sentinel + "\ud800"}
+        active_sentinel = header_sentinel
+    elif case == "body-unicode":
+        json_body = {"prompt": body_sentinel + "\ud800"}
+        active_sentinel = body_sentinel
+    elif case == "unserializable":
+        secret_type = type(
+            repr_sentinel,
+            (),
+            {"__repr__": lambda self: repr_sentinel},
+        )
+        json_body = {"value": secret_type()}
+        active_sentinel = repr_sentinel
+    elif case == "nan":
+        json_body = {value_sentinel: float("nan")}
+        active_sentinel = value_sentinel
+    else:
+        nested: Any = 0
+        for _ in range(20_000):
+            nested = [nested]
+        json_body = {value_sentinel: nested}
+        active_sentinel = value_sentinel
+
+    stream = _stream_for(mode)
+    client, policy, backend = _runtime_client(mode, stream)
+    for logger_name in (
+        "httpx",
+        "httpcore.connection",
+        "httpcore.http11",
+        "httpcore.http2",
+        "httpcore.proxy",
+        "httpcore.socks",
+    ):
+        caplog.set_level(logging.DEBUG, logger=logger_name)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _invoke(
+            mode,
+            client,
+            headers=headers,
+            json_body=json_body,
+        )
+
+    assert exc_info.value.code == "outbound_bad_response"
+    assert str(exc_info.value) == "外部服务响应无效"
+    assert active_sentinel not in repr(exc_info.value)
+    assert active_sentinel not in caplog.text
+    assert policy.calls == [(VALIDATED_BASE, False)]
+    assert backend.connect_calls == []
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
 @pytest.mark.parametrize("status", [302, 400, 500])
 @pytest.mark.asyncio
 async def test_non_2xx_reads_zero_body_bytes_and_never_follows_redirects(
@@ -714,10 +803,12 @@ async def test_invalid_or_oversized_content_length_reads_zero_body_bytes(
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
 @pytest.mark.asyncio
-async def test_missing_content_length_stops_at_exactly_limit_plus_one(
+async def test_missing_content_length_incremental_body_exceeds_parser_limit(
     mode: Mode,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     limit = 17
+    parser_buffer_lengths = _record_parser_buffer_lengths(monkeypatch)
     stream = _stream_for(
         mode,
         body=b"x" * (limit + 100),
@@ -730,7 +821,38 @@ async def test_missing_content_length_stops_at_exactly_limit_plus_one(
         await _invoke(mode, client, max_bytes=limit)
 
     assert exc_info.value.code == "outbound_response_too_large"
-    assert stream.body_bytes_returned == limit + 1
+    assert parser_buffer_lengths
+    assert max(parser_buffer_lengths) == limit + 1
+    assert stream.body_bytes_returned >= limit + 1
+    assert stream.close_count == 1
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.asyncio
+async def test_coalesced_socket_read_still_enforces_parser_limit(
+    mode: Mode,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 17
+    body = b"x" * (limit + 100)
+    parser_buffer_lengths = _record_parser_buffer_lengths(monkeypatch)
+    stream = _stream_for(
+        mode,
+        body=body,
+        content_length=None,
+    )
+    client, _, _ = _runtime_client(mode, stream)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _invoke(mode, client, max_bytes=limit)
+
+    assert exc_info.value.code == "outbound_response_too_large"
+    assert parser_buffer_lengths
+    assert max(parser_buffer_lengths) == limit + 1
+    # This counter observes the fake TCP stream. HTTPcore may read ahead into
+    # its protocol buffer; only bytes handed to the runtime parser are bounded.
+    assert stream.body_bytes_returned > limit + 1
+    assert stream.close_count == 1
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
