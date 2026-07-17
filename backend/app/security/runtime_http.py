@@ -474,7 +474,13 @@ class SafeRuntimeClient:
                                 raw_line = raw_line[:-1]
                             if loop.time() >= deadline:
                                 raise TimeoutError
-                            yield raw_line.decode("utf-8", errors="strict")
+                            line = raw_line.decode("utf-8", errors="strict")
+                            _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
+                            token = None
+                            try:
+                                yield line
+                            finally:
+                                token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(True)
                             offset = newline + 1
 
                     if line_buffer:
@@ -485,7 +491,13 @@ class SafeRuntimeClient:
                             raw_line = raw_line[:-1]
                         if loop.time() >= deadline:
                             raise TimeoutError
-                        yield raw_line.decode("utf-8", errors="strict")
+                        line = raw_line.decode("utf-8", errors="strict")
+                        _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
+                        token = None
+                        try:
+                            yield line
+                        finally:
+                            token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(True)
                 finally:
                     if response is not None:
                         await response_context.__aexit__(None, None, None)
@@ -507,4 +519,5 @@ class SafeRuntimeClient:
         except Exception:
             raise _bad_response() from None
         finally:
-            _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
+            if token is not None:
+                _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)

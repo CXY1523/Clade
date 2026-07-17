@@ -1646,6 +1646,92 @@ async def test_stream_early_aclose_closes_response_client_and_transport_once(
 
 
 @pytest.mark.asyncio
+async def test_stream_logging_context_is_restored_while_yield_is_paused(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    internal_sentinel = "stream-internal-log-must-stay-hidden"
+    caller_sentinel = "stream-caller-log-must-stay-visible"
+
+    class InternallyLoggingStream(RecordingAsyncStream):
+        async def read(
+            self,
+            max_bytes: int,
+            timeout: float | None = None,
+        ) -> bytes:
+            if not self._head and self.body_bytes_returned:
+                logging.getLogger("httpx").info(internal_sentinel)
+            return await super().read(max_bytes, timeout=timeout)
+
+    caplog.set_level(logging.INFO, logger="httpx")
+    stream = InternallyLoggingStream(
+        body=b"first\nsecond\n",
+        body_chunk_size=6,
+    )
+    client, _, _ = _runtime_client("async", stream)
+    iterator = _open_runtime_line_stream(client)
+
+    first = await anext(iterator)
+    paused_after_first = runtime_http._SUPPRESS_RUNTIME_HTTP_LOGS.get()
+    logging.getLogger("httpx").info(caller_sentinel)
+    second = await asyncio.create_task(anext(iterator))
+    paused_after_second = runtime_http._SUPPRESS_RUNTIME_HTTP_LOGS.get()
+    await iterator.aclose()
+
+    assert [first, second] == ["first", "second"]
+    assert paused_after_first is False
+    assert paused_after_second is False
+    assert runtime_http._SUPPRESS_RUNTIME_HTTP_LOGS.get() is False
+    assert caller_sentinel in caplog.text
+    assert internal_sentinel not in caplog.text
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_can_continue_in_a_different_task_without_context_leak(
+) -> None:
+    stream = RecordingAsyncStream(
+        body=b"first\nsecond\n",
+        body_chunk_size=6,
+    )
+    client, _, _ = _runtime_client("async", stream)
+    iterator = _open_runtime_line_stream(client)
+
+    first = await asyncio.create_task(anext(iterator))
+
+    async def collect_remaining() -> tuple[list[str], bool]:
+        lines = [line async for line in iterator]
+        return lines, runtime_http._SUPPRESS_RUNTIME_HTTP_LOGS.get()
+
+    remaining, worker_context = await asyncio.create_task(collect_remaining())
+
+    assert first == "first"
+    assert remaining == ["second"]
+    assert worker_context is False
+    assert runtime_http._SUPPRESS_RUNTIME_HTTP_LOGS.get() is False
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_can_aclose_in_a_different_task_without_context_leak(
+) -> None:
+    stream = RecordingAsyncStream(body=b"first\nsecond\n")
+    client, _, _ = _runtime_client("async", stream)
+    iterator = _open_runtime_line_stream(client)
+
+    assert await asyncio.create_task(anext(iterator)) == "first"
+
+    async def close_and_read_context() -> bool:
+        await iterator.aclose()
+        return runtime_http._SUPPRESS_RUNTIME_HTTP_LOGS.get()
+
+    worker_context = await asyncio.create_task(close_and_read_context())
+
+    assert worker_context is False
+    assert runtime_http._SUPPRESS_RUNTIME_HTTP_LOGS.get() is False
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
 async def test_stream_cancel_propagates_and_closes_once() -> None:
     stream = RecordingAsyncStream(body=b"never", block_body=True)
     client, _, _ = _runtime_client("async", stream)
