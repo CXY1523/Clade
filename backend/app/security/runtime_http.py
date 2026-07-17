@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, cast
@@ -164,6 +166,18 @@ def _check_response_headers(response: httpx.Response, max_bytes: int) -> None:
         raise _bad_response()
     _reject_non_identity_encoding(response.headers)
     _reject_oversized_content_length(response.headers, max_bytes)
+
+
+def _validated_stream_timeout(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _invalid_url()
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError):
+        raise _invalid_url() from None
+    if normalized <= 0 or not math.isfinite(normalized):
+        raise _invalid_url()
+    return normalized
 
 
 def _parse_json_object(content: bytearray) -> dict[str, Any]:
@@ -329,6 +343,160 @@ class SafeRuntimeClient:
                 else:
                     await client.aclose()
         except OutboundRequestError:
+            raise
+        except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
+            raise _timeout() from None
+        except (httpx.DecodingError, httpx.ProtocolError, httpcore.ProtocolError):
+            raise _bad_response() from None
+        except (httpx.RequestError, httpcore.NetworkError, OSError):
+            raise _connect_failed() from None
+        except Exception:
+            raise _bad_response() from None
+        finally:
+            _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
+
+    async def astream_lines(
+        self,
+        base_url: str,
+        *,
+        request_target: str,
+        headers: Mapping[str, str],
+        json_body: Mapping[str, Any],
+        allow_local: bool,
+        max_bytes: int = STREAM_MAX_BYTES,
+        max_event_bytes: int = STREAM_EVENT_MAX_BYTES,
+        idle_timeout: float | None = None,
+        total_timeout: float | None = None,
+    ) -> AsyncIterator[str]:
+        token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(True)
+        try:
+            validated = self._policy.validate(base_url, allow_local=allow_local)
+            request_url = _validated_request_url(validated, request_target)
+            if (
+                not isinstance(max_bytes, int)
+                or isinstance(max_bytes, bool)
+                or max_bytes < 0
+                or not isinstance(max_event_bytes, int)
+                or isinstance(max_event_bytes, bool)
+                or max_event_bytes < 0
+            ):
+                raise _invalid_url()
+            idle_limit = _validated_stream_timeout(
+                self._timeouts.stream_idle
+                if idle_timeout is None
+                else idle_timeout,
+            )
+            total_limit = _validated_stream_timeout(
+                self._timeouts.stream_total
+                if total_timeout is None
+                else total_timeout,
+            )
+            transport = PinnedAsyncTransport(
+                validated,
+                self._async_network_backend,
+            )
+            client: httpx.AsyncClient | None = None
+            try:
+                client = httpx.AsyncClient(
+                    transport=transport,
+                    timeout=httpx.Timeout(
+                        connect=self._timeouts.connect,
+                        read=None,
+                        write=self._timeouts.write,
+                        pool=self._timeouts.pool,
+                    ),
+                    trust_env=False,
+                    follow_redirects=False,
+                )
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + total_limit
+                response_context = client.stream(
+                    "POST",
+                    request_url,
+                    headers=_request_headers(headers),
+                    json=json_body,
+                )
+                response: httpx.Response | None = None
+                try:
+                    response = await asyncio.wait_for(
+                        response_context.__aenter__(),
+                        timeout=min(
+                            idle_limit,
+                            max(0.0, deadline - loop.time()),
+                        ),
+                    )
+                    _check_response_headers(response, max_bytes)
+                    iterator = response.aiter_raw().__aiter__()
+                    line_buffer = bytearray()
+                    total_bytes = 0
+
+                    while True:
+                        remaining_total = deadline - loop.time()
+                        if remaining_total <= 0:
+                            raise TimeoutError
+                        chunk_timeout = min(idle_limit, remaining_total)
+                        try:
+                            chunk = await asyncio.wait_for(
+                                iterator.__anext__(),
+                                timeout=chunk_timeout,
+                            )
+                        except StopAsyncIteration:
+                            break
+
+                        total_bytes += len(chunk)
+                        if total_bytes > max_bytes:
+                            raise _response_too_large()
+
+                        offset = 0
+                        while offset < len(chunk):
+                            newline = chunk.find(b"\n", offset)
+                            segment_end = len(chunk) if newline < 0 else newline
+                            segment_length = segment_end - offset
+                            accumulator_room = (
+                                max_event_bytes + 1 - len(line_buffer)
+                            )
+                            copy_length = min(segment_length, accumulator_room)
+                            if copy_length:
+                                line_buffer.extend(
+                                    chunk[offset : offset + copy_length]
+                                )
+                            if (
+                                segment_length > accumulator_room
+                                or len(line_buffer) > max_event_bytes
+                            ):
+                                raise _response_too_large()
+                            if newline < 0:
+                                break
+
+                            raw_line = bytes(line_buffer)
+                            line_buffer.clear()
+                            if raw_line.endswith(b"\r"):
+                                raw_line = raw_line[:-1]
+                            if loop.time() >= deadline:
+                                raise TimeoutError
+                            yield raw_line.decode("utf-8", errors="strict")
+                            offset = newline + 1
+
+                    if line_buffer:
+                        if len(line_buffer) > max_event_bytes:
+                            raise _response_too_large()
+                        raw_line = bytes(line_buffer)
+                        if raw_line.endswith(b"\r"):
+                            raw_line = raw_line[:-1]
+                        if loop.time() >= deadline:
+                            raise TimeoutError
+                        yield raw_line.decode("utf-8", errors="strict")
+                finally:
+                    if response is not None:
+                        await response_context.__aexit__(None, None, None)
+            finally:
+                if client is None:
+                    await transport.aclose()
+                else:
+                    await client.aclose()
+        except OutboundRequestError:
+            raise
+        except asyncio.CancelledError:
             raise
         except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
             raise _timeout() from None

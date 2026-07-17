@@ -195,6 +195,7 @@ class RecordingAsyncStream(httpcore.AsyncNetworkStream):
         write_error: Exception | None = None,
         tls_error: Exception | None = None,
         block_body: bool = False,
+        body_read_delay: float = 0.0,
     ) -> None:
         self._head = bytearray(
             raw_head
@@ -212,6 +213,7 @@ class RecordingAsyncStream(httpcore.AsyncNetworkStream):
         self.write_error = write_error
         self.tls_error = tls_error
         self.block_body = block_body
+        self.body_read_delay = body_read_delay
         self.request_bytes = bytearray()
         self.body_bytes_returned = 0
         self.close_count = 0
@@ -228,6 +230,8 @@ class RecordingAsyncStream(httpcore.AsyncNetworkStream):
             del self._head[:max_bytes]
             return chunk
         self.body_read_started.set()
+        if self.body_read_delay:
+            await asyncio.sleep(self.body_read_delay)
         if self.block_body:
             await self._never_ready.wait()
         if self.read_error is not None:
@@ -1261,3 +1265,624 @@ async def test_async_cancellation_propagates_closes_and_keeps_other_task_logs(
     assert stream.close_count == 1
     assert outside_sentinel in caplog.text
     assert query_sentinel not in caplog.text
+
+
+def _open_runtime_line_stream(
+    client: SafeRuntimeClient,
+    *,
+    base_url: str = VALIDATED_BASE,
+    request_target: Any = VALID_TARGET,
+    headers: Mapping[str, str] | None = None,
+    json_body: Mapping[str, Any] | None = None,
+    allow_local: bool = False,
+    max_bytes: Any = STREAM_MAX_BYTES,
+    max_event_bytes: Any = STREAM_EVENT_MAX_BYTES,
+    idle_timeout: float | None = None,
+    total_timeout: float | None = None,
+) -> Any:
+    return client.astream_lines(
+        base_url,
+        request_target=request_target,
+        headers={} if headers is None else headers,
+        json_body={"request": True} if json_body is None else json_body,
+        allow_local=allow_local,
+        max_bytes=max_bytes,
+        max_event_bytes=max_event_bytes,
+        idle_timeout=idle_timeout,
+        total_timeout=total_timeout,
+    )
+
+
+async def _collect_runtime_lines(
+    client: SafeRuntimeClient,
+    **kwargs: Any,
+) -> list[str]:
+    return [line async for line in _open_runtime_line_stream(client, **kwargs)]
+
+
+@pytest.mark.asyncio
+async def test_stream_yields_utf8_lines_and_trims_terminal_carriage_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = "浣犲ソ\r\n\nfinal".encode("utf-8")
+    event_limit = len("浣犲ソ\r".encode("utf-8"))
+    parser_buffer_lengths = _record_parser_buffer_lengths(monkeypatch)
+    stream = RecordingAsyncStream(body=body, body_chunk_size=1)
+    client, policy, backend = _runtime_client("async", stream)
+
+    result = await _collect_runtime_lines(
+        client,
+        max_bytes=len(body),
+        max_event_bytes=event_limit,
+    )
+
+    assert result == ["浣犲ソ", "", "final"]
+    assert parser_buffer_lengths
+    assert max(parser_buffer_lengths) <= event_limit
+    assert policy.calls == [(VALIDATED_BASE, False)]
+    assert backend.connect_calls == [("93.184.216.34", 443)]
+    assert stream.close_count == 1
+
+
+@pytest.mark.parametrize(
+    "body_chunk_size",
+    [1, None],
+    ids=["incremental", "coalesced-default"],
+)
+@pytest.mark.parametrize(
+    ("body", "max_bytes", "max_event_bytes", "max_accumulator"),
+    [
+        (b"abcd\n", 5, 3, 4),
+        (b"abcd\r\n", 6, 4, 5),
+        (b"abcde", 5, 4, 5),
+        (b"abcd\n", 4, 4, 4),
+    ],
+    ids=[
+        "complete-event-plus-one",
+        "limit-before-carriage-return-trim",
+        "final-partial-plus-one",
+        "total-plus-one",
+    ],
+)
+@pytest.mark.asyncio
+async def test_stream_rejects_event_limit_plus_one_and_total_limit_plus_one(
+    body_chunk_size: int | None,
+    body: bytes,
+    max_bytes: int,
+    max_event_bytes: int,
+    max_accumulator: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser_buffer_lengths = _record_parser_buffer_lengths(monkeypatch)
+    stream = RecordingAsyncStream(
+        body=body,
+        content_length=None,
+        body_chunk_size=body_chunk_size,
+    )
+    client, _, _ = _runtime_client("async", stream)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(
+            client,
+            max_bytes=max_bytes,
+            max_event_bytes=max_event_bytes,
+        )
+
+    assert exc_info.value.code == "outbound_response_too_large"
+    assert max(parser_buffer_lengths, default=0) <= max_accumulator
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_coalesced_chunk_copies_only_to_event_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_limit = 4
+    max_slice = event_limit + 1
+    real_aiter_raw = httpx.Response.aiter_raw
+
+    class SliceGuard(bytes):
+        def __getitem__(self, key: Any) -> Any:
+            if isinstance(key, slice):
+                start, stop, step = key.indices(len(self))
+                if step == 1 and stop - start > max_slice:
+                    raise AssertionError("stream copied past the event sentinel")
+            return super().__getitem__(key)
+
+    async def guarded_aiter_raw(
+        response: httpx.Response,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        async for chunk in real_aiter_raw(response, *args, **kwargs):
+            yield SliceGuard(chunk)
+
+    monkeypatch.setattr(httpx.Response, "aiter_raw", guarded_aiter_raw)
+    body = b"x" * 100
+    stream = RecordingAsyncStream(body=body, content_length=None)
+    client, _, _ = _runtime_client("async", stream)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(
+            client,
+            max_bytes=len(body),
+            max_event_bytes=event_limit,
+        )
+
+    assert exc_info.value.code == "outbound_response_too_large"
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_accepts_equal_byte_limits_and_checks_final_partial_utf8(
+) -> None:
+    allowed = RecordingAsyncStream(body=b"abcd\n", content_length=None)
+    allowed_client, _, _ = _runtime_client("async", allowed)
+
+    assert await _collect_runtime_lines(
+        allowed_client,
+        max_bytes=5,
+        max_event_bytes=4,
+    ) == ["abcd"]
+    assert allowed.close_count == 1
+
+    invalid = RecordingAsyncStream(body=b"ok\n\xff", content_length=None)
+    invalid_client, _, _ = _runtime_client("async", invalid)
+    iterator = _open_runtime_line_stream(
+        invalid_client,
+        max_bytes=4,
+        max_event_bytes=2,
+    )
+
+    assert await anext(iterator) == "ok"
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await anext(iterator)
+    assert exc_info.value.code == "outbound_bad_response"
+    assert invalid.close_count == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "content_length", "expected_code"),
+    [
+        (500, {}, 1, "outbound_bad_response"),
+        (200, {"Content-Encoding": "gzip"}, 1, "outbound_bad_response"),
+        (200, {}, 9, "outbound_response_too_large"),
+    ],
+    ids=["non-2xx", "encoded", "oversized-content-length"],
+)
+@pytest.mark.asyncio
+async def test_stream_rejects_response_headers_before_application_iteration(
+    status: int,
+    headers: Mapping[str, str],
+    content_length: object,
+    expected_code: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser_buffer_lengths = _record_parser_buffer_lengths(monkeypatch)
+    stream = RecordingAsyncStream(
+        body=b"x",
+        status=status,
+        headers=headers,
+        content_length=content_length,
+    )
+    client, _, _ = _runtime_client("async", stream)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(
+            client,
+            max_bytes=8,
+            max_event_bytes=8,
+        )
+
+    assert exc_info.value.code == expected_code
+    assert parser_buffer_lengths == []
+    assert stream.body_bytes_returned == 0
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_idle_timeout_uses_runtime_default_and_closes_once() -> None:
+    class BlockAfterFirstBodyStream(RecordingAsyncStream):
+        def __init__(self) -> None:
+            super().__init__(
+                body=b"ready\n",
+                content_length=None,
+                body_chunk_size=6,
+            )
+            self.blocked_read_started = asyncio.Event()
+            self._blocked_forever = asyncio.Event()
+
+        async def read(
+            self,
+            max_bytes: int,
+            timeout: float | None = None,
+        ) -> bytes:
+            if not self._head and self.body_bytes_returned:
+                self.blocked_read_started.set()
+                await self._blocked_forever.wait()
+            return await super().read(max_bytes, timeout=timeout)
+
+    stream = BlockAfterFirstBodyStream()
+    client, _, _ = _runtime_client(
+        "async",
+        stream,
+        timeouts=RuntimeTimeouts(stream_idle=0.5, stream_total=2.0),
+    )
+    iterator = _open_runtime_line_stream(client)
+
+    assert await anext(iterator) == "ready"
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await anext(iterator)
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert stream.blocked_read_started.is_set()
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_total_deadline_is_distinct_and_spans_yields() -> None:
+    stream = RecordingAsyncStream(
+        body=b"a\n" * 20,
+        content_length=None,
+        body_chunk_size=2,
+        body_read_delay=0.03,
+    )
+    client, _, _ = _runtime_client(
+        "async",
+        stream,
+        timeouts=RuntimeTimeouts(stream_idle=0.1, stream_total=0.2),
+    )
+    iterator = _open_runtime_line_stream(client)
+
+    assert await anext(iterator) == "a"
+    with pytest.raises(OutboundRequestError) as exc_info:
+        async for _ in iterator:
+            pass
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_total_deadline_spans_lines_from_one_coalesced_chunk(
+) -> None:
+    stream = RecordingAsyncStream(body=b"first\nsecond\n")
+    client, _, _ = _runtime_client("async", stream)
+    iterator = _open_runtime_line_stream(
+        client,
+        idle_timeout=1.0,
+        total_timeout=0.5,
+    )
+
+    assert await anext(iterator) == "first"
+    await asyncio.sleep(0.55)
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await anext(iterator)
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_uses_fresh_hardened_clients_and_closes_success_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    streams = [
+        RecordingAsyncStream(body=b"one\n"),
+        RecordingAsyncStream(body=b"two\n"),
+    ]
+    backend = RecordingAsyncBackend(streams)
+    policy = RecordingPolicy()
+    timeouts = RuntimeTimeouts(
+        connect=1.25,
+        read=2.5,
+        write=3.75,
+        pool=4.5,
+        stream_idle=5.0,
+        stream_total=6.0,
+    )
+    client = SafeRuntimeClient(
+        policy,
+        async_network_backend=backend,
+        timeouts=timeouts,
+    )
+    constructor_kwargs: list[dict[str, Any]] = []
+    real_async_client = httpx.AsyncClient
+
+    def async_client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        constructor_kwargs.append(kwargs.copy())
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_http.httpx, "AsyncClient", async_client_factory)
+    headers = {
+        "hOsT": "evil-host-secret",
+        "aCcEpT-eNcOdInG": "gzip",
+        "Authorization": "Bearer caller-secret",
+    }
+
+    assert await _collect_runtime_lines(client, headers=headers) == ["one"]
+    assert await _collect_runtime_lines(client, headers=headers) == ["two"]
+
+    assert policy.calls == [
+        (VALIDATED_BASE, False),
+        (VALIDATED_BASE, False),
+    ]
+    assert backend.connect_calls == [
+        ("93.184.216.34", 443),
+        ("93.184.216.34", 443),
+    ]
+    assert len(constructor_kwargs) == 2
+    for kwargs in constructor_kwargs:
+        assert kwargs["trust_env"] is False
+        assert kwargs["follow_redirects"] is False
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, httpx.Timeout)
+        assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (
+            1.25,
+            None,
+            3.75,
+            4.5,
+        )
+    for stream in streams:
+        request = _request_bytes(stream).lower()
+        assert b"host: public.example\r\n" in request
+        assert b"evil-host-secret" not in request
+        assert request.count(b"accept-encoding: identity\r\n") == 1
+        assert b"accept-encoding: gzip" not in request
+        assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_early_aclose_closes_response_client_and_transport_once(
+) -> None:
+    stream = RecordingAsyncStream(body=b"first\nsecond\n")
+    client, _, _ = _runtime_client("async", stream)
+    iterator = _open_runtime_line_stream(client)
+
+    assert await anext(iterator) == "first"
+    await iterator.aclose()
+
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_cancel_propagates_and_closes_once() -> None:
+    stream = RecordingAsyncStream(body=b"never", block_body=True)
+    client, _, _ = _runtime_client("async", stream)
+    iterator = _open_runtime_line_stream(client)
+    task = asyncio.create_task(anext(iterator))
+
+    await asyncio.wait_for(stream.body_read_started.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_base_exception_propagates_unchanged_and_closes_once(
+) -> None:
+    class FatalStreamSignal(BaseException):
+        pass
+
+    signal = FatalStreamSignal("fatal-stream-sentinel")
+    stream = RecordingAsyncStream(read_error=cast(Any, signal))
+    client, _, _ = _runtime_client("async", stream)
+
+    with pytest.raises(FatalStreamSignal) as exc_info:
+        await _collect_runtime_lines(client)
+
+    assert exc_info.value is signal
+    assert stream.close_count == 1
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "invalid_limit"),
+    [
+        ("max_bytes", -1),
+        ("max_bytes", True),
+        ("max_bytes", 1.5),
+        ("max_bytes", "8"),
+        ("max_event_bytes", -1),
+        ("max_event_bytes", True),
+        ("max_event_bytes", 1.5),
+        ("max_event_bytes", "8"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stream_invalid_limit_types_are_rejected_before_network(
+    limit_name: str,
+    invalid_limit: Any,
+) -> None:
+    stream = RecordingAsyncStream()
+    client, policy, backend = _runtime_client("async", stream)
+    kwargs: dict[str, Any] = {"max_bytes": 8, "max_event_bytes": 8}
+    kwargs[limit_name] = invalid_limit
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(client, **kwargs)
+
+    assert exc_info.value.code == "outbound_url_invalid"
+    assert policy.calls == [(VALIDATED_BASE, False)]
+    assert backend.connect_calls == []
+    assert stream.close_count == 0
+
+
+@pytest.mark.parametrize("timeout_name", ["idle_timeout", "total_timeout"])
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    [True, "0.1", 0.0, -1.0, float("nan"), float("inf"), float("-inf")],
+    ids=["bool", "string", "zero", "negative", "nan", "inf", "neg-inf"],
+)
+@pytest.mark.asyncio
+async def test_stream_invalid_timeouts_are_rejected_before_network(
+    timeout_name: str,
+    invalid_timeout: Any,
+) -> None:
+    stream = RecordingAsyncStream()
+    client, policy, backend = _runtime_client("async", stream)
+    kwargs = {timeout_name: invalid_timeout}
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(client, **kwargs)
+
+    assert exc_info.value.code == "outbound_url_invalid"
+    assert policy.calls == [(VALIDATED_BASE, False)]
+    assert backend.connect_calls == []
+    assert stream.close_count == 0
+
+
+@pytest.mark.parametrize(
+    ("idle_timeout", "total_timeout"),
+    [(1.0, 3.0), (3.0, 1.0)],
+    ids=["idle", "total"],
+)
+@pytest.mark.asyncio
+async def test_stream_timeouts_cover_response_headers(
+    idle_timeout: float,
+    total_timeout: float,
+) -> None:
+    stream = RecordingAsyncStream(raw_head=b"", block_body=True)
+    client, _, _ = _runtime_client("async", stream)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await asyncio.wait_for(
+            _collect_runtime_lines(
+                client,
+                idle_timeout=idle_timeout,
+                total_timeout=total_timeout,
+            ),
+            timeout=2.5,
+        )
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert stream.body_read_started.is_set()
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_request_serialization_error_is_fixed_and_redacted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repr_sentinel = "stream-serialization-secret-sentinel"
+    secret_type = type(
+        repr_sentinel,
+        (),
+        {"__repr__": lambda self: repr_sentinel},
+    )
+    stream = RecordingAsyncStream()
+    client, policy, backend = _runtime_client("async", stream)
+    for logger_name in (
+        "httpx",
+        "httpcore.connection",
+        "httpcore.http11",
+        "httpcore.http2",
+        "httpcore.proxy",
+        "httpcore.socks",
+    ):
+        caplog.set_level(logging.DEBUG, logger=logger_name)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(
+            client,
+            json_body={"value": secret_type()},
+        )
+
+    assert exc_info.value.code == "outbound_bad_response"
+    assert repr_sentinel not in repr(exc_info.value)
+    assert repr_sentinel not in caplog.text
+    assert policy.calls == [(VALIDATED_BASE, False)]
+    assert backend.connect_calls == []
+    assert stream.close_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_constructor_failure_closes_new_transport_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructor_sentinel = "stream-client-constructor-secret"
+    stream = RecordingAsyncStream()
+    client, policy, backend = _runtime_client("async", stream)
+    created_transports: list[Any] = []
+    real_transport = runtime_http.PinnedAsyncTransport
+
+    class TrackingAsyncTransport(real_transport):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.close_count = 0
+            created_transports.append(self)
+
+        async def aclose(self) -> None:
+            self.close_count += 1
+            await super().aclose()
+
+    def failing_async_client(*args: Any, **kwargs: Any) -> None:
+        raise OSError(constructor_sentinel)
+
+    monkeypatch.setattr(
+        runtime_http,
+        "PinnedAsyncTransport",
+        TrackingAsyncTransport,
+    )
+    monkeypatch.setattr(runtime_http.httpx, "AsyncClient", failing_async_client)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(client)
+
+    assert exc_info.value.code == "outbound_connect_failed"
+    assert constructor_sentinel not in repr(exc_info.value)
+    assert policy.calls == [(VALIDATED_BASE, False)]
+    assert backend.connect_calls == []
+    assert len(created_transports) == 1
+    assert created_transports[0].close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_error_and_logs_redact_all_sentinels(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinels = {
+        "header": "stream-header-secret-sentinel",
+        "query": "stream-query-secret-sentinel",
+        "body": "stream-body-secret-sentinel",
+        "backend": "stream-backend-secret-sentinel",
+    }
+    stream = RecordingAsyncStream(
+        body=b"unread",
+        read_error=OSError(sentinels["backend"]),
+    )
+    client, _, _ = _runtime_client("async", stream)
+    for logger_name in (
+        "httpx",
+        "httpcore.connection",
+        "httpcore.http11",
+        "httpcore.http2",
+        "httpcore.proxy",
+        "httpcore.socks",
+    ):
+        caplog.set_level(logging.DEBUG, logger=logger_name)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(
+            client,
+            request_target=(
+                VALID_TARGET + "?" + urlencode({"key": sentinels["query"]})
+            ),
+            headers={"Authorization": "Bearer " + sentinels["header"]},
+            json_body={"prompt": sentinels["body"]},
+        )
+
+    wire_request = _request_bytes(stream).decode("utf-8")
+    assert sentinels["header"] in wire_request
+    assert sentinels["query"] in wire_request
+    assert sentinels["body"] in wire_request
+    for sentinel in sentinels.values():
+        assert sentinel not in repr(exc_info.value)
+        assert sentinel not in caplog.text
+    assert exc_info.value.code == "outbound_connect_failed"
+    assert stream.close_count == 1
+
+    outside_sentinel = "outside-stream-log-is-visible"
+    logging.getLogger("httpx").info(outside_sentinel)
+    assert outside_sentinel in caplog.text
