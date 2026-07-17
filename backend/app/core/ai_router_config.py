@@ -61,6 +61,10 @@ def configure_model_router(
     if not config:
         return config
     
+    model_router.allow_local_ai_endpoints = config.allow_local_ai_endpoints
+    if embedding_service:
+        embedding_service.allow_local_ai_endpoints = config.allow_local_ai_endpoints
+
     model_router.overrides = {}
     
     if config.ai_concurrency_limit > 0:

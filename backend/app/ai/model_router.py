@@ -8,8 +8,11 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable
+from urllib.parse import quote, urlencode
 
 import httpx
+
+from ..security.runtime_http import SafeRuntimeClient
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,8 @@ class ModelRouter:
         concurrency_limit: int = 50,
         max_retries: int = 2,
         use_keepalive: bool = False,  # 是否启用连接复用（高效并发模式）
+        runtime_client: SafeRuntimeClient | None = None,
+        allow_local_ai_endpoints: bool = False,
     ) -> None:
         self.routes = defaults or {}
         self.prompts: dict[str, str] = {}
@@ -65,6 +70,8 @@ class ModelRouter:
         self.overrides: dict[str, dict[str, Any]] = {}
         self.max_retries = max(1, max_retries)
         self.use_keepalive = use_keepalive  # 连接复用开关
+        self._runtime_client = runtime_client or SafeRuntimeClient()
+        self.allow_local_ai_endpoints = allow_local_ai_endpoints
         
         # 并发控制
         self.concurrency_limit = concurrency_limit
@@ -467,6 +474,30 @@ class ModelRouter:
                 "payload": payload,
             }
         }
+
+    def _provider_request_location(
+        self, provider_type, base_url, model_name, endpoint, *, stream
+    ) -> tuple[str, str]:
+        base_url_stripped = base_url.rstrip("/")
+
+        if provider_type == PROVIDER_TYPE_ANTHROPIC:
+            return base_url_stripped, "/messages"
+
+        if provider_type == PROVIDER_TYPE_GOOGLE:
+            action = "streamGenerateContent" if stream else "generateContent"
+            request_target = (
+                f"/models/{quote(str(model_name), safe='')}:{action}?"
+                f"{urlencode({'key': self.api_key})}"
+            )
+            return base_url_stripped, request_target
+
+        request_target = endpoint or "/chat/completions"
+        if (
+            request_target == "/chat/completions"
+            and not self._has_api_version_suffix(base_url_stripped)
+        ):
+            request_target = "/v1/chat/completions"
+        return base_url_stripped, request_target
 
     def invoke(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Sync invocation (blocking)"""
