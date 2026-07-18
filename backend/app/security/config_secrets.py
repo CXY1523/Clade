@@ -26,18 +26,21 @@ def resolve_provider_credentials(
 ) -> ProviderCredentials:
     provider_id = str(request.get("provider_id") or "")
     stored = current.providers.get(provider_id)
-    base_url = request.get("base_url") or (stored.base_url if stored else None)
-    api_key = request.get("api_key") or (stored.api_key if stored else None)
-    provider_type = request.get("provider_type") or (
-        stored.provider_type if stored else "openai"
-    )
-    if not api_key:
+    explicit_key = request.get("api_key")
+    if explicit_key:
+        base_url = request.get("base_url") or (stored.base_url if stored else None)
+        provider_type = request.get("provider_type") or (
+            stored.provider_type if stored else "openai"
+        )
+        return ProviderCredentials(base_url, str(explicit_key), provider_type)
+
+    if not stored or not stored.api_key:
         raise ValueError("API Key is not configured")
-    return ProviderCredentials(
-        base_url=base_url,
-        api_key=api_key,
-        provider_type=provider_type,
-    )
+    if request.get("base_url") not in (None, "", stored.base_url):
+        raise ValueError("A new API Key is required when changing provider endpoint")
+    if request.get("provider_type") not in (None, "", stored.provider_type):
+        raise ValueError("A new API Key is required when changing provider type")
+    return ProviderCredentials(stored.base_url, stored.api_key, stored.provider_type)
 
 
 def public_ui_config(config: UIConfig) -> dict[str, Any]:

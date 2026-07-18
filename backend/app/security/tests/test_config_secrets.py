@@ -68,6 +68,39 @@ def test_provider_id_resolves_stored_credentials() -> None:
     assert credentials.provider_type == "openai"
 
 
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"base_url": "https://changed.example/v1"},
+        {"provider_type": "anthropic"},
+    ],
+)
+def test_stored_key_rejects_changed_credential_tuple_without_new_key(override):
+    current = config_with_key()
+    current.providers["main"].base_url = "https://saved.example/v1"
+    with pytest.raises(ValueError, match="new API Key"):
+        resolve_provider_credentials(
+            {"provider_id": "main", "api_key": "", **override}, current
+        )
+
+
+def test_stored_key_accepts_matching_public_provider_fields():
+    current = config_with_key()
+    current.providers["main"].base_url = "https://saved.example/v1"
+    credentials = resolve_provider_credentials(
+        {
+            "provider_id": "main",
+            "base_url": "https://saved.example/v1",
+            "api_key": "",
+            "provider_type": "openai",
+        },
+        current,
+    )
+    assert credentials.base_url == "https://saved.example/v1"
+    assert credentials.api_key == "sk-secret"
+    assert credentials.provider_type == "openai"
+
+
 def test_unsaved_values_override_stored_credentials() -> None:
     credentials = resolve_provider_credentials(
         {

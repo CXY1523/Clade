@@ -992,6 +992,45 @@ class TestNewRouterIntegration:
         )
 
     @pytest.mark.parametrize(
+        ("route", "client_method"),
+        [
+            ("/api/config/test-api", "probe_status"),
+            ("/api/config/fetch-models", "fetch_json_response"),
+        ],
+    )
+    def test_probe_routes_reject_changed_endpoint_with_stored_key(
+        self, client, mock_container, route, client_method
+    ):
+        from ...models.config import ProviderConfig, UIConfig
+        from ...security import SafeProbeClient
+
+        current = UIConfig(
+            providers={
+                "main": ProviderConfig(
+                    id="main",
+                    name="Main",
+                    base_url="https://saved.example/v1",
+                    api_key="stored-key-sentinel",
+                )
+            }
+        )
+        mock_container.config_service.get_ui_config.return_value = current
+        safe_client = MagicMock(spec=SafeProbeClient)
+        with patch("app.api.analytics._SAFE_PROBE_CLIENT", safe_client):
+            response = client.post(
+                route,
+                json={
+                    "provider_id": "main",
+                    "base_url": "https://changed.example/v1",
+                    "api_key": "",
+                },
+            )
+        assert response.status_code == 200
+        assert response.json()["success"] is False
+        getattr(safe_client, client_method).assert_not_called()
+        assert "stored-key-sentinel" not in response.text
+
+    @pytest.mark.parametrize(
         ("error", "expected_status"),
         ERROR_CASES,
     )
