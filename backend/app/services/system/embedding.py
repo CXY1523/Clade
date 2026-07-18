@@ -260,7 +260,12 @@ class EmbeddingService:
     @property
     def model_identifier(self) -> str:
         """生成模型标识符，用于缓存隔离"""
-        config = self._runtime_config_snapshot()
+        return self._model_identifier_for_config(self._runtime_config_snapshot())
+
+    def _model_identifier_for_config(
+        self,
+        config: _EmbeddingRuntimeConfig,
+    ) -> str:
         if config.enabled and config.model:
             return f"{config.provider}_{config.model}"
         return f"fake_{self.dimension}d"
@@ -286,6 +291,7 @@ class EmbeddingService:
         texts = list(texts)
         if not texts:
             return []
+        runtime_config = self._runtime_config_snapshot()
         
         self._stats["embed_calls"] += 1
         
@@ -296,7 +302,7 @@ class EmbeddingService:
         
         # 第一遍：检查缓存
         for idx, text in enumerate(texts):
-            cache_key = self._make_cache_key(text)
+            cache_key = self._make_cache_key(text, runtime_config)
             
             # 检查内存缓存
             if cache_key in self._memory_cache:
@@ -331,7 +337,8 @@ class EmbeddingService:
             new_vectors = self._generate_vectors_batch(
                 uncached_texts, 
                 require_real=require_real,
-                batch_size=batch_size
+                batch_size=batch_size,
+                runtime_config=runtime_config,
             )
             
             for i, (idx, text, vec) in enumerate(zip(uncached_indices, uncached_texts, new_vectors)):
@@ -340,8 +347,8 @@ class EmbeddingService:
                 vectors[idx] = vec
                 
                 # 存入缓存
-                cache_key = self._make_cache_key(text)
-                self._store_in_disk_cache(cache_key, vec, text)
+                cache_key = self._make_cache_key(text, runtime_config)
+                self._store_in_disk_cache(cache_key, vec, text, runtime_config)
                 self._update_memory_cache(cache_key, vec)
         
         return vectors
@@ -354,13 +361,19 @@ class EmbeddingService:
         self, 
         texts: list[str], 
         require_real: bool = False,
-        batch_size: int = 100
+        batch_size: int = 100,
+        runtime_config: _EmbeddingRuntimeConfig | None = None,
     ) -> list[list[float]]:
         """批量生成向量（内部方法）"""
-        config = self._runtime_config_snapshot()
+        config = runtime_config or self._runtime_config_snapshot()
         if config.enabled and config.api_base_url and config.api_key and config.model:
             # 使用远程 API
-            return self._remote_embed_batch(texts, require_real, batch_size)
+            return self._remote_embed_batch(
+                texts,
+                require_real,
+                batch_size,
+                runtime_config=config,
+            )
         else:
             if require_real:
                 raise RuntimeError(
@@ -376,7 +389,8 @@ class EmbeddingService:
         self, 
         texts: list[str], 
         require_real: bool = False,
-        batch_size: int = 10  # 【优化】减小默认批量大小，提高稳定性
+        batch_size: int = 10,  # 【优化】减小默认批量大小，提高稳定性
+        runtime_config: _EmbeddingRuntimeConfig | None = None,
     ) -> list[list[float]]:
         """批量调用远程 Embedding API（支持并发分片）
         
@@ -399,11 +413,16 @@ class EmbeddingService:
         ]
         if not chunks:
             return []
+        config = runtime_config or self._runtime_config_snapshot()
         
         results: list[list[list[float]] | None] = [None] * len(chunks)
         
         def run_chunk(idx: int, chunk: list[str]) -> None:
-            vectors = self._request_embedding_chunk(chunk, require_real)
+            vectors = self._request_embedding_chunk(
+                chunk,
+                require_real,
+                runtime_config=config,
+            )
             results[idx] = vectors
         
         max_workers = self.max_parallel_requests if self.enable_concurrency else 1
@@ -413,7 +432,12 @@ class EmbeddingService:
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {
-                    executor.submit(self._request_embedding_chunk, chunk, require_real): idx
+                    executor.submit(
+                        self._request_embedding_chunk,
+                        chunk,
+                        require_real,
+                        runtime_config=config,
+                    ): idx
                     for idx, chunk in enumerate(chunks)
                 }
                 for future in as_completed(future_map):
@@ -432,9 +456,10 @@ class EmbeddingService:
         batch_texts: list[str],
         require_real: bool,
         max_retries: int = 3,
+        runtime_config: _EmbeddingRuntimeConfig | None = None,
     ) -> list[list[float]]:
         """Request one embedding chunk through the guarded runtime client."""
-        config = self._runtime_config_snapshot()
+        config = runtime_config or self._runtime_config_snapshot()
         headers = {"Authorization": f"Bearer {config.api_key}"}
         max_text_length = 2000
         truncated_texts = [
@@ -540,9 +565,14 @@ class EmbeddingService:
             return vec + [0.0] * (target_dim - len(vec))
         return vec
 
-    def _make_cache_key(self, text: str) -> str:
+    def _make_cache_key(
+        self,
+        text: str,
+        runtime_config: _EmbeddingRuntimeConfig | None = None,
+    ) -> str:
         """生成缓存 key（包含模型标识）"""
-        content = f"{self.model_identifier}:{text}"
+        config = runtime_config or self._runtime_config_snapshot()
+        content = f"{self._model_identifier_for_config(config)}:{text}"
         return hashlib.sha256(content.encode()).hexdigest()
 
     # ==================== 内存缓存管理 ====================
@@ -582,18 +612,25 @@ class EmbeddingService:
         
         return None
 
-    def _store_in_disk_cache(self, cache_key: str, vector: list[float], text: str) -> None:
+    def _store_in_disk_cache(
+        self,
+        cache_key: str,
+        vector: list[float],
+        text: str,
+        runtime_config: _EmbeddingRuntimeConfig | None = None,
+    ) -> None:
         """存储到磁盘缓存"""
+        config = runtime_config or self._runtime_config_snapshot()
         path = self._disk_cache_path(cache_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         
         data = {
             "vector": vector,
             "metadata": {
-                "provider": self.provider,
-                "model": self.model,
+                "provider": config.provider,
+                "model": config.model,
                 "dimension": len(vector),
-                "model_identifier": self.model_identifier,
+                "model_identifier": self._model_identifier_for_config(config),
                 "text_preview": text[:100] if text else "",
             }
         }

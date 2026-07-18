@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import math
 import threading
 from pathlib import Path
@@ -68,6 +70,34 @@ def _find_forbidden_network_uses(source: str) -> list[str]:
             resolved[0] = aliases.get(resolved[0], resolved[0])
             return ".".join(resolved)
         return None
+
+    assignments: list[tuple[list[str], ast.AST]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            target_names = [
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            ]
+            if target_names:
+                assignments.append((target_names, node.value))
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+        ):
+            assignments.append(([node.target.id], node.value))
+
+    for _ in range(len(assignments) + 1):
+        changed = False
+        for target_names, value in assignments:
+            assigned_name = name_of(value)
+            if assigned_name is None:
+                continue
+            for target_name in target_names:
+                if aliases.get(target_name) != assigned_name:
+                    aliases[target_name] = assigned_name
+                    changed = True
+        if not changed:
+            break
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -348,6 +378,65 @@ def test_chunk_does_not_enable_fake_fallback_after_first_failure(
     assert service._stats["fake_embeds"] == 1
 
 
+def test_public_embed_binds_cache_and_metadata_to_generation_config(
+    tmp_path: Path,
+) -> None:
+    client = RecordingSafeRuntimeClient([
+        {"data": [{"index": 0, "embedding": [1.0]}]},
+        {"data": [{"index": 0, "embedding": [2.0]}]},
+    ])
+    service = EmbeddingService(
+        provider="provider-a",
+        dimension=1,
+        base_url="https://provider-a.example/v1",
+        api_key="key-a",
+        model="model-a",
+        enabled=True,
+        cache_dir=tmp_path,
+        runtime_client=client,
+        allow_local_ai_endpoints=True,
+    )
+
+    def switch_to_provider_b(call_number: int) -> None:
+        if call_number == 1:
+            service.configure_runtime_config(
+                provider="provider-b",
+                base_url="https://provider-b.example/v1",
+                api_key="key-b",
+                model="model-b",
+                enabled=True,
+                allow_local_ai_endpoints=False,
+            )
+
+    client.on_call = switch_to_provider_b
+
+    first = service.embed(["same text"], require_real=True)
+    second = service.embed(["same text"], require_real=True)
+
+    assert first == [[1.0]]
+    assert (second, len(client.calls)) == ([[2.0]], 2)
+    assert [call["base_url"] for call in client.calls] == [
+        "https://provider-a.example/v1",
+        "https://provider-b.example/v1",
+    ]
+    assert service._stats["cache_hits"] == 0
+
+    cache_files = list((tmp_path / "vectors").glob("*/*.json"))
+    assert len(cache_files) == 2
+    provider_a_key = hashlib.sha256(
+        "provider-a_model-a:same text".encode()
+    ).hexdigest()
+    provider_a_file = next(path for path in cache_files if path.stem == provider_a_key)
+    provider_a_data = json.loads(provider_a_file.read_text(encoding="utf-8"))
+    assert provider_a_data["metadata"] == {
+        "provider": "provider-a",
+        "model": "model-a",
+        "dimension": 1,
+        "model_identifier": "provider-a_model-a",
+        "text_preview": "same text",
+    }
+
+
 def test_concurrent_chunks_preserve_input_order_and_stats() -> None:
     client = RecordingSafeRuntimeClient([])
     first_started = threading.Event()
@@ -445,6 +534,7 @@ def test_embedding_module_has_no_direct_network_bypass() -> None:
     [
         "from urllib import request as req\nreq.urlopen('https://example.com')\n",
         "import urllib as u\nu.request.urlopen('https://example.com')\n",
+        "import urllib as u\nreq = u.request\nreq.urlopen('https://example.com')\n",
     ],
 )
 def test_embedding_network_guard_rejects_urllib_alias_mutations(source: str) -> None:
