@@ -51,6 +51,38 @@ def _resolve_final_model(
     return None
 
 
+def _commit_embedding_runtime_config(
+    embedding_service: 'EmbeddingService',
+    *,
+    allow_local_ai_endpoints: bool,
+    runtime_values: dict[str, object] | None,
+) -> None:
+    atomic_configure = getattr(embedding_service, "configure_runtime_config", None)
+    if callable(atomic_configure):
+        if runtime_values is None:
+            atomic_configure(
+                enabled=False,
+                allow_local_ai_endpoints=allow_local_ai_endpoints,
+            )
+        else:
+            atomic_configure(
+                **runtime_values,
+                allow_local_ai_endpoints=allow_local_ai_endpoints,
+            )
+        return
+
+    # Compatibility for old callers and lightweight test doubles.
+    embedding_service.allow_local_ai_endpoints = allow_local_ai_endpoints
+    if runtime_values is None:
+        embedding_service.enabled = False
+        return
+    embedding_service.provider = runtime_values["provider"]
+    embedding_service.api_base_url = runtime_values["base_url"]
+    embedding_service.api_key = runtime_values["api_key"]
+    embedding_service.model = runtime_values["model"]
+    embedding_service.enabled = runtime_values["enabled"]
+
+
 def configure_model_router(
     config: UIConfig,
     model_router: ModelRouter,
@@ -62,8 +94,6 @@ def configure_model_router(
         return config
     
     model_router.allow_local_ai_endpoints = config.allow_local_ai_endpoints
-    if embedding_service:
-        embedding_service.allow_local_ai_endpoints = config.allow_local_ai_endpoints
 
     model_router.overrides = {}
     
@@ -214,21 +244,30 @@ def configure_model_router(
     
     emb_provider = providers.get(config.embedding_provider_id) if config.embedding_provider_id else None
     
+    embedding_runtime_values: dict[str, object] | None = None
     if emb_provider and embedding_service:
-        embedding_service.provider = emb_provider.type
-        embedding_service.api_base_url = emb_provider.base_url
-        embedding_service.api_key = emb_provider.api_key
-        embedding_service.model = config.embedding_model
-        embedding_service.enabled = True
+        embedding_runtime_values = {
+            "provider": emb_provider.type,
+            "base_url": emb_provider.base_url,
+            "api_key": emb_provider.api_key,
+            "model": config.embedding_model,
+            "enabled": True,
+        }
     elif getattr(config, "embedding_api_key", None) and getattr(config, "embedding_base_url", None):
         if embedding_service:
-            embedding_service.provider = settings.embedding_provider
-            embedding_service.api_base_url = config.embedding_base_url
-            embedding_service.api_key = config.embedding_api_key
-            embedding_service.model = config.embedding_model
-            embedding_service.enabled = True
-    elif embedding_service:
-        embedding_service.enabled = False
+            embedding_runtime_values = {
+                "provider": settings.embedding_provider,
+                "base_url": config.embedding_base_url,
+                "api_key": config.embedding_api_key,
+                "model": config.embedding_model,
+                "enabled": True,
+            }
+    if embedding_service:
+        _commit_embedding_runtime_config(
+            embedding_service,
+            allow_local_ai_endpoints=config.allow_local_ai_endpoints,
+            runtime_values=embedding_runtime_values,
+        )
     
     return config
 

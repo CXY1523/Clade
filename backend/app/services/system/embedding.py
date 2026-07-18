@@ -33,6 +33,7 @@ import json
 import logging
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Any, Sequence, TYPE_CHECKING
 import threading
@@ -57,6 +58,21 @@ logger = logging.getLogger(__name__)
 # 全局缓存目录
 GLOBAL_CACHE_DIR = Path(get_settings().cache_dir) / "embeddings"
 GLOBAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass(frozen=True)
+class _EmbeddingRuntimeConfig:
+    provider: str
+    api_base_url: str | None
+    api_key: str | None
+    model: str | None
+    enabled: bool
+    timeout: int
+    allow_fake_embeddings: bool
+    allow_local_ai_endpoints: bool
+
+
+_RUNTIME_CONFIG_UNCHANGED = object()
 
 
 class EmbeddingService:
@@ -91,18 +107,21 @@ class EmbeddingService:
         runtime_client: SafeRuntimeClient | None = None,
         allow_local_ai_endpoints: bool = False,
     ) -> None:
-        self.provider = provider
         self.dimension = dimension
-        self.api_base_url = base_url
-        self.api_key = api_key
-        self.model = model
-        self.enabled = enabled
-        self.timeout = timeout
-        self.allow_fake_embeddings = allow_fake_embeddings
+        self._config_lock = threading.RLock()
+        self._runtime_config = _EmbeddingRuntimeConfig(
+            provider=provider,
+            api_base_url=base_url,
+            api_key=api_key,
+            model=model,
+            enabled=enabled,
+            timeout=timeout,
+            allow_fake_embeddings=allow_fake_embeddings,
+            allow_local_ai_endpoints=allow_local_ai_endpoints,
+        )
         self.enable_concurrency = enable_concurrency and max_parallel_requests > 1
         self.max_parallel_requests = max(1, max_parallel_requests)
         self._runtime_client = runtime_client or SafeRuntimeClient()
-        self.allow_local_ai_endpoints = allow_local_ai_endpoints
         if not self.enable_concurrency:
             self.max_parallel_requests = 1
         
@@ -138,11 +157,112 @@ class EmbeddingService:
         }
         self._stats_lock = threading.Lock()
 
+    def _runtime_config_snapshot(self) -> _EmbeddingRuntimeConfig:
+        with self._config_lock:
+            return self._runtime_config
+
+    def _replace_runtime_config(self, **changes: Any) -> None:
+        with self._config_lock:
+            self._runtime_config = replace(self._runtime_config, **changes)
+
+    def configure_runtime_config(
+        self,
+        *,
+        provider: Any = _RUNTIME_CONFIG_UNCHANGED,
+        base_url: Any = _RUNTIME_CONFIG_UNCHANGED,
+        api_key: Any = _RUNTIME_CONFIG_UNCHANGED,
+        model: Any = _RUNTIME_CONFIG_UNCHANGED,
+        enabled: bool,
+        allow_local_ai_endpoints: bool,
+    ) -> None:
+        """Atomically publish one complete runtime configuration version."""
+        with self._config_lock:
+            current = self._runtime_config
+            self._runtime_config = _EmbeddingRuntimeConfig(
+                provider=current.provider if provider is _RUNTIME_CONFIG_UNCHANGED else provider,
+                api_base_url=(
+                    current.api_base_url
+                    if base_url is _RUNTIME_CONFIG_UNCHANGED
+                    else base_url
+                ),
+                api_key=current.api_key if api_key is _RUNTIME_CONFIG_UNCHANGED else api_key,
+                model=current.model if model is _RUNTIME_CONFIG_UNCHANGED else model,
+                enabled=enabled,
+                timeout=current.timeout,
+                allow_fake_embeddings=current.allow_fake_embeddings,
+                allow_local_ai_endpoints=allow_local_ai_endpoints,
+            )
+
+    @property
+    def provider(self) -> str:
+        return self._runtime_config_snapshot().provider
+
+    @provider.setter
+    def provider(self, value: str) -> None:
+        self._replace_runtime_config(provider=value)
+
+    @property
+    def api_base_url(self) -> str | None:
+        return self._runtime_config_snapshot().api_base_url
+
+    @api_base_url.setter
+    def api_base_url(self, value: str | None) -> None:
+        self._replace_runtime_config(api_base_url=value)
+
+    @property
+    def api_key(self) -> str | None:
+        return self._runtime_config_snapshot().api_key
+
+    @api_key.setter
+    def api_key(self, value: str | None) -> None:
+        self._replace_runtime_config(api_key=value)
+
+    @property
+    def model(self) -> str | None:
+        return self._runtime_config_snapshot().model
+
+    @model.setter
+    def model(self, value: str | None) -> None:
+        self._replace_runtime_config(model=value)
+
+    @property
+    def enabled(self) -> bool:
+        return self._runtime_config_snapshot().enabled
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        self._replace_runtime_config(enabled=value)
+
+    @property
+    def timeout(self) -> int:
+        return self._runtime_config_snapshot().timeout
+
+    @timeout.setter
+    def timeout(self, value: int) -> None:
+        self._replace_runtime_config(timeout=value)
+
+    @property
+    def allow_fake_embeddings(self) -> bool:
+        return self._runtime_config_snapshot().allow_fake_embeddings
+
+    @allow_fake_embeddings.setter
+    def allow_fake_embeddings(self, value: bool) -> None:
+        self._replace_runtime_config(allow_fake_embeddings=value)
+
+    @property
+    def allow_local_ai_endpoints(self) -> bool:
+        return self._runtime_config_snapshot().allow_local_ai_endpoints
+
+    @allow_local_ai_endpoints.setter
+    def allow_local_ai_endpoints(self, value: bool) -> None:
+        self._replace_runtime_config(allow_local_ai_endpoints=value)
+
     @property
     def model_identifier(self) -> str:
         """生成模型标识符，用于缓存隔离"""
-        if self.enabled and self.model:
-            return f"{self.provider}_{self.model}"
+        config = self._runtime_config_snapshot()
+        if config.enabled and config.model:
+            return f"{config.provider}_{config.model}"
         return f"fake_{self.dimension}d"
 
     # ==================== 核心 Embedding 接口 ====================
@@ -237,7 +357,8 @@ class EmbeddingService:
         batch_size: int = 100
     ) -> list[list[float]]:
         """批量生成向量（内部方法）"""
-        if self.enabled and self.api_base_url and self.api_key and self.model:
+        config = self._runtime_config_snapshot()
+        if config.enabled and config.api_base_url and config.api_key and config.model:
             # 使用远程 API
             return self._remote_embed_batch(texts, require_real, batch_size)
         else:
@@ -313,25 +434,24 @@ class EmbeddingService:
         max_retries: int = 3,
     ) -> list[list[float]]:
         """Request one embedding chunk through the guarded runtime client."""
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        config = self._runtime_config_snapshot()
+        headers = {"Authorization": f"Bearer {config.api_key}"}
         max_text_length = 2000
         truncated_texts = [
             text[:max_text_length] + "..." if len(text) > max_text_length else text
             for text in batch_texts
         ]
-        body = {"model": self.model, "input": truncated_texts}
+        body = {"model": config.model, "input": truncated_texts}
 
-        # A config refresh must not change the policy between retry attempts.
-        allow_local = self.allow_local_ai_endpoints
         for attempt in range(max_retries):
             try:
                 data = self._runtime_client.post_json(
-                    self.api_base_url,
+                    config.api_base_url,
                     request_target="/embeddings",
                     headers=headers,
                     json_body=body,
-                    allow_local=allow_local,
-                    read_timeout=self.timeout,
+                    allow_local=config.allow_local_ai_endpoints,
+                    read_timeout=config.timeout,
                     max_bytes=EMBEDDING_JSON_MAX_BYTES,
                 )
                 batch_vectors = self._parse_embedding_response(data, len(batch_texts))
@@ -343,7 +463,7 @@ class EmbeddingService:
                     logger.warning("[Embedding] blocked error_code=%s", exc.code)
                     raise RuntimeError(exc.public_message) from None
                 if attempt == max_retries - 1:
-                    if require_real or not self.allow_fake_embeddings:
+                    if require_real or not config.allow_fake_embeddings:
                         raise RuntimeError(exc.public_message) from None
                     logger.warning("[Embedding] availability exhausted; using fake vectors")
                     vectors = [self._fake_embed(text) for text in batch_texts]
