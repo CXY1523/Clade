@@ -1111,6 +1111,56 @@ async def _collect_capability_stream(
     ]
 
 
+@pytest.mark.parametrize(
+    "entry_name",
+    [entry_name for entry_name, _ in NETWORK_ENTRY_TRANSPORTS],
+)
+def test_network_entries_do_not_mix_override_endpoint_with_global_key(
+    entry_name: str,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    response = {"choices": [{"message": {"content": "oak"}}]}
+    runtime_client.sync_results = [response]
+    runtime_client.async_results = [response]
+    runtime_client.stream_lines = [
+        'data: {"choices":[{"delta":{"content":"oak"}}]}',
+        "data: [DONE]",
+    ]
+    router = _remote_router(runtime_client, allow_local=False)
+    router.configure_overrides(
+        {
+            "generate": {
+                "base_url": "https://override.example/v1",
+                "api_key": None,
+                "provider_type": "openai",
+                "model": "override-model",
+            }
+        }
+    )
+
+    try:
+        if entry_name == "invoke":
+            router.invoke("generate", {"name": "oak"})
+        elif entry_name == "ainvoke":
+            asyncio.run(router.ainvoke("generate", {"name": "oak"}))
+        elif entry_name == "astream":
+            asyncio.run(_collect_stream(router))
+        elif entry_name == "call_capability":
+            router.call_capability("generate", _messages())
+        elif entry_name == "acall_capability":
+            asyncio.run(router.acall_capability("generate", _messages()))
+        elif entry_name == "chat":
+            asyncio.run(router.chat("Name a tree", capability="generate"))
+        else:
+            asyncio.run(
+                _collect_capability_stream(router, "generate", _messages())
+            )
+    except RuntimeError as exc:
+        assert "missing configuration" in str(exc)
+
+    assert runtime_client.calls == []
+
+
 LEGACY_JSON_ENTRIES = ("call_capability", "acall_capability", "chat")
 
 

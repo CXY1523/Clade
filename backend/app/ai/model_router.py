@@ -142,6 +142,12 @@ class ModelRouter:
             del self._provider_pools[capability]
             if capability in self._lb_counters:
                 del self._lb_counters[capability]
+
+    def clear_provider_pools(self) -> None:
+        """Clear all runtime load-balancing provider state."""
+        self._provider_pools.clear()
+        self._lb_counters.clear()
+        self._provider_latencies.clear()
     
     def get_provider_pools_info(self) -> dict[str, list[str]]:
         """获取所有capability的服务商池信息"""
@@ -296,6 +302,13 @@ class ModelRouter:
     def configure_overrides(self, overrides: dict[str, dict[str, Any]]) -> None:
         self.overrides = overrides or {}
 
+    def _runtime_credentials(
+        self, override: dict[str, Any]
+    ) -> tuple[str | None, str | None]:
+        if "base_url" in override or "api_key" in override:
+            return override.get("base_url"), override.get("api_key")
+        return self.api_base_url, self.api_key
+
     def capabilities(self) -> list[str]:
         return list(self.routes.keys())
 
@@ -325,8 +338,7 @@ class ModelRouter:
             provider_type = lb_provider.provider_type
             model_name = lb_provider.model or override.get("model") or config.model
         else:
-            base_url = (override.get("base_url") or self.api_base_url)
-            api_key = override.get("api_key") or self.api_key
+            base_url, api_key = self._runtime_credentials(override)
             provider_type = override.get("provider_type") or getattr(config, "provider_type", PROVIDER_TYPE_OPENAI)
             model_name = override.get("model") or config.model
         
@@ -1004,8 +1016,7 @@ class ModelRouter:
             model_name = lb_provider.model or override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
         else:
-            base_url = override.get("base_url") or self.api_base_url
-            api_key = override.get("api_key") or self.api_key
+            base_url, api_key = self._runtime_credentials(override)
             model_name = override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
             provider_type = override.get("provider_type") or getattr(config, "provider_type", PROVIDER_TYPE_OPENAI)
@@ -1147,8 +1158,7 @@ class ModelRouter:
             
             logger.info(f"[acall_capability] 负载均衡选择: {capability} -> {lb_provider.provider_id}, model={model_name}")
         else:
-            base_url = override.get("base_url") or self.api_base_url
-            api_key = override.get("api_key") or self.api_key
+            base_url, api_key = self._runtime_credentials(override)
             model_name = override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
             provider_type = override.get("provider_type") or getattr(config, "provider_type", PROVIDER_TYPE_OPENAI)
@@ -1305,8 +1315,7 @@ class ModelRouter:
             model_name = lb_provider.model or override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
         else:
-            base_url = override.get("base_url") or self.api_base_url
-            api_key = override.get("api_key") or self.api_key
+            base_url, api_key = self._runtime_credentials(override)
             model_name = override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
             provider_type = override.get("provider_type") or getattr(config, "provider_type", PROVIDER_TYPE_OPENAI)
@@ -1435,8 +1444,7 @@ class ModelRouter:
             model_name = lb_provider.model or override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
         else:
-            base_url = override.get("base_url") or self.api_base_url
-            api_key = override.get("api_key") or self.api_key
+            base_url, api_key = self._runtime_credentials(override)
             model_name = override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
             provider_type = override.get("provider_type") or getattr(

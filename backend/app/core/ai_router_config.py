@@ -92,10 +92,13 @@ def configure_model_router(
     """Apply UI routing config to the provided ModelRouter instance."""
     if not config:
         return config
-    
-    model_router.allow_local_ai_endpoints = config.allow_local_ai_endpoints
 
+    model_router.api_base_url = getattr(settings, "ai_base_url", None)
+    model_router.api_key = getattr(settings, "ai_api_key", None)
     model_router.overrides = {}
+    model_router.clear_provider_pools()
+
+    model_router.allow_local_ai_endpoints = config.allow_local_ai_endpoints
     
     if config.ai_concurrency_limit > 0:
         model_router.set_concurrency_limit(config.ai_concurrency_limit)
