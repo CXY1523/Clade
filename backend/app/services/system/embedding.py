@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Iterable, Any, Sequence, TYPE_CHECKING
 import threading
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 
@@ -70,6 +71,28 @@ class _EmbeddingRuntimeConfig:
     timeout: int
     allow_fake_embeddings: bool
     allow_local_ai_endpoints: bool
+
+
+_CACHE_NAMESPACE_VERSION = "embedding-cache-v2"
+_CACHE_SOURCE_REMOTE = "remote"
+_CACHE_SOURCE_LOCAL_FAKE = "local_fake"
+_CACHE_SOURCE_REMOTE_FALLBACK_FAKE = "remote_fallback_fake"
+
+
+@dataclass(frozen=True)
+class _GeneratedEmbedding:
+    vector: list[float]
+    cacheable: bool
+    source: str
+
+
+@dataclass(frozen=True)
+class _EmbeddingGenerationResult:
+    items: tuple[_GeneratedEmbedding, ...]
+
+    @property
+    def vectors(self) -> list[list[float]]:
+        return [item.vector for item in self.items]
 
 
 _RUNTIME_CONFIG_UNCHANGED = object()
@@ -270,6 +293,76 @@ class EmbeddingService:
             return f"{config.provider}_{config.model}"
         return f"fake_{self.dimension}d"
 
+    @staticmethod
+    def _has_remote_config(config: _EmbeddingRuntimeConfig) -> bool:
+        return bool(
+            config.enabled
+            and config.api_base_url
+            and config.api_key
+            and config.model
+        )
+
+    @staticmethod
+    def _normalized_endpoint(config: _EmbeddingRuntimeConfig) -> str:
+        raw_endpoint = str(config.api_base_url or "").strip()
+        try:
+            parsed = urlsplit(raw_endpoint)
+            scheme = parsed.scheme.lower()
+            hostname = (parsed.hostname or "").rstrip(".").lower()
+            if not scheme or not hostname:
+                return raw_endpoint.rstrip("/")
+            try:
+                hostname = hostname.encode("idna").decode("ascii")
+            except UnicodeError:
+                pass
+            host_for_url = f"[{hostname}]" if ":" in hostname else hostname
+            port = parsed.port
+            if port is not None and not (
+                (scheme == "https" and port == 443)
+                or (scheme == "http" and port == 80)
+            ):
+                host_for_url = f"{host_for_url}:{port}"
+            path = parsed.path.rstrip("/")
+            return urlunsplit((scheme, host_for_url, path, "", ""))
+        except (TypeError, ValueError):
+            return raw_endpoint.rstrip("/")
+
+    def _endpoint_identity(self, config: _EmbeddingRuntimeConfig) -> str:
+        normalized = self._normalized_endpoint(config)
+        return hashlib.sha256(normalized.encode()).hexdigest()
+
+    def _cache_namespace_for_config(
+        self,
+        config: _EmbeddingRuntimeConfig,
+        source: str,
+    ) -> str:
+        if source == _CACHE_SOURCE_REMOTE:
+            return ":".join((
+                _CACHE_NAMESPACE_VERSION,
+                _CACHE_SOURCE_REMOTE,
+                str(config.provider),
+                str(config.model),
+                self._endpoint_identity(config),
+            ))
+        if source == _CACHE_SOURCE_LOCAL_FAKE:
+            return ":".join((
+                _CACHE_NAMESPACE_VERSION,
+                _CACHE_SOURCE_LOCAL_FAKE,
+                f"{self.dimension}d",
+            ))
+        raise ValueError("uncacheable embedding source")
+
+    def _cache_source_for_request(
+        self,
+        config: _EmbeddingRuntimeConfig,
+        require_real: bool,
+    ) -> str | None:
+        if self._has_remote_config(config):
+            return _CACHE_SOURCE_REMOTE
+        if require_real:
+            return None
+        return _CACHE_SOURCE_LOCAL_FAKE
+
     # ==================== 核心 Embedding 接口 ====================
 
     def embed(
@@ -292,6 +385,7 @@ class EmbeddingService:
         if not texts:
             return []
         runtime_config = self._runtime_config_snapshot()
+        cache_source = self._cache_source_for_request(runtime_config, require_real)
         
         self._stats["embed_calls"] += 1
         
@@ -302,28 +396,37 @@ class EmbeddingService:
         
         # 第一遍：检查缓存
         for idx, text in enumerate(texts):
-            cache_key = self._make_cache_key(text, runtime_config)
-            
-            # 检查内存缓存
-            if cache_key in self._memory_cache:
-                cached = self._memory_cache[cache_key]
-                if target_dimension is None:
-                    target_dimension = len(cached)
-                vectors[idx] = cached
-                self._stats["cache_hits"] += 1
-                self._stats["memory_cache_hits"] += 1
-                continue
-            
-            # 检查磁盘缓存
-            cached = self._load_from_disk_cache(cache_key)
-            if cached is not None:
-                if target_dimension is None:
-                    target_dimension = len(cached)
-                vectors[idx] = cached
-                self._update_memory_cache(cache_key, cached)
-                self._stats["cache_hits"] += 1
-                self._stats["disk_cache_hits"] += 1
-                continue
+            if cache_source is not None:
+                cache_key = self._make_cache_key(
+                    text,
+                    runtime_config,
+                    source=cache_source,
+                )
+
+                # 检查内存缓存
+                if cache_key in self._memory_cache:
+                    cached = self._memory_cache[cache_key]
+                    if target_dimension is None:
+                        target_dimension = len(cached)
+                    vectors[idx] = cached
+                    self._stats["cache_hits"] += 1
+                    self._stats["memory_cache_hits"] += 1
+                    continue
+
+                # 检查磁盘缓存
+                cached = self._load_from_disk_cache(
+                    cache_key,
+                    runtime_config,
+                    source=cache_source,
+                )
+                if cached is not None:
+                    if target_dimension is None:
+                        target_dimension = len(cached)
+                    vectors[idx] = cached
+                    self._update_memory_cache(cache_key, cached)
+                    self._stats["cache_hits"] += 1
+                    self._stats["disk_cache_hits"] += 1
+                    continue
             
             # 需要生成
             uncached_indices.append(idx)
@@ -334,22 +437,36 @@ class EmbeddingService:
             if target_dimension is None:
                 target_dimension = self.dimension
             
-            new_vectors = self._generate_vectors_batch(
+            generation = self._generate_vectors_batch_result(
                 uncached_texts, 
                 require_real=require_real,
                 batch_size=batch_size,
                 runtime_config=runtime_config,
             )
             
-            for i, (idx, text, vec) in enumerate(zip(uncached_indices, uncached_texts, new_vectors)):
+            for idx, text, generated in zip(
+                uncached_indices,
+                uncached_texts,
+                generation.items,
+            ):
                 # 确保维度一致
-                vec = self._adjust_dimension(vec, target_dimension)
+                vec = self._adjust_dimension(generated.vector, target_dimension)
                 vectors[idx] = vec
                 
-                # 存入缓存
-                cache_key = self._make_cache_key(text, runtime_config)
-                self._store_in_disk_cache(cache_key, vec, text, runtime_config)
-                self._update_memory_cache(cache_key, vec)
+                if generated.cacheable:
+                    cache_key = self._make_cache_key(
+                        text,
+                        runtime_config,
+                        source=generated.source,
+                    )
+                    self._store_in_disk_cache(
+                        cache_key,
+                        vec,
+                        text,
+                        runtime_config,
+                        source=generated.source,
+                    )
+                    self._update_memory_cache(cache_key, vec)
         
         return vectors
 
@@ -365,10 +482,25 @@ class EmbeddingService:
         runtime_config: _EmbeddingRuntimeConfig | None = None,
     ) -> list[list[float]]:
         """批量生成向量（内部方法）"""
+        return self._generate_vectors_batch_result(
+            texts,
+            require_real=require_real,
+            batch_size=batch_size,
+            runtime_config=runtime_config,
+        ).vectors
+
+    def _generate_vectors_batch_result(
+        self,
+        texts: list[str],
+        require_real: bool = False,
+        batch_size: int = 100,
+        runtime_config: _EmbeddingRuntimeConfig | None = None,
+    ) -> _EmbeddingGenerationResult:
+        """Generate vectors together with explicit cache provenance."""
         config = runtime_config or self._runtime_config_snapshot()
-        if config.enabled and config.api_base_url and config.api_key and config.model:
+        if self._has_remote_config(config):
             # 使用远程 API
-            return self._remote_embed_batch(
+            return self._remote_embed_batch_result(
                 texts,
                 require_real,
                 batch_size,
@@ -383,7 +515,14 @@ class EmbeddingService:
             # 使用伪向量
             with self._stats_lock:
                 self._stats["fake_embeds"] += len(texts)
-            return [self._fake_embed(text) for text in texts]
+            return _EmbeddingGenerationResult(tuple(
+                _GeneratedEmbedding(
+                    vector=self._fake_embed(text),
+                    cacheable=True,
+                    source=_CACHE_SOURCE_LOCAL_FAKE,
+                )
+                for text in texts
+            ))
 
     def _remote_embed_batch(
         self, 
@@ -392,6 +531,20 @@ class EmbeddingService:
         batch_size: int = 10,  # 【优化】减小默认批量大小，提高稳定性
         runtime_config: _EmbeddingRuntimeConfig | None = None,
     ) -> list[list[float]]:
+        return self._remote_embed_batch_result(
+            texts,
+            require_real=require_real,
+            batch_size=batch_size,
+            runtime_config=runtime_config,
+        ).vectors
+
+    def _remote_embed_batch_result(
+        self,
+        texts: list[str],
+        require_real: bool = False,
+        batch_size: int = 10,
+        runtime_config: _EmbeddingRuntimeConfig | None = None,
+    ) -> _EmbeddingGenerationResult:
         """批量调用远程 Embedding API（支持并发分片）
         
         【优化策略】
@@ -412,18 +565,18 @@ class EmbeddingService:
             texts[i:i + batch_size] for i in range(0, len(texts), batch_size)
         ]
         if not chunks:
-            return []
+            return _EmbeddingGenerationResult(())
         config = runtime_config or self._runtime_config_snapshot()
         
-        results: list[list[list[float]] | None] = [None] * len(chunks)
+        results: list[_EmbeddingGenerationResult | None] = [None] * len(chunks)
         
         def run_chunk(idx: int, chunk: list[str]) -> None:
-            vectors = self._request_embedding_chunk(
+            result = self._request_embedding_chunk_result(
                 chunk,
                 require_real,
                 runtime_config=config,
             )
-            results[idx] = vectors
+            results[idx] = result
         
         max_workers = self.max_parallel_requests if self.enable_concurrency else 1
         if max_workers <= 1 or len(chunks) == 1:
@@ -433,7 +586,7 @@ class EmbeddingService:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {
                     executor.submit(
-                        self._request_embedding_chunk,
+                        self._request_embedding_chunk_result,
                         chunk,
                         require_real,
                         runtime_config=config,
@@ -444,12 +597,12 @@ class EmbeddingService:
                     idx = future_map[future]
                     results[idx] = future.result()
         
-        all_vectors: list[list[float]] = []
-        for chunk_vectors in results:
-            if chunk_vectors is None:
+        all_items: list[_GeneratedEmbedding] = []
+        for chunk_result in results:
+            if chunk_result is None:
                 continue
-            all_vectors.extend(chunk_vectors)
-        return all_vectors
+            all_items.extend(chunk_result.items)
+        return _EmbeddingGenerationResult(tuple(all_items))
 
     def _request_embedding_chunk(
         self,
@@ -458,6 +611,20 @@ class EmbeddingService:
         max_retries: int = 3,
         runtime_config: _EmbeddingRuntimeConfig | None = None,
     ) -> list[list[float]]:
+        return self._request_embedding_chunk_result(
+            batch_texts,
+            require_real=require_real,
+            max_retries=max_retries,
+            runtime_config=runtime_config,
+        ).vectors
+
+    def _request_embedding_chunk_result(
+        self,
+        batch_texts: list[str],
+        require_real: bool,
+        max_retries: int = 3,
+        runtime_config: _EmbeddingRuntimeConfig | None = None,
+    ) -> _EmbeddingGenerationResult:
         """Request one embedding chunk through the guarded runtime client."""
         config = runtime_config or self._runtime_config_snapshot()
         headers = {"Authorization": f"Bearer {config.api_key}"}
@@ -482,7 +649,14 @@ class EmbeddingService:
                 batch_vectors = self._parse_embedding_response(data, len(batch_texts))
                 with self._stats_lock:
                     self._stats["api_calls"] += 1
-                return batch_vectors
+                return _EmbeddingGenerationResult(tuple(
+                    _GeneratedEmbedding(
+                        vector=vector,
+                        cacheable=True,
+                        source=_CACHE_SOURCE_REMOTE,
+                    )
+                    for vector in batch_vectors
+                ))
             except OutboundRequestError as exc:
                 if exc.code not in RETRYABLE_OUTBOUND_CODES:
                     logger.warning("[Embedding] blocked error_code=%s", exc.code)
@@ -494,7 +668,14 @@ class EmbeddingService:
                     vectors = [self._fake_embed(text) for text in batch_texts]
                     with self._stats_lock:
                         self._stats["fake_embeds"] += len(batch_texts)
-                    return vectors
+                    return _EmbeddingGenerationResult(tuple(
+                        _GeneratedEmbedding(
+                            vector=vector,
+                            cacheable=False,
+                            source=_CACHE_SOURCE_REMOTE_FALLBACK_FAKE,
+                        )
+                        for vector in vectors
+                    ))
                 logger.warning(
                     "[Embedding] retryable error_code=%s retry=%s/%s",
                     exc.code,
@@ -569,10 +750,16 @@ class EmbeddingService:
         self,
         text: str,
         runtime_config: _EmbeddingRuntimeConfig | None = None,
+        *,
+        source: str | None = None,
     ) -> str:
-        """生成缓存 key（包含模型标识）"""
+        """Generate a versioned cache key bound to source and endpoint identity."""
         config = runtime_config or self._runtime_config_snapshot()
-        content = f"{self._model_identifier_for_config(config)}:{text}"
+        cache_source = source or self._cache_source_for_request(config, False)
+        if cache_source is None:
+            raise ValueError("cache source is unavailable")
+        namespace = self._cache_namespace_for_config(config, cache_source)
+        content = f"{namespace}:{text}"
         return hashlib.sha256(content.encode()).hexdigest()
 
     # ==================== 内存缓存管理 ====================
@@ -595,18 +782,53 @@ class EmbeddingService:
         subdir = cache_key[:2]
         return self._cache_dir / "vectors" / subdir / f"{cache_key}.json"
 
-    def _load_from_disk_cache(self, cache_key: str) -> list[float] | None:
+    def _load_from_disk_cache(
+        self,
+        cache_key: str,
+        runtime_config: _EmbeddingRuntimeConfig | None = None,
+        *,
+        source: str | None = None,
+    ) -> list[float] | None:
         """从磁盘缓存加载"""
         path = self._disk_cache_path(cache_key)
         if not path.exists():
             return None
+
+        expected_namespace: str | None = None
+        expected_endpoint_identity: str | None = None
+        if runtime_config is not None or source is not None:
+            config = runtime_config or self._runtime_config_snapshot()
+            cache_source = source or self._cache_source_for_request(config, False)
+            if cache_source is None:
+                return None
+            expected_namespace = self._cache_namespace_for_config(
+                config,
+                cache_source,
+            )
+            if cache_source == _CACHE_SOURCE_REMOTE:
+                expected_endpoint_identity = self._endpoint_identity(config)
         
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, list):
-                return data
+                return data if expected_namespace is None else None
             elif isinstance(data, dict) and "vector" in data:
-                return data["vector"]
+                vector = data["vector"]
+                if not isinstance(vector, list):
+                    return None
+                if expected_namespace is None:
+                    return vector
+                metadata = data.get("metadata")
+                if not isinstance(metadata, dict):
+                    return None
+                if (
+                    metadata.get("source") != cache_source
+                    or metadata.get("cache_namespace") != expected_namespace
+                    or metadata.get("endpoint_identity")
+                    != expected_endpoint_identity
+                ):
+                    return None
+                return vector
         except Exception as e:
             logger.warning(f"[Embedding] 加载缓存失败 {cache_key}: {e}")
         
@@ -618,15 +840,29 @@ class EmbeddingService:
         vector: list[float],
         text: str,
         runtime_config: _EmbeddingRuntimeConfig | None = None,
+        *,
+        source: str | None = None,
     ) -> None:
         """存储到磁盘缓存"""
         config = runtime_config or self._runtime_config_snapshot()
+        cache_source = source or self._cache_source_for_request(config, False)
+        if cache_source is None:
+            raise ValueError("cache source is unavailable")
+        cache_namespace = self._cache_namespace_for_config(config, cache_source)
+        endpoint_identity = (
+            self._endpoint_identity(config)
+            if cache_source == _CACHE_SOURCE_REMOTE
+            else None
+        )
         path = self._disk_cache_path(cache_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         
         data = {
             "vector": vector,
             "metadata": {
+                "source": cache_source,
+                "endpoint_identity": endpoint_identity,
+                "cache_namespace": cache_namespace,
                 "provider": config.provider,
                 "model": config.model,
                 "dimension": len(vector),

@@ -176,6 +176,25 @@ def remote_service(client: RecordingSafeRuntimeClient) -> EmbeddingService:
     )
 
 
+def _remote_cache_namespace(
+    provider: str,
+    model: str,
+    normalized_endpoint: str,
+) -> tuple[str, str]:
+    endpoint_identity = hashlib.sha256(normalized_endpoint.encode()).hexdigest()
+    namespace = (
+        f"embedding-cache-v2:remote:{provider}:{model}:{endpoint_identity}"
+    )
+    return namespace, endpoint_identity
+
+
+def _timeout_errors(count: int = 3) -> list[OutboundRequestError]:
+    return [
+        OutboundRequestError("outbound_timeout", 504, "PUBLIC-TIMEOUT")
+        for _ in range(count)
+    ]
+
+
 def test_embedding_request_uses_safe_client_and_preserves_payload() -> None:
     client = RecordingSafeRuntimeClient(
         [{"data": [{"index": 1, "embedding": [2.0]}, {"index": 0, "embedding": [1.0]}]}]
@@ -423,18 +442,279 @@ def test_public_embed_binds_cache_and_metadata_to_generation_config(
 
     cache_files = list((tmp_path / "vectors").glob("*/*.json"))
     assert len(cache_files) == 2
+    namespace, endpoint_identity = _remote_cache_namespace(
+        "provider-a",
+        "model-a",
+        "https://provider-a.example/v1",
+    )
     provider_a_key = hashlib.sha256(
-        "provider-a_model-a:same text".encode()
+        f"{namespace}:same text".encode()
     ).hexdigest()
     provider_a_file = next(path for path in cache_files if path.stem == provider_a_key)
     provider_a_data = json.loads(provider_a_file.read_text(encoding="utf-8"))
     assert provider_a_data["metadata"] == {
+        "source": "remote",
+        "endpoint_identity": endpoint_identity,
+        "cache_namespace": namespace,
         "provider": "provider-a",
         "model": "model-a",
         "dimension": 1,
         "model_identifier": "provider-a_model-a",
         "text_preview": "same text",
     }
+
+
+def test_remote_fallback_fake_does_not_satisfy_later_require_real(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = RecordingSafeRuntimeClient([
+        *_timeout_errors(),
+        {"data": [{"index": 0, "embedding": [2.0]}]},
+    ])
+    service = EmbeddingService(
+        provider="openai",
+        dimension=1,
+        base_url="https://embedding.example/v1",
+        api_key="secret-key",
+        model="model-a",
+        enabled=True,
+        allow_fake_embeddings=True,
+        cache_dir=tmp_path,
+        runtime_client=client,
+    )
+    monkeypatch.setattr("app.services.system.embedding.time.sleep", lambda _: None)
+
+    fallback = service.embed(["oak"], require_real=False)
+    real = service.embed(["oak"], require_real=True)
+
+    assert real == [[2.0]]
+    assert real != fallback
+    assert len(client.calls) == 4
+
+
+def test_remote_fallback_fake_is_not_reused_from_disk_by_new_service(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first_client = RecordingSafeRuntimeClient(_timeout_errors())
+    first_service = EmbeddingService(
+        provider="openai",
+        dimension=1,
+        base_url="https://embedding.example/v1",
+        api_key="first-key",
+        model="model-a",
+        enabled=True,
+        allow_fake_embeddings=True,
+        cache_dir=tmp_path,
+        runtime_client=first_client,
+    )
+    monkeypatch.setattr("app.services.system.embedding.time.sleep", lambda _: None)
+
+    fallback = first_service.embed(["oak"], require_real=False)
+
+    second_client = RecordingSafeRuntimeClient([
+        {"data": [{"index": 0, "embedding": [3.0]}]},
+    ])
+    second_service = EmbeddingService(
+        provider="openai",
+        dimension=1,
+        base_url="https://embedding.example/v1",
+        api_key="second-key",
+        model="model-a",
+        enabled=True,
+        allow_fake_embeddings=False,
+        cache_dir=tmp_path,
+        runtime_client=second_client,
+    )
+
+    real = second_service.embed(["oak"], require_real=True)
+
+    assert real == [[3.0]]
+    assert real != fallback
+    assert len(second_client.calls) == 1
+    assert second_service._stats["disk_cache_hits"] == 0
+
+
+def test_require_real_does_not_read_cached_local_fake(tmp_path: Path) -> None:
+    service = EmbeddingService(
+        provider="local",
+        dimension=2,
+        enabled=False,
+        cache_dir=tmp_path,
+    )
+
+    assert len(service.embed(["oak"], require_real=False)) == 1
+    assert list((tmp_path / "vectors").glob("*/*.json"))
+
+    with pytest.raises(RuntimeError, match="需要真实 embedding，但服务未配置"):
+        service.embed(["oak"], require_real=True)
+
+
+def test_same_provider_model_at_different_endpoints_do_not_share_cache(
+    tmp_path: Path,
+) -> None:
+    client = RecordingSafeRuntimeClient([
+        {"data": [{"index": 0, "embedding": [1.0]}]},
+        {"data": [{"index": 0, "embedding": [2.0]}]},
+    ])
+    service = EmbeddingService(
+        provider="openai",
+        dimension=1,
+        base_url="https://provider-a.example/v1",
+        api_key="key-a",
+        model="shared-model",
+        enabled=True,
+        cache_dir=tmp_path,
+        runtime_client=client,
+    )
+
+    assert service.embed(["oak"], require_real=True) == [[1.0]]
+    service.configure_runtime_config(
+        provider="openai",
+        base_url="https://provider-b.example/v1",
+        api_key="key-b",
+        model="shared-model",
+        enabled=True,
+        allow_local_ai_endpoints=False,
+    )
+    assert service.embed(["oak"], require_real=True) == [[2.0]]
+
+    assert len(client.calls) == 2
+    assert [call["base_url"] for call in client.calls] == [
+        "https://provider-a.example/v1",
+        "https://provider-b.example/v1",
+    ]
+
+
+def test_successful_remote_vector_can_satisfy_require_real_cache(
+    tmp_path: Path,
+) -> None:
+    client = RecordingSafeRuntimeClient([
+        {"data": [{"index": 0, "embedding": [4.0]}]},
+    ])
+    service = EmbeddingService(
+        provider="openai",
+        dimension=1,
+        base_url="https://embedding.example/v1",
+        api_key="secret-key",
+        model="model-a",
+        enabled=True,
+        cache_dir=tmp_path,
+        runtime_client=client,
+    )
+
+    assert service.embed(["oak"], require_real=False) == [[4.0]]
+    assert service.embed(["oak"], require_real=True) == [[4.0]]
+    assert len(client.calls) == 1
+    assert service._stats["memory_cache_hits"] == 1
+
+
+def test_remote_cache_metadata_uses_digest_and_never_stores_endpoint_or_key(
+    tmp_path: Path,
+) -> None:
+    raw_base_url = "https://Endpoint-Secret.Example:443/v1/"
+    api_key = "KEY-CACHE-SECRET"
+    client = RecordingSafeRuntimeClient([
+        {"data": [{"index": 0, "embedding": [5.0]}]},
+    ])
+    service = EmbeddingService(
+        provider="openai",
+        dimension=1,
+        base_url=raw_base_url,
+        api_key=api_key,
+        model="model-secret",
+        enabled=True,
+        cache_dir=tmp_path,
+        runtime_client=client,
+    )
+
+    assert service.embed(["secret text"], require_real=True) == [[5.0]]
+
+    namespace, endpoint_identity = _remote_cache_namespace(
+        "openai",
+        "model-secret",
+        "https://endpoint-secret.example/v1",
+    )
+    expected_key = hashlib.sha256(
+        f"{namespace}:secret text".encode()
+    ).hexdigest()
+    cache_files = list((tmp_path / "vectors").glob("*/*.json"))
+    assert [path.stem for path in cache_files] == [expected_key]
+    raw_cache = cache_files[0].read_text(encoding="utf-8")
+    metadata = json.loads(raw_cache)["metadata"]
+    assert metadata["source"] == "remote"
+    assert metadata["endpoint_identity"] == endpoint_identity
+    assert metadata["cache_namespace"] == namespace
+    combined = cache_files[0].name + raw_cache
+    assert raw_base_url not in combined
+    assert api_key not in combined
+    assert "/embeddings" not in combined
+
+
+@pytest.mark.parametrize("enable_concurrency", [False, True])
+def test_mixed_remote_chunks_only_cache_real_vectors_and_preserve_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    enable_concurrency: bool,
+) -> None:
+    class MixedChunkClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.recover_fallback = False
+            self._lock = threading.Lock()
+
+        def post_json(self, base_url: str, **kwargs: Any) -> dict[str, Any]:
+            text = kwargs["json_body"]["input"][0]
+            with self._lock:
+                self.calls.append(text)
+                recover_fallback = self.recover_fallback
+            if text == "fallback" and not recover_fallback:
+                raise OutboundRequestError(
+                    "outbound_timeout", 504, "PUBLIC-TIMEOUT"
+                )
+            vectors = {
+                "first": [1.0, 0.0],
+                "fallback": [0.5, 0.5],
+                "third": [0.0, 1.0],
+            }
+            return {"data": [{"index": 0, "embedding": vectors[text]}]}
+
+    client = MixedChunkClient()
+    service = EmbeddingService(
+        provider="openai",
+        dimension=2,
+        base_url="https://embedding.example/v1",
+        api_key="secret-key",
+        model="model-a",
+        enabled=True,
+        allow_fake_embeddings=True,
+        cache_dir=tmp_path,
+        max_parallel_requests=3,
+        enable_concurrency=enable_concurrency,
+        runtime_client=client,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr("app.services.system.embedding.time.sleep", lambda _: None)
+    fake_vector = service._fake_embed("fallback")
+
+    first = service.embed(
+        ["first", "fallback", "third"],
+        require_real=False,
+        batch_size=1,
+    )
+    assert first == [[1.0, 0.0], fake_vector, [0.0, 1.0]]
+    assert len(list((tmp_path / "vectors").glob("*/*.json"))) == 2
+
+    client.recover_fallback = True
+    second = service.embed(
+        ["first", "fallback", "third"],
+        require_real=True,
+        batch_size=1,
+    )
+    assert second == [[1.0, 0.0], [0.5, 0.5], [0.0, 1.0]]
+    assert client.calls.count("first") == 1
+    assert client.calls.count("third") == 1
+    assert client.calls.count("fallback") == 4
 
 
 def test_concurrent_chunks_preserve_input_order_and_stats() -> None:
