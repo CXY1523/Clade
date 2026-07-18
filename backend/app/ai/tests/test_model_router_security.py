@@ -1625,6 +1625,7 @@ def _attribute_name(node: ast.AST) -> str | None:
 def find_forbidden_network_calls(tree: ast.AST) -> list[str]:
     forbidden: list[str] = []
     forbidden_imports = {
+        "httpx",
         "requests",
         "urllib.request",
         "urllib3",
@@ -1633,9 +1634,17 @@ def find_forbidden_network_calls(tree: ast.AST) -> list[str]:
         "socket",
     }
     forbidden_httpx_calls = {
-        "httpx.post",
-        "httpx.Client",
         "httpx.AsyncClient",
+        "httpx.Client",
+        "httpx.delete",
+        "httpx.get",
+        "httpx.head",
+        "httpx.options",
+        "httpx.patch",
+        "httpx.post",
+        "httpx.put",
+        "httpx.request",
+        "httpx.stream",
     }
 
     def is_forbidden_import(module_name: str) -> bool:
@@ -1661,6 +1670,23 @@ def find_forbidden_network_calls(tree: ast.AST) -> list[str]:
             if call_name in forbidden_httpx_calls:
                 forbidden.append(f"call:{call_name}")
     return forbidden
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "import httpx as hx\nhx.get('https://example.com')",
+        "from httpx import post as send\nsend('https://example.com')",
+        "httpx.request('GET', 'https://example.com')",
+        "httpx.get('https://example.com')",
+        "from httpx import AsyncClient as AC\nAC()",
+    ],
+)
+def test_forbidden_network_guard_rejects_httpx_aliases_and_direct_calls(
+    snippet: str,
+) -> None:
+    tree = ast.parse(snippet)
+    assert find_forbidden_network_calls(tree) != []
 
 
 def test_model_router_has_no_direct_network_client_bypass() -> None:
