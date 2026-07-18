@@ -6,7 +6,7 @@ import logging
 import random
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, AsyncGenerator, Callable
 from urllib.parse import quote, urlencode
 
@@ -50,6 +50,13 @@ class ProviderPoolConfig:
     weight: int = 1  # 权重（用于加权轮询）
 
 
+@dataclass(frozen=True)
+class _RuntimeCredentialSnapshot:
+    base_url: str | None
+    api_key: str | None
+    provider_type: str | None
+
+
 @dataclass
 class ModelConfig:
     provider: str
@@ -76,8 +83,11 @@ class ModelRouter:
     ) -> None:
         self.routes = defaults or {}
         self.prompts: dict[str, str] = {}
-        self.api_base_url = base_url.rstrip("/") if base_url else None
-        self.api_key = api_key
+        self._runtime_credential_snapshot = _RuntimeCredentialSnapshot(
+            base_url=base_url.rstrip("/") if base_url else None,
+            api_key=api_key,
+            provider_type=None,
+        )
         self.timeout = timeout
         self.overrides: dict[str, dict[str, Any]] = {}
         self.max_retries = max(1, max_retries)
@@ -302,12 +312,61 @@ class ModelRouter:
     def configure_overrides(self, overrides: dict[str, dict[str, Any]]) -> None:
         self.overrides = overrides or {}
 
-    def _runtime_credentials(
-        self, override: dict[str, Any]
-    ) -> tuple[str | None, str | None]:
-        if "base_url" in override or "api_key" in override:
-            return override.get("base_url"), override.get("api_key")
-        return self.api_base_url, self.api_key
+    @property
+    def api_base_url(self) -> str | None:
+        return self._runtime_credential_snapshot.base_url
+
+    @api_base_url.setter
+    def api_base_url(self, value: str | None) -> None:
+        self._runtime_credential_snapshot = replace(
+            self._runtime_credential_snapshot,
+            base_url=value,
+        )
+
+    @property
+    def api_key(self) -> str | None:
+        return self._runtime_credential_snapshot.api_key
+
+    @api_key.setter
+    def api_key(self, value: str | None) -> None:
+        self._runtime_credential_snapshot = replace(
+            self._runtime_credential_snapshot,
+            api_key=value,
+        )
+
+    def configure_runtime_credentials(
+        self,
+        *,
+        base_url: str | None,
+        api_key: str | None,
+        provider_type: str | None,
+    ) -> None:
+        """Atomically publish one complete runtime credential tuple."""
+        self._runtime_credential_snapshot = _RuntimeCredentialSnapshot(
+            base_url=base_url,
+            api_key=api_key,
+            provider_type=provider_type,
+        )
+
+    def _select_runtime_credentials(
+        self,
+        override: dict[str, Any],
+        fallback_provider_type: str,
+    ) -> _RuntimeCredentialSnapshot:
+        if any(
+            field_name in override
+            for field_name in ("base_url", "api_key", "provider_type")
+        ):
+            return _RuntimeCredentialSnapshot(
+                base_url=override.get("base_url"),
+                api_key=override.get("api_key"),
+                provider_type=override.get("provider_type"),
+            )
+
+        snapshot = self._runtime_credential_snapshot
+        if snapshot.provider_type is None:
+            return replace(snapshot, provider_type=fallback_provider_type)
+        return snapshot
 
     def capabilities(self) -> list[str]:
         return list(self.routes.keys())
@@ -338,15 +397,20 @@ class ModelRouter:
             provider_type = lb_provider.provider_type
             model_name = lb_provider.model or override.get("model") or config.model
         else:
-            base_url, api_key = self._runtime_credentials(override)
-            provider_type = override.get("provider_type") or getattr(config, "provider_type", PROVIDER_TYPE_OPENAI)
+            credentials = self._select_runtime_credentials(
+                override,
+                getattr(config, "provider_type", PROVIDER_TYPE_OPENAI),
+            )
+            base_url = credentials.base_url
+            api_key = credentials.api_key
+            provider_type = credentials.provider_type
             model_name = override.get("model") or config.model
         
         timeout = override.get("timeout") or self.timeout
         extra_body = override.get("extra_body") or config.extra_body
         
         # 判断是否有有效的 API 凭据（来自 override 或全局配置）
-        has_valid_credentials = bool(base_url and api_key)
+        has_valid_credentials = bool(base_url and api_key and provider_type)
         
         # 如果 override 中有有效凭据，即使初始 provider 是 "local" 也应该使用 AI
         # 这允许用户通过设置默认服务商来覆盖 local 模式
@@ -1016,14 +1080,24 @@ class ModelRouter:
             model_name = lb_provider.model or override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
         else:
-            base_url, api_key = self._runtime_credentials(override)
+            credentials = self._select_runtime_credentials(
+                override,
+                getattr(config, "provider_type", PROVIDER_TYPE_OPENAI),
+            )
+            base_url = credentials.base_url
+            api_key = credentials.api_key
             model_name = override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
-            provider_type = override.get("provider_type") or getattr(config, "provider_type", PROVIDER_TYPE_OPENAI)
+            provider_type = credentials.provider_type
         
         timeout = override.get("timeout") or self.timeout
         
-        if config.provider == "local" or not base_url or not api_key:
+        if (
+            config.provider == "local"
+            or not base_url
+            or not api_key
+            or not provider_type
+        ):
             raise RuntimeError(f"Cannot call AI for capability {capability}: missing configuration")
         
         # 根据 provider_type 处理不同的 API 格式
@@ -1158,10 +1232,15 @@ class ModelRouter:
             
             logger.info(f"[acall_capability] 负载均衡选择: {capability} -> {lb_provider.provider_id}, model={model_name}")
         else:
-            base_url, api_key = self._runtime_credentials(override)
+            credentials = self._select_runtime_credentials(
+                override,
+                getattr(config, "provider_type", PROVIDER_TYPE_OPENAI),
+            )
+            base_url = credentials.base_url
+            api_key = credentials.api_key
             model_name = override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
-            provider_type = override.get("provider_type") or getattr(config, "provider_type", PROVIDER_TYPE_OPENAI)
+            provider_type = credentials.provider_type
         
         timeout_value = override.get("timeout") or self.timeout or 60  # 确保有默认值
         
@@ -1172,7 +1251,12 @@ class ModelRouter:
                 f"请检查服务商配置的 selected_models 是否为空，或者 capability_routes 中的 model 配置。"
             )
         
-        if config.provider == "local" or not base_url or not api_key:
+        if (
+            config.provider == "local"
+            or not base_url
+            or not api_key
+            or not provider_type
+        ):
             raise RuntimeError(f"Cannot call AI for capability {capability}: missing configuration")
         
         # 根据 provider_type 处理不同的 API 格式
@@ -1315,15 +1399,25 @@ class ModelRouter:
             model_name = lb_provider.model or override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
         else:
-            base_url, api_key = self._runtime_credentials(override)
+            credentials = self._select_runtime_credentials(
+                override,
+                getattr(config, "provider_type", PROVIDER_TYPE_OPENAI),
+            )
+            base_url = credentials.base_url
+            api_key = credentials.api_key
             model_name = override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
-            provider_type = override.get("provider_type") or getattr(config, "provider_type", PROVIDER_TYPE_OPENAI)
+            provider_type = credentials.provider_type
         
         timeout_value = override.get("timeout") or self.timeout or 60
         
         # 检查是否为本地模式（无 API 配置）
-        if config.provider == "local" or not base_url or not api_key:
+        if (
+            config.provider == "local"
+            or not base_url
+            or not api_key
+            or not provider_type
+        ):
             logger.warning(f"[chat] {capability} 无 API 配置，返回占位符响应")
             return f"[本地模式] 无法生成响应: {prompt[:100]}..."
         
@@ -1444,14 +1538,22 @@ class ModelRouter:
             model_name = lb_provider.model or override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
         else:
-            base_url, api_key = self._runtime_credentials(override)
+            credentials = self._select_runtime_credentials(
+                override,
+                getattr(config, "provider_type", PROVIDER_TYPE_OPENAI),
+            )
+            base_url = credentials.base_url
+            api_key = credentials.api_key
             model_name = override.get("model") or config.model
             extra_body = override.get("extra_body") or config.extra_body
-            provider_type = override.get("provider_type") or getattr(
-                config, "provider_type", PROVIDER_TYPE_OPENAI
-            )
+            provider_type = credentials.provider_type
 
-        if config.provider == "local" or not base_url or not api_key:
+        if (
+            config.provider == "local"
+            or not base_url
+            or not api_key
+            or not provider_type
+        ):
             yield self._stream_error_event(
                 capability, "Missing configuration for streaming"
             )

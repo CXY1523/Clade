@@ -11,6 +11,19 @@ class RecordingEmbeddingService:
         self.network_calls = 0
 
 
+def test_model_router_public_credential_accessors_remain_assignable() -> None:
+    router = ModelRouter(
+        base_url="https://initial.example/v1",
+        api_key="initial-test-key",
+    )
+
+    router.api_base_url = "https://replacement.example/v1"
+    router.api_key = "replacement-test-key"
+
+    assert router.api_base_url == "https://replacement.example/v1"
+    assert router.api_key == "replacement-test-key"
+
+
 def test_configure_model_router_propagates_local_endpoint_policy() -> None:
     router = ModelRouter()
     embedding_service = RecordingEmbeddingService()

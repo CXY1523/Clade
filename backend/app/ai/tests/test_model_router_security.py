@@ -3,8 +3,10 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -20,6 +22,8 @@ from app.ai.model_router import (
     ModelRouter,
     ProviderPoolConfig,
 )
+from app.core.ai_router_config import configure_model_router
+from app.models.config import ProviderConfig, UIConfig
 from app.security import (
     AI_JSON_MAX_BYTES,
     STREAM_EVENT_MAX_BYTES,
@@ -1111,13 +1115,45 @@ async def _collect_capability_stream(
     ]
 
 
+def _credential_call_signature(call: dict[str, Any]) -> tuple[str, str, str]:
+    endpoint_source = {
+        "https://global.example/v1": "global",
+        "https://override.example/v1": "override",
+        "https://old.example/v1": "old",
+        "https://environment.example/v1": "environment",
+        "https://new.example/v1": "new",
+    }.get(call["base_url"], "unknown")
+    headers = call["headers"]
+    raw_key = headers.get("x-api-key")
+    if raw_key is None:
+        authorization = headers.get("Authorization", "")
+        raw_key = authorization.removeprefix("Bearer ")
+    key_source = {
+        "global-test-key": "global",
+        "override-test-key": "override",
+        "old-test-key": "old",
+        "environment-test-key": "environment",
+        "new-test-key": "new",
+    }.get(raw_key, "unknown")
+    return endpoint_source, key_source, call["provider_type"]
+
+
+def _credential_call_source(call: dict[str, Any]) -> str:
+    signature = _credential_call_signature(call)
+    if signature == ("global", "global", PROVIDER_TYPE_OPENAI):
+        return "global"
+    if signature == ("override", "override", PROVIDER_TYPE_ANTHROPIC):
+        return "override"
+    return "mixed-or-unknown"
+
+
 @pytest.mark.parametrize(
     ("entry_name", "expected_transport"),
     NETWORK_ENTRY_TRANSPORTS,
     ids=[entry_name for entry_name, _ in NETWORK_ENTRY_TRANSPORTS],
 )
 @pytest.mark.parametrize(
-    ("override", "should_call"),
+    ("override", "expected_source"),
     [
         pytest.param(
             {
@@ -1126,7 +1162,7 @@ async def _collect_capability_stream(
                 "provider_type": "openai",
                 "model": "override-model",
             },
-            False,
+            None,
             id="both-credential-fields-incomplete",
         ),
         pytest.param(
@@ -1135,7 +1171,7 @@ async def _collect_capability_stream(
                 "provider_type": "openai",
                 "model": "override-model",
             },
-            False,
+            None,
             id="base-url-only",
         ),
         pytest.param(
@@ -1144,14 +1180,41 @@ async def _collect_capability_stream(
                 "provider_type": "openai",
                 "model": "override-model",
             },
-            False,
+            None,
             id="api-key-only",
+        ),
+        pytest.param(
+            {
+                "base_url": "https://override.example/v1",
+                "api_key": "override-test-key",
+                "model": "override-model",
+            },
+            None,
+            id="endpoint-key-without-provider-type",
+        ),
+        pytest.param(
+            {
+                "provider_type": PROVIDER_TYPE_ANTHROPIC,
+                "model": "override-model",
+            },
+            None,
+            id="provider-type-only",
+        ),
+        pytest.param(
+            {
+                "base_url": "https://override.example/v1",
+                "api_key": "override-test-key",
+                "provider_type": PROVIDER_TYPE_ANTHROPIC,
+                "model": "override-model",
+            },
+            "override",
+            id="complete-credential-tuple",
         ),
         pytest.param(
             {
                 "model": "override-model",
             },
-            True,
+            "global",
             id="model-only",
         ),
     ],
@@ -1160,10 +1223,13 @@ def test_network_entries_select_override_credentials_atomically(
     entry_name: str,
     expected_transport: str,
     override: dict[str, Any],
-    should_call: bool,
+    expected_source: str | None,
 ) -> None:
     runtime_client = RecordingSafeRuntimeClient()
-    response = {"choices": [{"message": {"content": "oak"}}]}
+    response = {
+        "choices": [{"message": {"content": "oak"}}],
+        "content": [{"type": "text", "text": "oak"}],
+    }
     runtime_client.sync_results = [response]
     runtime_client.async_results = [response]
     runtime_client.stream_lines = [
@@ -1198,15 +1264,122 @@ def test_network_entries_select_override_credentials_atomically(
     except RuntimeError as exc:
         assert "missing configuration" in str(exc)
 
-    if not should_call:
-        assert runtime_client.calls == []
+    if expected_source is None:
+        assert len(runtime_client.calls) == 0
         return
 
     assert len(runtime_client.calls) == 1
     call = runtime_client.calls[0]
     assert call["method"] == expected_transport
-    assert call["base_url"] == "https://global.example/v1"
-    assert call["headers"]["Authorization"] == "Bearer global-test-key"
+    assert _credential_call_source(call) == expected_source
+
+
+class CoordinatedCredentialRouter(ModelRouter):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._coordinate_credential_publications = False
+        self.credential_published = threading.Barrier(2)
+        self.credential_resume = threading.Barrier(2)
+        super().__init__(*args, **kwargs)
+
+    def _pause_after_credential_publication(self) -> None:
+        self.credential_published.wait(timeout=5)
+        self.credential_resume.wait(timeout=5)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if (
+            name == "api_base_url"
+            and getattr(self, "_coordinate_credential_publications", False)
+        ):
+            self._pause_after_credential_publication()
+
+    def configure_runtime_credentials(
+        self,
+        *,
+        base_url: str | None,
+        api_key: str | None,
+        provider_type: str | None,
+    ) -> None:
+        super().configure_runtime_credentials(
+            base_url=base_url,
+            api_key=api_key,
+            provider_type=provider_type,
+        )
+        if self._coordinate_credential_publications:
+            self._pause_after_credential_publication()
+
+
+def test_config_refresh_publishes_only_complete_credential_snapshots() -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    runtime_client.sync_results = [{}, {}, {}]
+    router = CoordinatedCredentialRouter(
+        defaults={
+            "generate": ModelConfig(
+                provider=PROVIDER_TYPE_ANTHROPIC,
+                provider_type=PROVIDER_TYPE_ANTHROPIC,
+                model="old-model",
+            )
+        },
+        base_url="https://old.example/v1",
+        api_key="old-test-key",
+        runtime_client=runtime_client,
+        allow_local_ai_endpoints=False,
+    )
+    router.set_prompt("generate", "Answer for {name}")
+    config = UIConfig(
+        providers={
+            "new": ProviderConfig(
+                id="new",
+                name="New",
+                type=PROVIDER_TYPE_ANTHROPIC,
+                provider_type=PROVIDER_TYPE_ANTHROPIC,
+                base_url="https://new.example/v1",
+                api_key="new-test-key",
+                selected_models=["new-model"],
+            )
+        },
+        default_provider_id="new",
+    )
+    settings = SimpleNamespace(
+        speciation_model="fallback",
+        embedding_provider=PROVIDER_TYPE_OPENAI,
+        ai_base_url="https://environment.example/v1",
+        ai_api_key="environment-test-key",
+    )
+    refresh_errors: list[BaseException] = []
+
+    def refresh() -> None:
+        try:
+            configure_model_router(
+                config,
+                router,
+                None,  # type: ignore[arg-type]
+                settings,
+            )
+        except BaseException as exc:
+            refresh_errors.append(exc)
+
+    def invoke_signature() -> tuple[str, str, str]:
+        router.invoke("generate", {"name": "oak"})
+        return _credential_call_signature(runtime_client.calls[-1])
+
+    signatures = [invoke_signature()]
+    router._coordinate_credential_publications = True
+    refresh_thread = threading.Thread(target=refresh)
+    refresh_thread.start()
+    for _ in range(2):
+        router.credential_published.wait(timeout=5)
+        signatures.append(invoke_signature())
+        router.credential_resume.wait(timeout=5)
+    refresh_thread.join(timeout=5)
+
+    assert not refresh_thread.is_alive()
+    assert refresh_errors == []
+    assert signatures == [
+        ("old", "old", PROVIDER_TYPE_ANTHROPIC),
+        ("environment", "environment", PROVIDER_TYPE_OPENAI),
+        ("new", "new", PROVIDER_TYPE_ANTHROPIC),
+    ]
 
 
 LEGACY_JSON_ENTRIES = ("call_capability", "acall_capability", "chat")

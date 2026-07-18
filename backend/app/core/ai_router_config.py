@@ -3,7 +3,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
-from ..ai.model_router import ModelConfig, ModelRouter, ProviderPoolConfig
+from ..ai.model_router import (
+    PROVIDER_TYPE_OPENAI,
+    ModelConfig,
+    ModelRouter,
+    ProviderPoolConfig,
+)
 from ..models.config import CapabilityRouteConfig, ProviderConfig, UIConfig
 
 if TYPE_CHECKING:
@@ -90,8 +95,11 @@ def configure_model_router(
     settings: 'Settings',
 ) -> UIConfig:
     """Apply UI routing config to the provided ModelRouter instance."""
-    model_router.api_base_url = getattr(settings, "ai_base_url", None)
-    model_router.api_key = getattr(settings, "ai_api_key", None)
+    model_router.configure_runtime_credentials(
+        base_url=getattr(settings, "ai_base_url", None),
+        api_key=getattr(settings, "ai_api_key", None),
+        provider_type=PROVIDER_TYPE_OPENAI,
+    )
     model_router.overrides = {}
     model_router.clear_provider_pools()
 
@@ -110,8 +118,11 @@ def configure_model_router(
     default_model_name = config.default_model
     
     if default_provider:
-        model_router.api_base_url = default_provider.base_url
-        model_router.api_key = default_provider.api_key
+        model_router.configure_runtime_credentials(
+            base_url=default_provider.base_url,
+            api_key=default_provider.api_key,
+            provider_type=default_provider.provider_type or PROVIDER_TYPE_OPENAI,
+        )
         if not default_model_name:
             default_model_name = _pick_provider_model(default_provider)
             if default_model_name:
