@@ -769,6 +769,7 @@ class ModelRouter:
             )
             headers = {**req["headers"], "Connection": "close"}
             iterator: Any = None
+            primary_cancel: asyncio.CancelledError | None = None
 
             try:
                 lines = self._runtime_client.astream_lines(
@@ -969,7 +970,8 @@ class ModelRouter:
                             yield content
 
                 yield self._stream_status_event(capability, "completed")
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as exc:
+                primary_cancel = exc
                 raise
             except OutboundRequestError as exc:
                 logger.warning(
@@ -994,7 +996,8 @@ class ModelRouter:
                         try:
                             await close()
                         except asyncio.CancelledError:
-                            raise
+                            if primary_cancel is None:
+                                raise
                         except OutboundRequestError as exc:
                             logger.warning(
                                 "[ModelRouter] Stream close failed %s code=%s",

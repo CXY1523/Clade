@@ -911,6 +911,43 @@ def test_astream_cancellation_survives_inner_close_error(
     assert "CLOSE-CANCEL-SENTINEL" not in caplog.text
 
 
+def test_astream_preserves_outer_cancellation_over_inner_close_cancellation() -> None:
+    async def scenario() -> None:
+        runtime_client = RecordingSafeRuntimeClient()
+        runtime_client.stream_lines = [": heartbeat"]
+        runtime_client.stream_block_on_exhaustion = True
+        runtime_client.stream_close_error = asyncio.CancelledError("INNER-CLOSE")
+        router = _remote_router(runtime_client)
+        task = asyncio.create_task(_collect_stream(router))
+
+        while runtime_client.stream_iterator is None:
+            await asyncio.sleep(0)
+        await runtime_client.stream_iterator.next_started.wait()
+        task.cancel("OUTER-CANCEL")
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        assert exc_info.value.args == ("OUTER-CANCEL",)
+        assert runtime_client.stream_iterator.close_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_astream_propagates_inner_close_cancellation_without_outer_cancel() -> None:
+    async def scenario() -> None:
+        runtime_client = RecordingSafeRuntimeClient()
+        runtime_client.stream_lines = [": heartbeat", "data: [DONE]"]
+        runtime_client.stream_close_error = asyncio.CancelledError("INNER-CLOSE")
+        router = _remote_router(runtime_client)
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await _collect_stream(router)
+        assert exc_info.value.args == ("INNER-CLOSE",)
+        assert runtime_client.stream_iterator is not None
+        assert runtime_client.stream_iterator.close_count == 1
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("failure_kind", ["security", "protocol"])
 def test_astream_error_is_not_replaced_by_inner_close_error(
     failure_kind: str,
