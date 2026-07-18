@@ -1,7 +1,10 @@
+import ast
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -26,6 +29,7 @@ from app.security import (
 
 
 PUBLIC_BLOCKED = "That network address is not allowed"
+PUBLIC_CONNECT_FAILED = "The upstream service could not be reached"
 PUBLIC_TIMEOUT = "The upstream request timed out"
 PRIMARY_RESPONSE_ERROR = "AI response error"
 UPSTREAM_STREAM_ERROR = "AI stream response error"
@@ -77,9 +81,9 @@ def forbid_direct_httpx(monkeypatch: pytest.MonkeyPatch) -> None:
         "request",
         "stream",
     ):
-        monkeypatch.setattr(model_router_module.httpx, verb, forbidden_request)
-    monkeypatch.setattr(model_router_module.httpx, "Client", ForbiddenSyncClient)
-    monkeypatch.setattr(model_router_module.httpx, "AsyncClient", ForbiddenAsyncClient)
+        monkeypatch.setattr(httpx, verb, forbidden_request)
+    monkeypatch.setattr(httpx, "Client", ForbiddenSyncClient)
+    monkeypatch.setattr(httpx, "AsyncClient", ForbiddenAsyncClient)
 
 
 class RecordingAsyncLines(AsyncIterator[str]):
@@ -98,8 +102,10 @@ class RecordingAsyncLines(AsyncIterator[str]):
         self.next_started = asyncio.Event()
         self.next_release = asyncio.Event()
         self.close_count = 0
+        self.iter_count = 0
 
     def __aiter__(self) -> "RecordingAsyncLines":
+        self.iter_count += 1
         return self
 
     async def __anext__(self) -> str:
@@ -130,6 +136,7 @@ class RecordingSafeRuntimeClient:
         self.stream_close_error: BaseException | None = None
         self.stream_block_on_exhaustion = False
         self.stream_iterator: RecordingAsyncLines | None = None
+        self.on_sync_call: Callable[[int], None] | None = None
         self.on_async_call: Callable[[int], None] | None = None
         self.async_started: asyncio.Event | None = None
         self.async_release: asyncio.Event | None = None
@@ -180,6 +187,8 @@ class RecordingSafeRuntimeClient:
             read_timeout=read_timeout,
             max_bytes=max_bytes,
         )
+        if self.on_sync_call is not None:
+            self.on_sync_call(len(self.calls))
         return self._next_result(self.sync_results)
 
     async def apost_json(
@@ -1030,3 +1039,695 @@ def test_astream_upstream_error_and_malformed_fragment_are_redacted(
     assert "MALFORMED-SENTINEL" not in caplog.text
     assert runtime_client.stream_iterator is not None
     assert runtime_client.stream_iterator.close_count == 1
+
+
+NETWORK_ENTRY_TRANSPORTS = (
+    ("invoke", "post_json"),
+    ("ainvoke", "apost_json"),
+    ("astream", "astream_lines"),
+    ("call_capability", "post_json"),
+    ("acall_capability", "apost_json"),
+    ("chat", "apost_json"),
+    ("astream_capability", "astream_lines"),
+)
+
+
+def _messages() -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": "Be concise"},
+        {"role": "user", "content": "Name a tree"},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entry_name", "expected_transport"),
+    NETWORK_ENTRY_TRANSPORTS,
+    ids=[entry_name for entry_name, _ in NETWORK_ENTRY_TRANSPORTS],
+)
+def test_seven_network_entries_delegate_once_through_safe_runtime_client(
+    entry_name: str,
+    expected_transport: str,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    response = {"choices": [{"message": {"content": "oak"}}]}
+    runtime_client.sync_results = [response]
+    runtime_client.async_results = [response]
+    runtime_client.stream_lines = [
+        ": heartbeat",
+        'data: {"choices":[{"delta":{"content":"oak"}}]}',
+        "data: [DONE]",
+    ]
+    router = _remote_router(runtime_client, allow_local=False)
+
+    if entry_name == "invoke":
+        router.invoke("generate", {"name": "oak"})
+    elif entry_name == "ainvoke":
+        asyncio.run(router.ainvoke("generate", {"name": "oak"}))
+    elif entry_name == "astream":
+        asyncio.run(_collect_stream(router))
+    elif entry_name == "call_capability":
+        assert router.call_capability("generate", _messages()) == "oak"
+    elif entry_name == "acall_capability":
+        assert asyncio.run(router.acall_capability("generate", _messages())) == "oak"
+    elif entry_name == "chat":
+        assert asyncio.run(router.chat("Name a tree", capability="generate")) == "oak"
+    else:
+        events = asyncio.run(
+            _collect_capability_stream(router, "generate", _messages())
+        )
+        assert "oak" in events
+
+    assert [call["method"] for call in runtime_client.calls] == [expected_transport]
+
+
+async def _collect_capability_stream(
+    router: ModelRouter,
+    capability: str,
+    messages: list[dict[str, str]],
+) -> list[Any]:
+    return [
+        event
+        async for event in router.astream_capability(capability, messages)
+    ]
+
+
+LEGACY_JSON_ENTRIES = ("call_capability", "acall_capability", "chat")
+
+
+def _run_legacy_json_entry(router: ModelRouter, entry_name: str) -> str:
+    if entry_name == "call_capability":
+        return router.call_capability("generate", _messages())
+    if entry_name == "acall_capability":
+        return asyncio.run(router.acall_capability("generate", _messages()))
+    return asyncio.run(
+        router.chat(
+            "Name a tree",
+            capability="generate",
+            system_prompt="Be concise",
+            max_tokens=123,
+        )
+    )
+
+
+@pytest.mark.parametrize("entry_name", LEGACY_JSON_ENTRIES)
+@pytest.mark.parametrize(
+    ("provider_type", "expected_target"),
+    [
+        (PROVIDER_TYPE_OPENAI, "/v1/chat/completions"),
+        (PROVIDER_TYPE_ANTHROPIC, "/messages"),
+        (
+            PROVIDER_TYPE_GOOGLE,
+            "/models/default-model:generateContent?key=default-key",
+        ),
+    ],
+)
+def test_legacy_json_entries_preserve_provider_formats_through_safe_client(
+    entry_name: str,
+    provider_type: str,
+    expected_target: str,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    response = _json_response(provider_type, "maple")
+    runtime_client.sync_results = [response]
+    runtime_client.async_results = [response]
+    router = _remote_router(
+        runtime_client,
+        provider_type=provider_type,
+        allow_local=False,
+    )
+
+    assert _run_legacy_json_entry(router, entry_name) == "maple"
+
+    expected_method = "post_json" if entry_name == "call_capability" else "apost_json"
+    assert len(runtime_client.calls) == 1
+    _assert_json_call(
+        runtime_client.calls[0],
+        method=expected_method,
+        base_url="https://default.example/api",
+        request_target=expected_target,
+        provider_type=provider_type,
+        timeout=17,
+        allow_local=False,
+    )
+
+
+@pytest.mark.parametrize("entry_name", LEGACY_JSON_ENTRIES)
+@pytest.mark.parametrize(
+    ("code", "public_message"),
+    [
+        ("private_network_blocked", PUBLIC_BLOCKED),
+        ("outbound_connect_failed", PUBLIC_CONNECT_FAILED),
+        ("outbound_timeout", PUBLIC_TIMEOUT),
+    ],
+)
+def test_legacy_json_safety_and_timeout_errors_are_fixed_and_never_retried(
+    entry_name: str,
+    code: str,
+    public_message: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    failure = OutboundRequestError(code, 504, public_message)
+    response = {"choices": [{"message": {"content": "must-not-retry"}}]}
+    runtime_client.sync_results = [failure, response]
+    runtime_client.async_results = [failure, response]
+    router = _remote_router(
+        runtime_client,
+        base_url="https://url-secret.example/v1",
+        api_key="KEY-ERROR-SENTINEL",
+        allow_local=False,
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RuntimeError) as exc_info:
+            _run_legacy_json_entry(router, entry_name)
+
+    assert str(exc_info.value) == public_message
+    assert len(runtime_client.calls) == 1
+    assert "KEY-ERROR-SENTINEL" not in caplog.text
+    assert "url-secret.example" not in caplog.text
+
+
+@pytest.mark.parametrize("entry_name", LEGACY_JSON_ENTRIES)
+@pytest.mark.parametrize(
+    "provider_type",
+    [PROVIDER_TYPE_OPENAI, PROVIDER_TYPE_ANTHROPIC, PROVIDER_TYPE_GOOGLE],
+)
+@pytest.mark.parametrize("response_kind", ["malformed", "upstream_error"])
+def test_legacy_json_invalid_provider_shapes_are_fixed_and_redacted(
+    entry_name: str,
+    provider_type: str,
+    response_kind: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = f"LEGACY-{entry_name}-{provider_type}-{response_kind}-SENTINEL"
+    response = (
+        _json_response(provider_type, {"secret": sentinel})
+        if response_kind == "malformed"
+        else {"error": {"message": sentinel}}
+    )
+    runtime_client = RecordingSafeRuntimeClient()
+    runtime_client.sync_results = [response]
+    runtime_client.async_results = [response]
+    router = _remote_router(runtime_client, provider_type=provider_type)
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RuntimeError) as exc_info:
+            _run_legacy_json_entry(router, entry_name)
+
+    assert str(exc_info.value) == PRIMARY_RESPONSE_ERROR
+    assert sentinel not in repr(exc_info.value)
+    assert sentinel not in caplog.text
+    assert len(runtime_client.calls) == 1
+
+
+@pytest.mark.parametrize("entry_name", LEGACY_JSON_ENTRIES)
+def test_legacy_json_uses_business_start_local_policy_snapshot(
+    entry_name: str,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    response = {"choices": [{"message": {"content": "fir"}}]}
+    runtime_client.sync_results = [response]
+    runtime_client.async_results = [response]
+    router = _remote_router(runtime_client, allow_local=False)
+
+    def enable_local(_: int) -> None:
+        router.allow_local_ai_endpoints = True
+
+    runtime_client.on_sync_call = enable_local
+    runtime_client.on_async_call = enable_local
+
+    assert _run_legacy_json_entry(router, entry_name) == "fir"
+    assert runtime_client.calls[0]["allow_local"] is False
+
+
+@pytest.mark.parametrize("entry_name", LEGACY_JSON_ENTRIES)
+def test_legacy_json_selected_google_pool_key_builds_request_target(
+    entry_name: str,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    response = _json_response(PROVIDER_TYPE_GOOGLE, "cedar")
+    runtime_client.sync_results = [response]
+    runtime_client.async_results = [response]
+    router = _remote_router(runtime_client, allow_local=False)
+    router.configure_load_balance(True)
+    router.set_provider_pool(
+        "generate",
+        [
+            ProviderPoolConfig(
+                provider_id="selected-google",
+                base_url="https://selected.example/v1beta",
+                api_key="selected+&key",
+                provider_type=PROVIDER_TYPE_GOOGLE,
+                model="gemini pool/model",
+            ),
+            ProviderPoolConfig(
+                provider_id="must-not-select",
+                base_url="https://other.example/v1",
+                api_key="other-key",
+                provider_type=PROVIDER_TYPE_OPENAI,
+                model="other-model",
+            ),
+        ],
+    )
+
+    assert _run_legacy_json_entry(router, entry_name) == "cedar"
+
+    assert router._lb_counters["generate"] == 1
+    assert len(runtime_client.calls) == 1
+    assert runtime_client.calls[0]["base_url"] == "https://selected.example/v1beta"
+    assert runtime_client.calls[0]["request_target"] == (
+        "/models/gemini%20pool%2Fmodel:generateContent?"
+        + urlencode({"key": "selected+&key"})
+    )
+
+
+@pytest.mark.parametrize("configuration", ["local", "missing"])
+def test_legacy_local_and_missing_configuration_shapes_are_unchanged(
+    configuration: str,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    router = ModelRouter(
+        defaults={
+            "generate": ModelConfig(
+                provider="local" if configuration == "local" else "openai",
+                model="default-model",
+            )
+        },
+        base_url=None,
+        api_key=None,
+        runtime_client=runtime_client,
+    )
+
+    expected = "Cannot call AI for capability generate: missing configuration"
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
+        router.call_capability("generate", _messages())
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
+        asyncio.run(router.acall_capability("generate", _messages()))
+    assert asyncio.run(router.chat("Name a tree", capability="generate")) == (
+        "[本地模式] 无法生成响应: Name a tree..."
+    )
+    events = asyncio.run(_collect_capability_stream(router, "generate", _messages()))
+    assert [event["message"] for event in events] == [
+        "Missing configuration for streaming"
+    ]
+    assert runtime_client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "lines", "expected_target", "expected_chunks"),
+    [
+        (
+            PROVIDER_TYPE_OPENAI,
+            [
+                ": heartbeat",
+                'data: {"choices":[{"delta":{"content":"open"}}]}',
+                ": heartbeat",
+                'data: {"choices":[{"delta":{"content":"ai"}}]}',
+                "data: [DONE]",
+            ],
+            "/v1/chat/completions",
+            ["open", "ai"],
+        ),
+        (
+            PROVIDER_TYPE_ANTHROPIC,
+            [
+                ": heartbeat",
+                'data: {"type":"content_block_delta","delta":{"text":"anth"}}',
+                'data: {"type":"content_block_delta","delta":{"text":"ropic"}}',
+                "data: [DONE]",
+            ],
+            "/messages",
+            ["anth", "ropic"],
+        ),
+        (
+            PROVIDER_TYPE_GOOGLE,
+            [
+                ": heartbeat",
+                '[{"candidates":[{"content":{"parts":[{"text":"goo"}]}}]},',
+                '{"candidates":[{"content":{"parts":[{"text":"gle"}]}}]}]',
+            ],
+            "/models/default-model:streamGenerateContent?key=default-key",
+            ["goo", "gle"],
+        ),
+    ],
+)
+def test_legacy_stream_preserves_provider_formats_status_and_heartbeat(
+    provider_type: str,
+    lines: list[str],
+    expected_target: str,
+    expected_chunks: list[str],
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    runtime_client.stream_lines = lines
+    router = _remote_router(
+        runtime_client,
+        provider_type=provider_type,
+        allow_local=False,
+    )
+
+    events = asyncio.run(
+        _collect_capability_stream(router, "generate", _messages())
+    )
+
+    assert [event for event in events if isinstance(event, str)] == expected_chunks
+    assert [
+        event["state"]
+        for event in events
+        if isinstance(event, dict) and event.get("type") == "status"
+    ] == [
+        "connecting",
+        "connected",
+        "receiving",
+        "completed",
+    ]
+    assert len(runtime_client.calls) == 1
+    call = runtime_client.calls[0]
+    assert call["method"] == "astream_lines"
+    assert call["base_url"] == "https://default.example/api"
+    assert call["request_target"] == expected_target
+    assert call["provider_type"] == provider_type
+    assert call["allow_local"] is False
+    assert call["max_bytes"] == STREAM_MAX_BYTES
+    assert call["max_event_bytes"] == STREAM_EVENT_MAX_BYTES
+    assert call["idle_timeout"] == 120.0
+    assert call["total_timeout"] is None
+    assert runtime_client.stream_iterator is not None
+    assert runtime_client.stream_iterator.iter_count == 1
+    assert runtime_client.stream_iterator.close_count == 1
+
+
+def test_legacy_stream_uses_business_start_local_policy_snapshot() -> None:
+    async def scenario() -> None:
+        runtime_client = RecordingSafeRuntimeClient()
+        runtime_client.stream_lines = [": heartbeat", "data: [DONE]"]
+        router = _remote_router(runtime_client, allow_local=False)
+        stream = router.astream_capability("generate", _messages())
+
+        assert (await stream.__anext__())["state"] == "connecting"
+        router.allow_local_ai_endpoints = True
+        remaining = [event async for event in stream]
+
+        assert remaining[-1]["state"] == "completed"
+        assert runtime_client.calls[0]["allow_local"] is False
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("code", "public_message"),
+    [
+        ("private_network_blocked", PUBLIC_BLOCKED),
+        ("outbound_connect_failed", PUBLIC_CONNECT_FAILED),
+        ("outbound_timeout", PUBLIC_TIMEOUT),
+    ],
+)
+def test_legacy_stream_safe_error_stops_redacted_without_retry(
+    code: str,
+    public_message: str,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    runtime_client.stream_error = OutboundRequestError(code, 504, public_message)
+    router = _remote_router(runtime_client, allow_local=False)
+
+    events = asyncio.run(
+        _collect_capability_stream(router, "generate", _messages())
+    )
+
+    assert [event["state"] for event in events if event.get("type") == "status"] == [
+        "connecting"
+    ]
+    assert [event["message"] for event in events if event.get("type") == "error"] == [
+        public_message
+    ]
+    assert len(runtime_client.calls) == 1
+    assert runtime_client.stream_iterator is not None
+    assert runtime_client.stream_iterator.close_count == 1
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "lines"),
+    [
+        (
+            PROVIDER_TYPE_OPENAI,
+            ['data: {"error":{"message":"STREAM-UPSTREAM-SENTINEL"}}'],
+        ),
+        (
+            PROVIDER_TYPE_OPENAI,
+            ['data: {"malformed":"STREAM-MALFORMED-SENTINEL"'],
+        ),
+        (
+            PROVIDER_TYPE_ANTHROPIC,
+            [
+                'data: {"type":"error","error":{"message":"STREAM-UPSTREAM-SENTINEL"}}'
+            ],
+        ),
+        (
+            PROVIDER_TYPE_ANTHROPIC,
+            ['data: {"malformed":"STREAM-MALFORMED-SENTINEL"'],
+        ),
+        (
+            PROVIDER_TYPE_GOOGLE,
+            ['[{"error":{"message":"STREAM-UPSTREAM-SENTINEL"}}]'],
+        ),
+        (
+            PROVIDER_TYPE_GOOGLE,
+            ['[{"malformed":"STREAM-MALFORMED-SENTINEL"'],
+        ),
+    ],
+)
+def test_legacy_stream_upstream_and_malformed_data_are_fixed_and_redacted(
+    provider_type: str,
+    lines: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    runtime_client.stream_lines = lines
+    router = _remote_router(runtime_client, provider_type=provider_type)
+
+    with caplog.at_level(logging.DEBUG):
+        events = asyncio.run(
+            _collect_capability_stream(router, "generate", _messages())
+        )
+
+    assert [event["message"] for event in events if event.get("type") == "error"] == [
+        UPSTREAM_STREAM_ERROR
+    ]
+    assert not any(event.get("state") == "completed" for event in events)
+    assert "STREAM-UPSTREAM-SENTINEL" not in repr(events)
+    assert "STREAM-MALFORMED-SENTINEL" not in repr(events)
+    assert "STREAM-UPSTREAM-SENTINEL" not in caplog.text
+    assert "STREAM-MALFORMED-SENTINEL" not in caplog.text
+    assert runtime_client.stream_iterator is not None
+    assert runtime_client.stream_iterator.close_count == 1
+
+
+def test_legacy_stream_cancellation_preserves_outer_cancel_and_closes_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def scenario() -> None:
+        runtime_client = RecordingSafeRuntimeClient()
+        runtime_client.stream_lines = [": heartbeat"]
+        runtime_client.stream_block_on_exhaustion = True
+        runtime_client.stream_close_error = OutboundRequestError(
+            "outbound_connect_failed", 502, "STREAM-CLOSE-SENTINEL"
+        )
+        router = _remote_router(runtime_client)
+        task = asyncio.create_task(
+            _collect_capability_stream(router, "generate", _messages())
+        )
+
+        while runtime_client.stream_iterator is None:
+            await asyncio.sleep(0)
+        await runtime_client.stream_iterator.next_started.wait()
+        task.cancel("OUTER-CANCEL")
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        assert exc_info.value.args == ("OUTER-CANCEL",)
+        assert runtime_client.stream_iterator.close_count == 1
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(scenario())
+    assert "STREAM-CLOSE-SENTINEL" not in caplog.text
+
+
+def test_legacy_stream_early_close_swallows_inner_close_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def scenario() -> None:
+        runtime_client = RecordingSafeRuntimeClient()
+        runtime_client.stream_lines = [": heartbeat", "data: [DONE]"]
+        runtime_client.stream_close_error = RuntimeError("EARLY-CLOSE-SENTINEL")
+        router = _remote_router(runtime_client)
+        stream = router.astream_capability("generate", _messages())
+
+        assert (await stream.__anext__())["state"] == "connecting"
+        assert (await stream.__anext__())["state"] == "connected"
+        await stream.aclose()
+        assert runtime_client.stream_iterator is not None
+        assert runtime_client.stream_iterator.close_count == 1
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(scenario())
+    assert "EARLY-CLOSE-SENTINEL" not in caplog.text
+
+
+def test_legacy_stream_selected_google_pool_key_builds_encoded_target() -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    runtime_client.stream_lines = [": heartbeat"]
+    router = _remote_router(runtime_client, allow_local=False)
+    router.configure_load_balance(True)
+    router.set_provider_pool(
+        "generate",
+        [
+            ProviderPoolConfig(
+                provider_id="selected-google",
+                base_url="https://selected.example/v1beta",
+                api_key="selected+&key",
+                provider_type=PROVIDER_TYPE_GOOGLE,
+                model="gemini pool/model",
+            ),
+            ProviderPoolConfig(
+                provider_id="must-not-select",
+                base_url="https://other.example/v1",
+                api_key="other-key",
+                provider_type=PROVIDER_TYPE_OPENAI,
+                model="other-model",
+            ),
+        ],
+    )
+
+    asyncio.run(_collect_capability_stream(router, "generate", _messages()))
+
+    assert router._lb_counters["generate"] == 1
+    assert len(runtime_client.calls) == 1
+    assert runtime_client.calls[0]["request_target"] == (
+        "/models/gemini%20pool%2Fmodel:streamGenerateContent?"
+        + urlencode({"key": "selected+&key"})
+    )
+
+
+MODEL_ROUTER_PATH = Path(model_router_module.__file__)
+
+
+def _attribute_name(node: ast.AST) -> str | None:
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def find_forbidden_network_calls(tree: ast.AST) -> list[str]:
+    forbidden: list[str] = []
+    forbidden_imports = {
+        "requests",
+        "urllib.request",
+        "urllib3",
+        "aiohttp",
+        "httpcore",
+        "socket",
+    }
+    forbidden_httpx_calls = {
+        "httpx.post",
+        "httpx.Client",
+        "httpx.AsyncClient",
+    }
+
+    def is_forbidden_import(module_name: str) -> bool:
+        return any(
+            module_name == forbidden_module
+            or module_name.startswith(f"{forbidden_module}.")
+            for forbidden_module in forbidden_imports
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if is_forbidden_import(alias.name):
+                    forbidden.append(f"import:{alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for alias in node.names:
+                imported = f"{module}.{alias.name}" if module else alias.name
+                if is_forbidden_import(module) or is_forbidden_import(imported):
+                    forbidden.append(f"import:{imported}")
+        elif isinstance(node, ast.Call):
+            call_name = _attribute_name(node.func)
+            if call_name in forbidden_httpx_calls:
+                forbidden.append(f"call:{call_name}")
+    return forbidden
+
+
+def test_model_router_has_no_direct_network_client_bypass() -> None:
+    tree = ast.parse(MODEL_ROUTER_PATH.read_text(encoding="utf-8"))
+    assert find_forbidden_network_calls(tree) == []
+    assert all(
+        not (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_get_client"
+        )
+        for node in ast.walk(tree)
+    )
+    assert all(
+        not (isinstance(node, ast.Attribute) and node.attr == "_client_session")
+        for node in ast.walk(tree)
+    )
+
+
+def test_seven_network_entries_each_call_one_expected_safe_transport() -> None:
+    tree = ast.parse(MODEL_ROUTER_PATH.read_text(encoding="utf-8"))
+    model_router_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ModelRouter"
+    )
+    methods = {
+        node.name: node
+        for node in model_router_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    expected = dict(NETWORK_ENTRY_TRANSPORTS)
+    safe_names = {"post_json", "apost_json", "astream_lines"}
+    actual_safe_callers: dict[str, list[str]] = {}
+    for method_name, method in methods.items():
+        calls = [
+            node.func.attr
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in safe_names
+        ]
+        if calls:
+            actual_safe_callers[method_name] = calls
+
+    assert len(expected) == 7
+    assert set(actual_safe_callers) == set(expected)
+    assert actual_safe_callers == {
+        entry_name: [transport]
+        for entry_name, transport in NETWORK_ENTRY_TRANSPORTS
+    }
+
+
+def test_legacy_compatibility_methods_do_not_create_or_reset_network_client(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    router = _remote_router(runtime_client)
+    router._active_requests = 2
+    router._queued_requests = 3
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(router.reset_client())
+        asyncio.run(router.set_keepalive_mode(True))
+
+    assert router.use_keepalive is True
+    assert router._active_requests == 2
+    assert router._queued_requests == 3
+    assert not hasattr(router, "_client_session")
+    assert runtime_client.calls == []
+    assert "高效并发" in caplog.text
