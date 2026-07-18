@@ -476,7 +476,7 @@ class ModelRouter:
         }
 
     def _provider_request_location(
-        self, provider_type, base_url, model_name, endpoint, *, stream
+        self, provider_type, base_url, model_name, endpoint, *, api_key: str, stream
     ) -> tuple[str, str]:
         base_url_stripped = base_url.rstrip("/")
 
@@ -487,7 +487,7 @@ class ModelRouter:
             action = "streamGenerateContent" if stream else "generateContent"
             request_target = (
                 f"/models/{quote(str(model_name), safe='')}:{action}?"
-                f"{urlencode({'key': self.api_key})}"
+                f"{urlencode({'key': api_key})}"
             )
             return base_url_stripped, request_target
 
