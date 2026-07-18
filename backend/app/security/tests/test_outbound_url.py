@@ -2,7 +2,11 @@ from ipaddress import ip_address
 
 import pytest
 
-from app.security.outbound_url import OutboundRequestError, OutboundURLPolicy
+from app.security.outbound_url import (
+    OutboundRequestError,
+    OutboundURLPolicy,
+    canonicalize_outbound_base_url,
+)
 
 
 class FakeResolver:
@@ -16,6 +20,31 @@ class FakeResolver:
         if answer is None:
             raise OSError("resolver sentinel must not be exposed")
         return tuple(ip_address(value) for value in answer)
+
+
+def test_canonicalize_outbound_base_url_normalizes_without_dns() -> None:
+    canonical = canonicalize_outbound_base_url(
+        "https://Endpoint.Example:443/v1/"
+    )
+
+    assert canonical.url == "https://endpoint.example:443/v1/"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://public.example/v1?tenant=other",
+        "https://public.example/v1#fragment",
+        "https://user@public.example/v1",
+    ],
+)
+def test_canonicalize_outbound_base_url_rejects_credential_or_suffix(
+    url: str,
+) -> None:
+    with pytest.raises(OutboundRequestError) as exc_info:
+        canonicalize_outbound_base_url(url)
+
+    assert exc_info.value.code == "outbound_url_invalid"
 
 
 @pytest.mark.parametrize(

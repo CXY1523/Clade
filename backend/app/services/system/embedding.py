@@ -38,7 +38,6 @@ from pathlib import Path
 from typing import Iterable, Any, Sequence, TYPE_CHECKING
 import threading
 import time
-from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 
@@ -48,6 +47,7 @@ from ...security import (
     RETRYABLE_OUTBOUND_CODES,
     OutboundRequestError,
     SafeRuntimeClient,
+    canonicalize_outbound_base_url,
 )
 from .vector_store import VectorStore, MultiVectorStore, SearchResult
 
@@ -304,28 +304,7 @@ class EmbeddingService:
 
     @staticmethod
     def _normalized_endpoint(config: _EmbeddingRuntimeConfig) -> str:
-        raw_endpoint = str(config.api_base_url or "").strip()
-        try:
-            parsed = urlsplit(raw_endpoint)
-            scheme = parsed.scheme.lower()
-            hostname = (parsed.hostname or "").rstrip(".").lower()
-            if not scheme or not hostname:
-                return raw_endpoint.rstrip("/")
-            try:
-                hostname = hostname.encode("idna").decode("ascii")
-            except UnicodeError:
-                pass
-            host_for_url = f"[{hostname}]" if ":" in hostname else hostname
-            port = parsed.port
-            if port is not None and not (
-                (scheme == "https" and port == 443)
-                or (scheme == "http" and port == 80)
-            ):
-                host_for_url = f"{host_for_url}:{port}"
-            path = parsed.path.rstrip("/")
-            return urlunsplit((scheme, host_for_url, path, "", ""))
-        except (TypeError, ValueError):
-            return raw_endpoint.rstrip("/")
+        return canonicalize_outbound_base_url(config.api_base_url or "").url
 
     def _endpoint_identity(self, config: _EmbeddingRuntimeConfig) -> str:
         normalized = self._normalized_endpoint(config)
@@ -385,6 +364,15 @@ class EmbeddingService:
         if not texts:
             return []
         runtime_config = self._runtime_config_snapshot()
+        cache_runtime_config = runtime_config
+        if self._has_remote_config(runtime_config):
+            canonical_endpoint = canonicalize_outbound_base_url(
+                runtime_config.api_base_url or ""
+            )
+            cache_runtime_config = replace(
+                runtime_config,
+                api_base_url=canonical_endpoint.url,
+            )
         cache_source = self._cache_source_for_request(runtime_config, require_real)
         
         self._stats["embed_calls"] += 1
@@ -399,7 +387,7 @@ class EmbeddingService:
             if cache_source is not None:
                 cache_key = self._make_cache_key(
                     text,
-                    runtime_config,
+                    cache_runtime_config,
                     source=cache_source,
                 )
 
@@ -416,7 +404,7 @@ class EmbeddingService:
                 # 检查磁盘缓存
                 cached = self._load_from_disk_cache(
                     cache_key,
-                    runtime_config,
+                    cache_runtime_config,
                     source=cache_source,
                 )
                 if cached is not None:
@@ -456,14 +444,14 @@ class EmbeddingService:
                 if generated.cacheable:
                     cache_key = self._make_cache_key(
                         text,
-                        runtime_config,
+                        cache_runtime_config,
                         source=generated.source,
                     )
                     self._store_in_disk_cache(
                         cache_key,
                         vec,
                         text,
-                        runtime_config,
+                        cache_runtime_config,
                         source=generated.source,
                     )
                     self._update_memory_cache(cache_key, vec)

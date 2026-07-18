@@ -610,6 +610,33 @@ def test_successful_remote_vector_can_satisfy_require_real_cache(
     assert service._stats["memory_cache_hits"] == 1
 
 
+def test_invalid_remote_endpoint_cannot_reuse_valid_memory_cache(
+    tmp_path: Path,
+) -> None:
+    client = RecordingSafeRuntimeClient(
+        [{"data": [{"index": 0, "embedding": [4.0]}]}]
+    )
+    service = EmbeddingService(
+        provider="openai",
+        dimension=1,
+        base_url="https://embedding.example/v1",
+        api_key="secret-key",
+        model="model-a",
+        enabled=True,
+        cache_dir=tmp_path,
+        runtime_client=client,
+    )
+
+    assert service.embed(["oak"], require_real=True) == [[4.0]]
+    service.api_base_url = "https://embedding.example/v1?tenant=other"
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        service.embed(["oak"], require_real=True)
+
+    assert exc_info.value.code == "outbound_url_invalid"
+    assert len(client.calls) == 1
+
+
 def test_remote_cache_metadata_uses_digest_and_never_stores_endpoint_or_key(
     tmp_path: Path,
 ) -> None:
@@ -634,7 +661,7 @@ def test_remote_cache_metadata_uses_digest_and_never_stores_endpoint_or_key(
     namespace, endpoint_identity = _remote_cache_namespace(
         "openai",
         "model-secret",
-        "https://endpoint-secret.example/v1",
+        "https://endpoint-secret.example:443/v1/",
     )
     expected_key = hashlib.sha256(
         f"{namespace}:secret text".encode()

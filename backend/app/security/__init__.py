@@ -4,9 +4,11 @@ from .config_secrets import (
     public_ui_config,
 )
 from .outbound_url import (
+    CanonicalOutboundBaseURL,
     OutboundRequestError,
     OutboundURLPolicy,
     ValidatedOutboundURL,
+    canonicalize_outbound_base_url,
 )
 from .safe_http import (
     CONNECTION_TEST_TIMEOUTS,
@@ -28,6 +30,7 @@ from .runtime_http import (
 
 __all__ = [
     "AI_JSON_MAX_BYTES",
+    "CanonicalOutboundBaseURL",
     "CONNECTION_TEST_TIMEOUTS",
     "EMBEDDING_JSON_MAX_BYTES",
     "MODEL_LIST_MAX_BYTES",
@@ -44,6 +47,7 @@ __all__ = [
     "STREAM_MAX_BYTES",
     "UIConfigUpdateRequest",
     "ValidatedOutboundURL",
+    "canonicalize_outbound_base_url",
     "merge_ui_config_secrets",
     "public_ui_config",
 ]
