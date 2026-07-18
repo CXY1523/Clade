@@ -261,7 +261,7 @@ git diff --stat b52eb91..HEAD
 git diff --name-only b52eb91..HEAD
 ```
 
-命令均退出 0。文档提交前的 `b52eb91..1dcb6b7` 共 **23 个物理提交**，stat 为 **18 files changed、9561 insertions、1056 deletions**。其中 `1dcb6b7` 是最终代码验证 HEAD；本报告的文档提交将在其后成为第 24 个物理提交，提交树预计为 **18 files changed、9642 insertions、1056 deletions**，但不改变代码验证结论。name-only 清单为：
+命令均退出 0。截至文档主体提交 `3121c99`，已核对范围 `b52eb91..3121c99` 的实际结果为 **24 个物理提交**、**18 files changed、9642 insertions、1056 deletions**。其中 `1dcb6b7` 是最终代码验证 HEAD，`3121c99` 只更新文档，不改变代码验证结论。后续若仅修正文档措辞，应作为独立文档提交记录，不回写成无法稳定自引用的“当前 HEAD”。name-only 清单为：
 
 ```text
 backend/app/ai/model_router.py
