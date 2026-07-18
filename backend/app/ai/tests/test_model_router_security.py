@@ -1112,11 +1112,55 @@ async def _collect_capability_stream(
 
 
 @pytest.mark.parametrize(
-    "entry_name",
-    [entry_name for entry_name, _ in NETWORK_ENTRY_TRANSPORTS],
+    ("entry_name", "expected_transport"),
+    NETWORK_ENTRY_TRANSPORTS,
+    ids=[entry_name for entry_name, _ in NETWORK_ENTRY_TRANSPORTS],
 )
-def test_network_entries_do_not_mix_override_endpoint_with_global_key(
+@pytest.mark.parametrize(
+    ("override", "should_call"),
+    [
+        pytest.param(
+            {
+                "base_url": "https://override.example/v1",
+                "api_key": None,
+                "provider_type": "openai",
+                "model": "override-model",
+            },
+            False,
+            id="both-credential-fields-incomplete",
+        ),
+        pytest.param(
+            {
+                "base_url": "https://override.example/v1",
+                "provider_type": "openai",
+                "model": "override-model",
+            },
+            False,
+            id="base-url-only",
+        ),
+        pytest.param(
+            {
+                "api_key": "override-test-key",
+                "provider_type": "openai",
+                "model": "override-model",
+            },
+            False,
+            id="api-key-only",
+        ),
+        pytest.param(
+            {
+                "model": "override-model",
+            },
+            True,
+            id="model-only",
+        ),
+    ],
+)
+def test_network_entries_select_override_credentials_atomically(
     entry_name: str,
+    expected_transport: str,
+    override: dict[str, Any],
+    should_call: bool,
 ) -> None:
     runtime_client = RecordingSafeRuntimeClient()
     response = {"choices": [{"message": {"content": "oak"}}]}
@@ -1126,17 +1170,13 @@ def test_network_entries_do_not_mix_override_endpoint_with_global_key(
         'data: {"choices":[{"delta":{"content":"oak"}}]}',
         "data: [DONE]",
     ]
-    router = _remote_router(runtime_client, allow_local=False)
-    router.configure_overrides(
-        {
-            "generate": {
-                "base_url": "https://override.example/v1",
-                "api_key": None,
-                "provider_type": "openai",
-                "model": "override-model",
-            }
-        }
+    router = _remote_router(
+        runtime_client,
+        base_url="https://global.example/v1",
+        api_key="global-test-key",
+        allow_local=False,
     )
+    router.configure_overrides({"generate": override})
 
     try:
         if entry_name == "invoke":
@@ -1158,7 +1198,15 @@ def test_network_entries_do_not_mix_override_endpoint_with_global_key(
     except RuntimeError as exc:
         assert "missing configuration" in str(exc)
 
-    assert runtime_client.calls == []
+    if not should_call:
+        assert runtime_client.calls == []
+        return
+
+    assert len(runtime_client.calls) == 1
+    call = runtime_client.calls[0]
+    assert call["method"] == expected_transport
+    assert call["base_url"] == "https://global.example/v1"
+    assert call["headers"]["Authorization"] == "Bearer global-test-key"
 
 
 LEGACY_JSON_ENTRIES = ("call_capability", "acall_capability", "chat")

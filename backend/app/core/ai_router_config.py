@@ -90,13 +90,13 @@ def configure_model_router(
     settings: 'Settings',
 ) -> UIConfig:
     """Apply UI routing config to the provided ModelRouter instance."""
-    if not config:
-        return config
-
     model_router.api_base_url = getattr(settings, "ai_base_url", None)
     model_router.api_key = getattr(settings, "ai_api_key", None)
     model_router.overrides = {}
     model_router.clear_provider_pools()
+
+    if not config:
+        return config
 
     model_router.allow_local_ai_endpoints = config.allow_local_ai_endpoints
     

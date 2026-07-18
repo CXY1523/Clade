@@ -192,3 +192,53 @@ def test_configure_model_router_clears_deleted_provider_runtime_state() -> None:
     assert router.get_provider_pools_info() == {}
     assert router._lb_counters == {}
     assert router._provider_latencies == {}
+
+
+def test_configure_model_router_none_clears_runtime_state_before_returning() -> None:
+    router = ModelRouter(
+        defaults={
+            "speciation": ModelConfig(
+                provider="openai", model="existing", endpoint="/chat/completions"
+            )
+        }
+    )
+    configured = UIConfig(
+        providers={
+            "old": ProviderConfig(
+                id="old",
+                name="Old",
+                base_url="https://old.example/v1",
+                api_key="old-test-key",
+                selected_models=["old-model"],
+            )
+        },
+        default_provider_id="old",
+        load_balance_enabled=True,
+        capability_routes={
+            "speciation": CapabilityRouteConfig(provider_ids=["old"])
+        },
+    )
+    settings = SimpleNamespace(
+        speciation_model="fallback",
+        embedding_provider="openai",
+        ai_base_url="https://settings.example/v1",
+        ai_api_key="settings-test-key",
+    )
+
+    configure_model_router(configured, router, None, settings)  # type: ignore[arg-type]
+    router._provider_latencies["old"] = 1.0
+
+    result = configure_model_router(
+        None,  # type: ignore[arg-type]
+        router,
+        None,  # type: ignore[arg-type]
+        settings,
+    )
+
+    assert result is None
+    assert router.api_base_url == "https://settings.example/v1"
+    assert router.api_key == "settings-test-key"
+    assert router.overrides == {}
+    assert router.get_provider_pools_info() == {}
+    assert router._lb_counters == {}
+    assert router._provider_latencies == {}
