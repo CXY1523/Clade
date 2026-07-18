@@ -34,6 +34,11 @@ LB_RANDOM = "random"                 # 随机
 LB_LEAST_LATENCY = "least_latency"   # 最低延迟
 
 _STREAM_RESPONSE_ERROR = "AI stream response error"
+_PRIMARY_RESPONSE_ERROR = "AI response error"
+
+
+class _PrimaryResponseError(Exception):
+    pass
 
 
 @dataclass
@@ -513,6 +518,7 @@ class ModelRouter:
 
     def invoke(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Sync invocation (blocking)"""
+        allow_local = self.allow_local_ai_endpoints
         req = self._prepare_request(capability, payload)
         if req["is_local"]:
             logger.debug(f"[ModelRouter] Local mode: {req['result']}")
@@ -525,17 +531,28 @@ class ModelRouter:
                 request_target=req["request_target"],
                 headers=req["headers"],
                 json_body=req["body"],
-                allow_local=self.allow_local_ai_endpoints,
+                allow_local=allow_local,
                 read_timeout=req["timeout"],
                 max_bytes=AI_JSON_MAX_BYTES,
             )
-            content = self._extract_content(data, req.get("provider_type", PROVIDER_TYPE_OPENAI))
+            content = self._extract_primary_content(
+                data, req.get("provider_type", PROVIDER_TYPE_OPENAI)
+            )
             parsed_content = self._parse_content(content)
             
             return {
                 **req["meta"],
                 "content": parsed_content,
                 "raw": data,
+            }
+        except _PrimaryResponseError:
+            logger.warning(
+                "[ModelRouter] Sync invoke invalid response %s code=invalid_response_shape",
+                capability,
+            )
+            return {
+                **req["meta"],
+                "error": _PRIMARY_RESPONSE_ERROR,
             }
         except OutboundRequestError as exc:
             logger.warning(
@@ -549,82 +566,91 @@ class ModelRouter:
             }
 
     async def ainvoke(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Async invocation (non-blocking) with semaphore"""
+        """Async invocation (non-blocking) with semaphore."""
+        allow_local = self.allow_local_ai_endpoints
         req = self._prepare_request(capability, payload)
         if req["is_local"]:
             return req["result"]
 
-        # 【诊断】记录请求开始
         self._total_requests += 1
         self._queued_requests += 1
+        request_queued = True
+        request_active = False
         request_id = self._total_requests
         queue_start = time.time()
-        
-        # 初始化 capability 统计
+
         if capability not in self._request_stats:
-            self._request_stats[capability] = {"total": 0, "success": 0, "timeout": 0, "error": 0, "avg_time": 0}
+            self._request_stats[capability] = {
+                "total": 0,
+                "success": 0,
+                "timeout": 0,
+                "error": 0,
+                "avg_time": 0,
+            }
         self._request_stats[capability]["total"] += 1
-        
         self._log_diagnostics("排队", capability, f"请求#{request_id}")
 
         last_error = "AI request failed"
-        for attempt in range(self.max_retries):
-            async with self._semaphore:
-                # 【诊断】获取到信号量，开始处理
-                queue_time = time.time() - queue_start
-                self._queued_requests -= 1
-                self._active_requests += 1
-                process_start = time.time()
-                
-                self._log_diagnostics("开始处理", capability, f"请求#{request_id} 排队耗时:{queue_time:.2f}s 尝试:{attempt + 1}/{self.max_retries}")
-                
+        try:
+            for attempt in range(self.max_retries):
                 try:
-                    timeout = req.get("timeout") or self.timeout
-                    headers = {**req["headers"], "Connection": "close"}
-                    provider_type = req.get("provider_type", PROVIDER_TYPE_OPENAI)
+                    async with self._semaphore:
+                        queue_time = time.time() - queue_start
+                        if request_queued:
+                            self._queued_requests -= 1
+                            request_queued = False
+                        self._active_requests += 1
+                        request_active = True
+                        process_start = time.time()
 
-                    data = await self._runtime_client.apost_json(
-                        req["base_url"],
-                        request_target=req["request_target"],
-                        headers=headers,
-                        json_body=req["body"],
-                        allow_local=self.allow_local_ai_endpoints,
-                        read_timeout=timeout,
-                        max_bytes=AI_JSON_MAX_BYTES,
+                        try:
+                            self._log_diagnostics(
+                                "开始处理",
+                                capability,
+                                (
+                                    f"请求#{request_id} 排队耗时:{queue_time:.2f}s "
+                                    f"尝试:{attempt + 1}/{self.max_retries}"
+                                ),
+                            )
+                            timeout = req.get("timeout") or self.timeout
+                            headers = {**req["headers"], "Connection": "close"}
+                            provider_type = req.get(
+                                "provider_type", PROVIDER_TYPE_OPENAI
+                            )
+                            data = await self._runtime_client.apost_json(
+                                req["base_url"],
+                                request_target=req["request_target"],
+                                headers=headers,
+                                json_body=req["body"],
+                                allow_local=allow_local,
+                                read_timeout=timeout,
+                                max_bytes=AI_JSON_MAX_BYTES,
+                            )
+                            content = self._extract_primary_content(data, provider_type)
+                            parsed_content = self._parse_content(content)
+                        finally:
+                            if request_active:
+                                self._active_requests -= 1
+                                request_active = False
+                except _PrimaryResponseError:
+                    self._request_stats[capability]["error"] += 1
+                    logger.warning(
+                        "[ModelRouter] Async invoke invalid response %s code=invalid_response_shape",
+                        capability,
                     )
-                    
-                    # 根据服务商类型解析响应
-                    content = self._extract_content(data, provider_type)
-                    parsed_content = self._parse_content(content)
-                    
-                    # 【诊断】请求成功
-                    process_time = time.time() - process_start
-                    self._active_requests -= 1
-                    self._request_stats[capability]["success"] += 1
-                    # 更新平均时间
-                    stats = self._request_stats[capability]
-                    stats["avg_time"] = (stats["avg_time"] * (stats["success"] - 1) + process_time) / stats["success"]
-                    
-                    # 【负载均衡】记录服务商延迟
-                    lb_provider_id = req.get("lb_provider_id")
-                    if lb_provider_id:
-                        self._record_provider_latency(lb_provider_id, process_time)
-                    
-                    self._log_diagnostics("✅ 成功", capability, f"请求#{request_id} 处理耗时:{process_time:.2f}s")
-                    
                     return {
                         **req["meta"],
-                        "content": parsed_content,
-                        "raw": data,
+                        "error": _PRIMARY_RESPONSE_ERROR,
                     }
                 except OutboundRequestError as exc:
                     last_error = exc.public_message
                     process_time = time.time() - process_start
-                    self._active_requests -= 1
                     if exc.code == "outbound_timeout":
                         self._total_timeouts += 1
                         self._request_stats[capability]["timeout"] += 1
-                        self._log_diagnostics("⏱️ 超时", capability, f"请求#{request_id}")
+                        self._log_diagnostics(
+                            "⏱️ 超时", capability, f"请求#{request_id}"
+                        )
                     else:
                         self._request_stats[capability]["error"] += 1
                         self._log_diagnostics(
@@ -632,7 +658,6 @@ class ModelRouter:
                             capability,
                             f"请求#{request_id} code={exc.code}",
                         )
-
                     logger.warning(
                         "[ModelRouter] Async invoke failed %s attempt=%s/%s code=%s duration=%.2fs",
                         capability,
@@ -647,7 +672,6 @@ class ModelRouter:
                             "error": exc.public_message,
                         }
                 except Exception as exc:
-                    self._active_requests -= 1
                     self._request_stats[capability]["error"] += 1
                     self._log_diagnostics(
                         "❌ 异常",
@@ -658,17 +682,44 @@ class ModelRouter:
                         **req["meta"],
                         "error": "AI request failed",
                     }
-                    
-            if attempt < self.max_retries - 1:
-                self._queued_requests += 1  # 重试时重新排队
-                # 【优化】429 Rate Limit 需要更长的退避时间
-                sleep_time = min(2.0, 0.5 * (attempt + 1))
-                await asyncio.sleep(sleep_time)
-        
-        return {
-            **req["meta"],
-            "error": f"{last_error} (after {self.max_retries} attempts)",
-        }
+                else:
+                    process_time = time.time() - process_start
+                    self._request_stats[capability]["success"] += 1
+                    stats = self._request_stats[capability]
+                    stats["avg_time"] = (
+                        stats["avg_time"] * (stats["success"] - 1) + process_time
+                    ) / stats["success"]
+
+                    lb_provider_id = req.get("lb_provider_id")
+                    if lb_provider_id:
+                        self._record_provider_latency(lb_provider_id, process_time)
+
+                    self._log_diagnostics(
+                        "✅ 成功",
+                        capability,
+                        f"请求#{request_id} 处理耗时:{process_time:.2f}s",
+                    )
+                    return {
+                        **req["meta"],
+                        "content": parsed_content,
+                        "raw": data,
+                    }
+
+                if attempt < self.max_retries - 1:
+                    self._queued_requests += 1
+                    request_queued = True
+                    sleep_time = min(2.0, 0.5 * (attempt + 1))
+                    await asyncio.sleep(sleep_time)
+
+            return {
+                **req["meta"],
+                "error": f"{last_error} (after {self.max_retries} attempts)",
+            }
+        finally:
+            if request_active:
+                self._active_requests -= 1
+            if request_queued:
+                self._queued_requests -= 1
 
     def _stream_status_event(self, capability: str, state: str, **extra) -> dict[str, Any]:
         event = {
@@ -690,6 +741,7 @@ class ModelRouter:
 
     async def astream(self, capability: str, payload: dict[str, Any]) -> AsyncGenerator[Any, None]:
         """Async streaming invocation. Yields status/error dicts and plain chunks."""
+        allow_local = self.allow_local_ai_endpoints
         req = self._prepare_request(capability, payload)
         if req["is_local"]:
             yield self._stream_error_event(capability, "Streaming not supported for local provider")
@@ -724,7 +776,7 @@ class ModelRouter:
                     request_target=stream_request_target,
                     headers=headers,
                     json_body=req["body"],
-                    allow_local=self.allow_local_ai_endpoints,
+                    allow_local=allow_local,
                     max_bytes=STREAM_MAX_BYTES,
                     max_event_bytes=STREAM_EVENT_MAX_BYTES,
                     idle_timeout=120.0,
@@ -939,7 +991,22 @@ class ModelRouter:
                 if iterator is not None:
                     close = getattr(iterator, "aclose", None)
                     if close is not None:
-                        await close()
+                        try:
+                            await close()
+                        except asyncio.CancelledError:
+                            raise
+                        except OutboundRequestError as exc:
+                            logger.warning(
+                                "[ModelRouter] Stream close failed %s code=%s",
+                                capability,
+                                exc.code,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "[ModelRouter] Stream close failed %s type=%s",
+                                capability,
+                                type(exc).__name__,
+                            )
 
     def _has_api_version_suffix(self, url: str) -> bool:
         """检查 URL 是否已包含 API 版本路径（如 /v1, /v1beta, /v2, /api/v1 等）
@@ -1715,6 +1782,72 @@ class ModelRouter:
                 logger.error(f"[ModelRouter] Async capability stream error {capability}: {e}")
                 yield self._stream_error_event(capability, str(e))
 
+    def _extract_primary_content(
+        self, data: dict[str, Any], provider_type: str
+    ) -> str:
+        """Extract content from a validated primary-invocation response shape."""
+        if not isinstance(data, dict) or "error" in data:
+            raise _PrimaryResponseError
+
+        if provider_type == PROVIDER_TYPE_ANTHROPIC:
+            blocks = data.get("content")
+            if not isinstance(blocks, list) or not blocks:
+                raise _PrimaryResponseError
+            texts: list[str] = []
+            for block in blocks:
+                if not isinstance(block, dict):
+                    raise _PrimaryResponseError
+                if block.get("type") != "text":
+                    continue
+                text = block.get("text")
+                if not isinstance(text, str):
+                    raise _PrimaryResponseError
+                texts.append(text)
+            if not texts:
+                raise _PrimaryResponseError
+            return "\n".join(texts)
+
+        if provider_type == PROVIDER_TYPE_GOOGLE:
+            candidates = data.get("candidates")
+            if not isinstance(candidates, list) or not candidates:
+                raise _PrimaryResponseError
+            candidate = candidates[0]
+            if not isinstance(candidate, dict):
+                raise _PrimaryResponseError
+            content = candidate.get("content")
+            if not isinstance(content, dict):
+                raise _PrimaryResponseError
+            parts = content.get("parts")
+            if not isinstance(parts, list) or not parts:
+                raise _PrimaryResponseError
+            texts: list[str] = []
+            for part in parts:
+                if not isinstance(part, dict):
+                    raise _PrimaryResponseError
+                if "text" not in part:
+                    continue
+                text = part["text"]
+                if not isinstance(text, str):
+                    raise _PrimaryResponseError
+                texts.append(text)
+            if not texts:
+                raise _PrimaryResponseError
+            return "\n".join(texts)
+
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise _PrimaryResponseError
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise _PrimaryResponseError
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            raise _PrimaryResponseError
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise _PrimaryResponseError
+        return content
+
     def _extract_content(self, data: dict, provider_type: str) -> str:
         """从不同API类型的响应中提取内容"""
         try:
@@ -1727,7 +1860,7 @@ class ModelRouter:
                         if block.get("type") == "text":
                             texts.append(block.get("text", ""))
                     return "\n".join(texts)
-                logger.warning(f"[ModelRouter] Anthropic 响应无内容: {str(data)[:500]}")
+                logger.warning("[ModelRouter] Anthropic response has no content")
                 return ""
             elif provider_type == PROVIDER_TYPE_GOOGLE:
                 # Gemini API 响应格式
@@ -1743,9 +1876,9 @@ class ModelRouter:
                 # 如果没有 candidates，检查是否有错误
                 error = data.get("error", {})
                 if error:
-                    logger.error(f"[ModelRouter] Gemini API 错误: {error}")
+                    logger.error("[ModelRouter] Google response reported an upstream error")
                 else:
-                    logger.warning(f"[ModelRouter] Gemini 响应无内容: {str(data)[:500]}")
+                    logger.warning("[ModelRouter] Google response has no content")
                 return ""
             else:
                 # OpenAI 兼容格式（默认）
@@ -1754,8 +1887,12 @@ class ModelRouter:
                     .get("message", {})
                     .get("content", "")
                 )
-        except Exception as e:
-            logger.warning(f"[ModelRouter] 响应解析失败 ({provider_type}): {e}, 原始数据: {str(data)[:300]}")
+        except Exception as exc:
+            logger.warning(
+                "[ModelRouter] Response parsing failed provider=%s type=%s",
+                provider_type,
+                type(exc).__name__,
+            )
             return str(data)
 
     def _parse_content(self, content: str) -> Any:
@@ -1799,8 +1936,11 @@ class ModelRouter:
                         return content
             
             return json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            logger.warning(f"[ModelRouter] JSON解析失败: {e}, 内容前200字符: {content[:200]}")
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "[ModelRouter] JSON parsing failed type=%s",
+                type(exc).__name__,
+            )
             
             # 最后尝试：查找任何可能的JSON对象
             import re
