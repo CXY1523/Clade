@@ -31,16 +31,22 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Any, Sequence, TYPE_CHECKING
 import threading
 import time
 
-import httpx
 import numpy as np
 
 from ...core.config import get_settings
+from ...security import (
+    EMBEDDING_JSON_MAX_BYTES,
+    RETRYABLE_OUTBOUND_CODES,
+    OutboundRequestError,
+    SafeRuntimeClient,
+)
 from .vector_store import VectorStore, MultiVectorStore, SearchResult
 
 if TYPE_CHECKING:
@@ -82,6 +88,8 @@ class EmbeddingService:
         allow_fake_embeddings: bool = True,
         max_parallel_requests: int = 1,
         enable_concurrency: bool = False,
+        runtime_client: SafeRuntimeClient | None = None,
+        allow_local_ai_endpoints: bool = False,
     ) -> None:
         self.provider = provider
         self.dimension = dimension
@@ -93,6 +101,8 @@ class EmbeddingService:
         self.allow_fake_embeddings = allow_fake_embeddings
         self.enable_concurrency = enable_concurrency and max_parallel_requests > 1
         self.max_parallel_requests = max(1, max_parallel_requests)
+        self._runtime_client = runtime_client or SafeRuntimeClient()
+        self.allow_local_ai_endpoints = allow_local_ai_endpoints
         if not self.enable_concurrency:
             self.max_parallel_requests = 1
         
@@ -302,83 +312,98 @@ class EmbeddingService:
         require_real: bool,
         max_retries: int = 3,
     ) -> list[list[float]]:
-        """向远程服务请求一个批次的向量
-        
-        【优化策略】
-        - 文本长度限制：单个文本超过 2000 字符时截断
-        - 批次大小自适应：超时后减小批次重试
-        - 指数退避重试：每次重试间隔翻倍
-        """
-        url = f"{self.api_base_url.rstrip('/')}/embeddings"
+        """Request one embedding chunk through the guarded runtime client."""
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        
-        # 【优化】限制单个文本长度，避免上下文过长
-        MAX_TEXT_LENGTH = 2000
-        truncated_texts = []
-        for text in batch_texts:
-            if len(text) > MAX_TEXT_LENGTH:
-                truncated_texts.append(text[:MAX_TEXT_LENGTH] + "...")
-            else:
-                truncated_texts.append(text)
-        
+        max_text_length = 2000
+        truncated_texts = [
+            text[:max_text_length] + "..." if len(text) > max_text_length else text
+            for text in batch_texts
+        ]
         body = {"model": self.model, "input": truncated_texts}
-        
+
+        # A config refresh must not change the policy between retry attempts.
+        allow_local = self.allow_local_ai_endpoints
         for attempt in range(max_retries):
             try:
-                # 【优化】使用更细粒度的超时控制
-                timeout_config = httpx.Timeout(
-                    connect=10.0,  # 连接超时 10 秒
-                    read=self.timeout,  # 读取超时使用配置值
-                    write=30.0,  # 写入超时 30 秒
-                    pool=10.0  # 连接池超时 10 秒
+                data = self._runtime_client.post_json(
+                    self.api_base_url,
+                    request_target="/embeddings",
+                    headers=headers,
+                    json_body=body,
+                    allow_local=allow_local,
+                    read_timeout=self.timeout,
+                    max_bytes=EMBEDDING_JSON_MAX_BYTES,
                 )
-                response = httpx.post(url, json=body, headers=headers, timeout=timeout_config)
-                response.raise_for_status()
-                data = response.json()
-                
-                embeddings = sorted(data["data"], key=lambda x: x["index"])
-                batch_vectors = [e["embedding"] for e in embeddings]
-                
+                batch_vectors = self._parse_embedding_response(data, len(batch_texts))
                 with self._stats_lock:
                     self._stats["api_calls"] += 1
-                
                 return batch_vectors
-            except httpx.ReadTimeout as exc:
-                # 【优化】读取超时时，记录更详细的信息
+            except OutboundRequestError as exc:
+                if exc.code not in RETRYABLE_OUTBOUND_CODES:
+                    logger.warning("[Embedding] blocked error_code=%s", exc.code)
+                    raise RuntimeError(exc.public_message) from None
+                if attempt == max_retries - 1:
+                    if require_real or not self.allow_fake_embeddings:
+                        raise RuntimeError(exc.public_message) from None
+                    logger.warning("[Embedding] availability exhausted; using fake vectors")
+                    vectors = [self._fake_embed(text) for text in batch_texts]
+                    with self._stats_lock:
+                        self._stats["fake_embeds"] += len(batch_texts)
+                    return vectors
                 logger.warning(
-                    f"[Embedding] 读取超时 (批次大小: {len(batch_texts)}, "
-                    f"总字符数: {sum(len(t) for t in truncated_texts)}, "
-                    f"重试 {attempt+1}/{max_retries}): {exc}"
+                    "[Embedding] retryable error_code=%s retry=%s/%s",
+                    exc.code,
+                    attempt + 1,
+                    max_retries,
                 )
-                if attempt == max_retries - 1:
-                    if require_real or not self.allow_fake_embeddings:
-                        raise RuntimeError(f"Embedding API 读取超时 (重试耗尽): {exc}") from exc
-                    
-                    logger.warning(f"[Embedding] 超时后使用假向量")
-                    vectors = [self._fake_embed(t) for t in batch_texts]
-                    with self._stats_lock:
-                        self._stats["fake_embeds"] += len(batch_texts)
-                    return vectors
-                
-                # 指数退避
                 time.sleep(2 ** attempt)
-                
-            except Exception as exc:
-                if attempt == max_retries - 1:
-                    if require_real or not self.allow_fake_embeddings:
-                        raise RuntimeError(f"Embedding API 调用失败 (重试耗尽): {exc}") from exc
-                    
-                    logger.warning(f"[Embedding] API 调用失败，使用假向量: {exc}")
-                    vectors = [self._fake_embed(t) for t in batch_texts]
-                    with self._stats_lock:
-                        self._stats["fake_embeds"] += len(batch_texts)
-                    return vectors
-                
-                logger.warning(f"[Embedding] API 调用失败，正在重试 ({attempt+1}/{max_retries}): {exc}")
-                time.sleep(2 ** attempt)  # 指数退避
-        
-        # 理论上不会到此
-        return [self._fake_embed(t) for t in batch_texts]
+            except Exception:
+                logger.error("[Embedding] unexpected request failure")
+                raise RuntimeError("Embedding API 调用失败") from None
+
+        raise RuntimeError("Embedding API 调用失败")
+
+    @staticmethod
+    def _parse_embedding_response(
+        data: Any,
+        expected_count: int,
+    ) -> list[list[float]]:
+        """Require one non-empty finite vector for every indexed input."""
+        try:
+            entries = data["data"] if isinstance(data, dict) else None
+            if not isinstance(entries, list) or len(entries) != expected_count:
+                raise ValueError
+            vectors: list[list[float] | None] = [None] * expected_count
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError
+                index = entry.get("index")
+                embedding = entry.get("embedding")
+                if (
+                    isinstance(index, bool)
+                    or not isinstance(index, int)
+                    or not 0 <= index < expected_count
+                    or vectors[index] is not None
+                    or not isinstance(embedding, list)
+                    or not embedding
+                ):
+                    raise ValueError
+                vector: list[float] = []
+                for value in embedding:
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise ValueError
+                    normalized = float(value)
+                    if not math.isfinite(normalized):
+                        raise ValueError
+                    vector.append(normalized)
+                vectors[index] = vector
+            if any(vector is None for vector in vectors):
+                raise ValueError
+            return [vector for vector in vectors if vector is not None]
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise OutboundRequestError(
+                "outbound_bad_response", 502, "外部服务响应无效"
+            ) from None
 
     def _fake_embed(self, text: str) -> list[float]:
         """生成基于文本哈希的伪向量（确定性）"""
