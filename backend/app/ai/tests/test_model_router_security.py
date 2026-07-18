@@ -1747,7 +1747,7 @@ def test_legacy_compatibility_methods_do_not_create_or_reset_network_client(
     router._active_requests = 2
     router._queued_requests = 3
 
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.INFO, logger=model_router_module.__name__):
         asyncio.run(router.reset_client())
         asyncio.run(router.set_keepalive_mode(True))
 
