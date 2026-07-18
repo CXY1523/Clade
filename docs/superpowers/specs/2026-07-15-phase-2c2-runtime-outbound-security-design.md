@@ -132,7 +132,7 @@ Phase 2C-1 已经建立统一的 URL 规范化、特殊地址分类、DNS 解析
 
 `ModelRouter` 保留 OpenAI、Anthropic、Google 的 URL、headers、body 和正常响应解析。它不再直接建立网络连接，而是把准备好的最终请求交给运行时安全客户端。
 
-`EmbeddingService` 保留文本截断、批次拆分、并发、重试、统计、真实/假向量选择和响应排序，只替换实际网络发送与安全错误分类。
+`EmbeddingService` 保留文本截断、批次拆分、并发、重试、统计、真实/假向量选择和响应排序，并替换实际网络发送与安全错误分类。缓存读取和写入继续绑定一次公开调用的不可变运行时配置，但在最终安全复审后升级为第 14.1 节定义的 v2 来源隔离命名空间，不能再把不同端点或真假向量视为同一缓存来源。
 
 ## 7. 固定请求流程
 
@@ -288,7 +288,21 @@ Google API key 位于查询参数时，策略只验证不含 query 的 provider 
 1. **安全错误：** URL、协议、地址、DNS 安全、响应大小、内容编码和响应格式错误。无论 `require_real` 和 `allow_fake_embeddings` 如何设置，都必须抛出，禁止假向量降级。
 2. **普通可用性错误：** 允许重试的连接失败和超时。达到现有重试上限后，只有 `require_real=false` 且 `allow_fake_embeddings=true` 时，才能继续使用现有假向量降级。
 
-Embedding 的文本截断、批次大小、并发 worker、指数退避、向量排序、缓存和统计保持不变。安全错误日志不得包含 URL、key、输入文本、响应数据或底层异常原文。
+Embedding 的文本截断、批次大小、并发 worker、指数退避、向量排序和统计保持不变。缓存语义按下节绑定来源、服务商、模型和端点身份。安全错误日志不得包含 URL、key、输入文本、响应数据或底层异常原文。
+
+### 14.1 Embedding v2 缓存来源与端点身份
+
+最终安全复审确认，缓存不能只按 provider 类型和 model 隔离：同一种 provider/model 可以指向不同服务端；远程连接/超时后的假向量也不能伪装成该远程服务的真实结果。因此采用新的 `embedding-cache-v2` 命名空间：
+
+- 真实远程向量的命名空间由版本、来源 `remote`、provider、model 和端点身份组成。端点身份是规范化 base endpoint 的 SHA-256；规范化会统一 scheme/主机大小写、IDNA、默认端口和末尾斜杠，并保留有意义的基础路径。
+- 缓存文件名继续只使用完整命名空间与输入文本的 SHA-256。文件名和 metadata 都不得保存原始 endpoint、API key、request target 或其他凭据。
+- 本地/未配置服务时生成的确定性假向量使用独立的 `local_fake` v2 命名空间，并按向量维度隔离；它不能与任何远程 provider/model/endpoint 命名空间相交。
+- 已配置远程服务在连接失败或超时重试耗尽后产生的 fallback 假向量标记为 `remote_fallback_fake`，逐向量设为不可缓存。混合顺序或并发批次中，只有真实远程结果可写入缓存，结果顺序仍按输入恢复。
+- `require_real=true` 只查询当前远程配置对应的 `remote` 命名空间。它不能读取本地假向量，也不能命中曾经由远程故障降级产生的假向量；没有完整远程配置时继续返回既有固定配置错误。
+- 磁盘 metadata 必须同时匹配 `source`、完整 `cache_namespace` 和 `endpoint_identity` 才能命中。远程 metadata 记录端点摘要而非原始 endpoint；本地假向量的端点身份必须为空。
+- v2 版本进入缓存 key 后，旧版无来源/无端点身份的 key 和 metadata 会自然 miss。旧文件无需危险地批量删除；第一次再次需要对应文本时生成 v2 项，相当于旧缓存一次性失效并自动重建。
+
+一次公开 `embed()` 仍只捕获一份冻结运行时配置。缓存查询、生成、顺序/并发 chunk、缓存写入和 metadata 都使用同一份配置与来源证据，避免刷新期间混入新旧 provider、凭据、端点或缓存命名空间。
 
 ## 15. 兼容性与迁移
 
@@ -358,6 +372,12 @@ Embedding 的文本截断、批次大小、并发 worker、指数退避、向量
 - 只有原条件满足时才允许普通故障降级；
 - 并发批次保持顺序；
 - 16 MiB 和 schema 错误受控失败；
+- 同一 provider/model 的不同规范化 endpoint 使用不同 v2 cache namespace；
+- 远程 fallback 假向量不写入内存或磁盘缓存，也不能满足后续 `require_real=true`；
+- local fake、remote real 和 remote fallback fake 的来源隔离；
+- 成功远程结果仍可缓存并满足同一端点后续的 `require_real=true`；
+- metadata 来源、namespace 和 endpoint SHA-256 必须严格匹配，且不含原始 endpoint 或 API key；
+- 旧版缓存自然 miss，并由 v2 缓存按需重建；
 - 日志不包含 key、URL、输入文本或响应正文。
 
 增加结构性守卫，禁止 `EmbeddingService` 继续直接调用普通 `httpx.post`。

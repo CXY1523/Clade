@@ -6,15 +6,19 @@
 
 Phase 2C-1 基线：`b52eb91`
 
-代码验证 HEAD：`137e047 test: isolate model router log capture`
+代码验证 HEAD：`1dcb6b7 fix: preserve embedding cache provenance`
+
+初版报告 HEAD：`13534c2 docs: record phase 2c2 security verification`
+
+本次报告提交 HEAD：主题为 `docs: record embedding cache provenance fix`；它只更新文档，不改变代码验证 HEAD。提交后的具体哈希以当前 `git log -1` 为准。
 
 ## 结论
 
-Phase 2C-2 的聚焦安全、后端全量、插件注册、前端测试、lint、类型检查、生产构建、结构守卫、敏感哨兵和仓库卫生门禁均已从当前代码 HEAD 取得通过证据。
+Phase 2C-2 的聚焦安全、后端全量、插件注册、前端测试、lint、类型检查、生产构建、结构守卫、敏感哨兵和仓库卫生门禁均已从最终代码 HEAD `1dcb6b7` 取得新鲜通过证据。
 
-完整检查确认：`ModelRouter` 七个运行时网络入口和 Embedding 的远程批次都委托统一安全运行时客户端；默认、能力覆盖、负载均衡池、环境/构造参数、旧版配置和 UI 刷新来源没有旁路。DNS 批准结果约束实际连接，安全错误不触发服务商切换或假向量降级，响应限制、超时、取消、清理、配置快照、缓存命名空间和脱敏契约均有自动测试覆盖。
+完整检查确认：`ModelRouter` 七个运行时网络入口和 Embedding 的远程批次都委托统一安全运行时客户端；默认、能力覆盖、负载均衡池、环境/构造参数、旧版配置和 UI 刷新来源没有旁路。DNS 批准结果约束实际连接，安全错误不触发服务商切换或假向量降级，响应限制、超时、取消、清理、配置快照和脱敏契约均有自动测试覆盖。Embedding 缓存进一步升级为 v2 来源/端点隔离：远程真实、本地假向量和远程故障 fallback 不再混用缓存语义。
 
-验证过程中发现并诚实保留了一次全量后端测试失败。根因是测试日志捕获受收集顺序影响，不是产品网络行为错误；该问题在独立测试提交 `137e047` 中修复并通过独立复审。复跑后的完整门禁为绿色。当前没有未解决的 Critical、Important 或 Minor 发现，Phase 2C 可进入合并考虑，但本任务未合并、推送、发布或上线。
+验证历史保留两轮真实问题：Task 9 全量后端门禁曾因测试日志捕获顺序失败，由 `137e047` 隔离；初版最终复审随后在 `13534c2` 上发现两个 Important Embedding 缓存来源问题，由 `1dcb6b7` 修复。最终代码范围已经独立复审并获 **APPROVED**，没有未解决的 Critical、Important 或 Minor 发现；修复后的全量后端和前端门禁也已由主控从新鲜进程复跑通过。本任务未合并、推送、发布或上线。
 
 ## 验证环境
 
@@ -60,7 +64,7 @@ app/ai/tests/test_model_router_security.py::test_legacy_compatibility_methods_do
 - 原测试只降低 root logger 的捕获级别，没有降低上述命名 logger，因此 INFO 记录在传播前已被过滤。
 - 模式值、活动/排队计数、无普通客户端、无安全客户端调用等产品行为断言均正常；故障只属于测试顺序与日志捕获隔离。
 
-### 独立修复与复审
+### 日志门禁的独立修复与复审
 
 经批准，仅在原测试的 `caplog.at_level` 中明确指定 `app.ai.model_router` 命名 logger，没有改产品代码、放宽断言或改变安全行为。修复单独提交为：
 
@@ -68,7 +72,7 @@ app/ai/tests/test_model_router_security.py::test_legacy_compatibility_methods_do
 137e047 test: isolate model router log capture
 ```
 
-独立复审结论为 **APPROVED**，没有 Critical、Important 或 Minor 发现。当前 HEAD 的修复后证据为：
+独立复审结论为 **APPROVED**，没有 Critical、Important 或 Minor 发现。以下是初版报告提交 `13534c2` 前保留的历史证据，不是最终缓存修复后的测试数字：
 
 | 验证 | Exit | 新鲜结果 |
 | --- | ---: | --- |
@@ -80,9 +84,47 @@ app/ai/tests/test_model_router_security.py::test_legacy_compatibility_methods_do
 
 两项跳过是既有 Windows symlink 测试。45 条后端警告等于既有上限；聚焦套件的 1 条警告是 Starlette TestClient 与当前 httpx 兼容层的既有弃用提示。没有失败、收集错误或新增资源泄漏警告。
 
+## 初版最终复审与缓存来源修复
+
+### `13534c2` 上发现的两个 Important
+
+初版报告提交后，对完整 `b52eb91..13534c2` 范围的最终复审结论为 **CHANGES REQUIRED**。没有 Critical，但确认两个 Important：
+
+1. 已配置远程服务在连接/超时重试耗尽后产生的假向量，会被写入真实 provider/model 的缓存。随后同实例或新实例的 `require_real=true` 可能零网络调用命中该假向量；旧 metadata 也没有来源证据。
+2. 缓存命名空间只有 provider 类型和 model。同一 provider/model 从 endpoint A 切换到 endpoint B 时，B 可能直接读取 A 的向量而不联系 B。
+
+这两个发现说明初版报告中“缓存命名空间已经完整隔离”的结论过早；本报告明确更正，不隐藏初次最终复审结果。
+
+### `1dcb6b7` 的修复
+
+用户批准后，修复仅修改 Embedding 实现及其测试，并单独提交：
+
+```text
+1dcb6b7 fix: preserve embedding cache provenance
+```
+
+修复引入 `embedding-cache-v2`：真实远程 namespace 包含来源、provider、model 与规范化 endpoint 的 SHA-256；本地确定性假向量使用独立 `local_fake` namespace；远程可用性故障 fallback 假向量逐向量标记为不可缓存。`require_real=true` 只查当前远程真实 namespace。磁盘命中还必须严格匹配 source、完整 namespace 与 endpoint identity，metadata 不保存原始 endpoint、API key 或 request target。旧版无来源/无端点身份的缓存自然 miss，并按需重建 v2 项。
+
+实现者按新增和强化的安全场景口径记录 **9 个缓存来源回归场景**。其中混合 chunk 顺序/缓存测试以顺序和并发参数化运行，因此“测试函数数”和 pytest 展开的 selected case 数不是同一口径；本报告不把两者混写。
+
+### 修复后聚焦与全量门禁
+
+| 验证 | Exit | `1dcb6b7` 新鲜结果 |
+| --- | ---: | --- |
+| Embedding security 完整模块 | 0 | 46 passed |
+| system services + AI router config | 0 | 66 passed、1 skipped |
+| Phase 2C 聚焦安全 | 0 | 577 passed、1 skipped、1 warning，31.69 秒 |
+| Embedding 网络结构守卫选择 | 0 | 3 passed |
+| Python `py_compile`（修复实现与测试） | 0 | 无输出 |
+| 修复范围 `git diff --check` | 0 | 无 whitespace error |
+| 禁止直接网络与敏感来源扫描 | 1 | 无匹配；exit 1 是 ripgrep 的正常 no-match 结果 |
+| `python -m pytest app -q` | 0 | 1067 passed、2 skipped、45 warnings，67.95 秒 |
+
+最终代码范围的独立安全复审结论为 **APPROVED**，没有 Critical、Important 或 Minor 发现。两项跳过仍是既有 Windows symlink 测试；45 条后端 warning 仍等于既有上限；聚焦套件的 1 条 warning 仍是既有 TestClient/httpx 弃用提示。
+
 ## Fresh-process 插件注册守卫
 
-从 `backend` 目录启动全新 Python 进程，执行计划规定的 `PluginRegistry` / `load_all_plugins` 集合等值断言。命令退出 0，加载和注册集合都精确为以下六项：
+从最终代码 HEAD 的 `backend` 目录启动全新 Python 进程，执行计划规定的 `PluginRegistry` / `load_all_plugins` 集合等值断言。命令退出 0，加载和注册集合都精确为以下六项：
 
 ```powershell
 & $PYTHON -c "from app.services.embedding_plugins import PluginRegistry, load_all_plugins; expected={'ancestry','behavior_strategy','evolution_space','food_web','prompt_optimizer','tile_biome'}; loaded=set(load_all_plugins()); registered=set(PluginRegistry.list_plugins()); assert loaded == expected; assert registered == expected; print(sorted(registered))"
@@ -105,10 +147,10 @@ tile_biome
 
 | 命令 | Exit | 新鲜结果 |
 | --- | ---: | --- |
-| `npm run test:run` | 0 | 12 个 test files 通过；84 tests passed；0 failed |
+| `npm run test:run` | 0 | 12 个 test files 通过；84 tests passed；0 failed；Duration 12.17 秒 |
 | `npm run lint` | 0 | 0 errors、162 warnings |
 | `npx tsc --noEmit` | 0 | 无输出，类型检查通过 |
-| `npm run build` | 0 | TypeScript 与 Vite build 完成；4,399 modules transformed；Vite 14.89 秒 |
+| `npm run build` | 0 | TypeScript 与 Vite build 完成；4,399 modules transformed；Vite 16.87 秒 |
 
 lint 的 162 条 warning 精确等于既有 `--max-warnings=162` 上限，其中 1 条被标记为可自动修复；本阶段没有修改这些既有 warning。build 保留一个信息性提示：设置模块同时被动态和静态导入，因此不会被移动到单独 chunk；构建仍正常退出 0。
 
@@ -119,7 +161,7 @@ lint 的 162 条 warning 精确等于既有 `--max-warnings=162` 上限，其中
 | `git diff --check` | 0 | 无 whitespace error；工作副本只提示 Git 下次接触文档时会按配置将 LF 转为 CRLF |
 | 禁止直接网络 `rg` 扫描 `model_router.py` 与 `embedding.py` | 1 | 无匹配；exit 1 是 ripgrep 的正常 no-match 结果 |
 | 四类 runtime secret sentinel 生产范围 `rg` | 1 | 无匹配；排除 Python/TypeScript 测试文件后，后端、前端和 API 指南均未发现哨兵 |
-| `git status --short`（写报告前） | 0 | 只有预期的 connectivity 文档草稿 |
+| `git status --short`（本次三文档编辑前） | 0 | 最终代码 HEAD `1dcb6b7` 工作树干净 |
 
 禁止直接网络扫描覆盖 `httpx.post`、普通 `httpx.Client` / `AsyncClient`、`requests`、`aiohttp`、`urllib.request`、`urllib3`、`httpcore` 和 `socket`。测试中的 AST 守卫还覆盖 httpx 导入别名、请求动词以及 urllib 导入/赋值别名。
 
@@ -191,7 +233,11 @@ git status --short
 - 上游条目可以乱序完成，但按 index 恢复输入顺序；并发 chunk 也按原输入顺序合并。
 - 公开 `embed()` 在开始时捕获一份冻结的运行时配置。provider 身份、base URL、key、model、timeout、本地策略、假向量策略、缓存查询/写入和磁盘元数据在整个调用中使用同一快照。
 - 配置写入通过服务级锁一次发布完整新值；运行中的重试不会混用新旧 provider、凭据或 timeout，下一次独立调用才看到新配置。
-- 缓存 key 与元数据绑定生成该向量的同一 provider/model 快照，避免运行中刷新后把旧 provider 结果写入新 provider 命名空间。
+- v2 真实远程 cache namespace 由版本、来源 `remote`、provider、model 和规范化 endpoint 的 SHA-256 组成；同一 provider/model 的不同 endpoint 不共享缓存。
+- 本地确定性假向量使用独立 `local_fake` namespace；远程连接/超时耗尽后的 `remote_fallback_fake` 逐向量不可缓存。混合顺序/并发 chunk 只缓存真实结果，输入顺序不变。
+- `require_real=true` 只查询当前远程配置的真实 namespace，不能命中 local fake 或 remote fallback fake。成功远程结果仍能满足同一端点后续的真实向量请求。
+- 磁盘 metadata 必须严格匹配 source、完整 cache namespace 和 endpoint identity；文件名和 metadata 都不保存原始 endpoint、API key 或 request target。
+- v2 key 使旧版无来源/无端点身份的缓存一次性失效；旧文件不批量删除，对应文本再次使用时按需重建。
 - 只有连接失败或超时重试耗尽、`require_real=false`，且请求开始快照已启用假向量时才允许降级。
 - URL、HTTPS、本地/私网、DNS、状态、编码、大小、JSON 与 schema 错误都立即失败，永不重试成假向量。
 
@@ -207,7 +253,7 @@ git status --short
 
 ## 完整 Phase 2C-2 范围
 
-在代码验证 HEAD `137e047` 上执行：
+在最终代码验证 HEAD `1dcb6b7` 上执行：
 
 ```powershell
 git log --oneline b52eb91..HEAD
@@ -215,7 +261,7 @@ git diff --stat b52eb91..HEAD
 git diff --name-only b52eb91..HEAD
 ```
 
-命令均退出 0。`b52eb91..137e047` 共 **21 个物理提交**，stat 为 **16 files changed、8706 insertions、1011 deletions**。name-only 清单为：
+命令均退出 0。文档提交前的 `b52eb91..1dcb6b7` 共 **23 个物理提交**，stat 为 **18 files changed、9561 insertions、1056 deletions**。其中 `1dcb6b7` 是最终代码验证 HEAD；本报告的文档提交将在其后成为第 24 个物理提交，提交树预计为 **18 files changed、9642 insertions、1056 deletions**，但不改变代码验证结论。name-only 清单为：
 
 ```text
 backend/app/ai/model_router.py
@@ -232,14 +278,16 @@ backend/app/security/tests/test_runtime_http.py
 backend/app/security/tests/test_safe_http.py
 backend/app/services/system/embedding.py
 backend/app/services/system/tests/test_embedding_security.py
+docs/api-guides/modules/config-ui/api-connectivity.md
 docs/superpowers/plans/2026-07-15-phase-2c2-runtime-outbound-security.md
+docs/superpowers/reports/2026-07-15-phase-2c2-verification.md
 docs/superpowers/specs/2026-07-15-phase-2c2-runtime-outbound-security-design.md
 ```
 
-逐提交 log 已核对，范围从设计、计划、同步/异步 pinned transport、JSON/流式运行时客户端、七入口接入、Embedding 接入及原子配置/cache 修复，到最终测试日志隔离。Task 9 的 connectivity 与本报告是此代码范围之后的纯文档提交。
+逐提交 log 已核对，范围从设计、计划、同步/异步 pinned transport、JSON/流式运行时客户端、七入口接入、Embedding 接入及原子配置/cache 修复、日志捕获隔离、初版 Task 9 文档，到最终缓存 provenance 修复 `1dcb6b7`。本次文档提交只更正设计、用户指南和验证报告；最终提交哈希在报告内容生成时不能自引用，以提交后的 `git log -1` 为准。
 
 ## 设计核对与交接
 
-新鲜证据没有证明 `docs/superpowers/specs/2026-07-15-phase-2c2-runtime-outbound-security-design.md` 存在错误，因此 Task 9 未修改设计文档。
+初次最终复审证明设计中“缓存保持不变”的表述已经过时，因此本次按新鲜证据修正 `docs/superpowers/specs/2026-07-15-phase-2c2-runtime-outbound-security-design.md`，补充 v2 cache namespace、来源/端点身份、真假向量隔离、metadata provenance 和旧缓存失效规则。没有改变安全策略、API、schema 或依赖。
 
 最终复审检查表全部有实现、测试或结构扫描证据，没有未解决的 Critical、Important 或 Minor 问题。Phase 2C 可以进入合并考虑；本验证未执行 merge、push、publish 或 release。
