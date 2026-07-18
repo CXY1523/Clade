@@ -637,6 +637,44 @@ def test_invalid_remote_endpoint_cannot_reuse_valid_memory_cache(
     assert len(client.calls) == 1
 
 
+def test_invalid_remote_endpoint_cannot_reuse_valid_disk_cache(
+    tmp_path: Path,
+) -> None:
+    client = RecordingSafeRuntimeClient(
+        [{"data": [{"index": 0, "embedding": [4.0]}]}]
+    )
+    writer = EmbeddingService(
+        provider="openai",
+        dimension=1,
+        base_url="https://embedding.example/v1",
+        api_key="secret-key",
+        model="model-a",
+        enabled=True,
+        cache_dir=tmp_path,
+        runtime_client=client,
+    )
+
+    assert writer.embed(["oak"], require_real=True) == [[4.0]]
+    assert list((tmp_path / "vectors").glob("*/*.json"))
+
+    reader = EmbeddingService(
+        provider="openai",
+        dimension=1,
+        base_url="https://embedding.example/v1?tenant=other",
+        api_key="secret-key",
+        model="model-a",
+        enabled=True,
+        cache_dir=tmp_path,
+        runtime_client=client,
+    )
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        reader.embed(["oak"], require_real=True)
+
+    assert exc_info.value.code == "outbound_url_invalid"
+    assert len(client.calls) == 1
+
+
 def test_remote_cache_metadata_uses_digest_and_never_stores_endpoint_or_key(
     tmp_path: Path,
 ) -> None:
