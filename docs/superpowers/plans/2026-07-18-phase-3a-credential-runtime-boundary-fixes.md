@@ -332,6 +332,6 @@ Run the existing full backend suite, frontend Vitest suite, ESLint at the curren
 
 Run `git diff --check`, `git status --short`, secret-sentinel scans outside tests, and review every changed hunk. Expected: only Phase 3A code, tests, and this plan are changed.
 
-- [ ] **Step 4: Commit and push**
+- [x] **Step 4: Commit and push**
 
 Commit the verified Phase 3A scope with a security-focused message, push `phase-2c-outbound-url-security` to the existing fork, and verify PR #15 still points to the pushed head and remains Draft.
