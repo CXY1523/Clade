@@ -380,12 +380,12 @@ export const PerformanceSection = memo(function PerformanceSection({
       {/* 超时配置 */}
       <Card title="超时与并发" icon="⏱️">
         <InfoBox>
-          超时时间决定了系统等待 AI 响应的最长时间。如果 AI 在超时前未能完成，系统将使用规则降级处理。
+          普通 AI 请求从排队到获得完整结果共用一个端到端总时限；流式生成时，此处设置的是等待下一段 AI 内容的最长时间，整段流式生成总计最多运行 10 分钟。超时后系统会使用规则生成的备用结果。
         </InfoBox>
 
         <SliderRow
           label="全局超时时间"
-          desc="单次 AI 请求的最大等待时间（可在功能模块中单独覆盖）"
+          desc="普通请求的端到端总时限；流式请求等待新内容的时限（可在功能模块中单独覆盖）"
           value={aiTimeout}
           min={15}
           max={300}

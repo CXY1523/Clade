@@ -47,9 +47,17 @@
 - `default_provider_id` / `default_model`：全局默认服务商和模型；能力路由没有单独指定时使用。
 - `ai_concurrency_limit`：AI 并发限制，默认 15。
 - `allow_local_ai_endpoints`：是否允许配置探测访问当前电脑上的精确回环 AI 服务，默认 `false`。旧配置缺少该字段时也按 `false` 读取。
-- `capability_routes`：按能力指定 provider、model、timeout 等设置。
+- `capability_routes`：按能力指定 provider、model、timeout 等设置。能力自己的 `timeout` 会覆盖全局 AI 超时，但不会改变下述普通请求与流式请求的计时语义。
 - `embedding_provider_id` / `embedding_model`：Embedding 的现有默认设置。
 - Legacy 字段（`ai_provider`、`ai_model`、`ai_base_url`、`ai_api_key`、`capability_configs` 等）仍被接受，并由现有流程迁移到新结构。
+
+## AI 超时语义
+
+- 对普通 AI 请求，`timeout` 是从逻辑入口到完整结果的端到端总时限。请求准备、并发排队、URL 与 DNS 校验、连接、读写、解析、重试退避和后续尝试共享这一份时间，不会在每个阶段或每次重试时重新计时。
+- 对流式 AI 请求，`timeout` 是等待下一段非空真实 AI 内容的最长时间。并发排队到首段内容也属于第一次等待；状态事件、心跳、空行和协议事件不会延长等待时间。
+- 每条流式请求从逻辑入口开始最多运行 600 秒（10 分钟），排队时间包含在内，持续输出也不会重置这个总上限。
+- 已经显示部分内容后发生中断时，界面保留已显示文字并给出备用结果警告；残缺文字不会保存或解析为完整业务结果，报告和结构化分析会使用现有的完整规则备用结果。
+- 用户主动取消会继续按“取消”处理，不计为超时，不触发普通重试，也不会冒充“AI 生成中断”。
 
 ## 更新请求与敏感字段
 
@@ -85,7 +93,7 @@ POST 请求体使用包装结构：
 
 配置保存继续使用同一个更新锁和 `EnvironmentRepository.save_ui_config()` 原子写入路径。保存成功后使配置缓存失效，并执行现有的 ModelRouter、Embedding 和模拟配置刷新流程。
 
-Phase 2C-1 只为配置探测和永久本地 AI 开关建立安全边界。实际 AI、负载均衡、流式和 Embedding 请求仍留待 Phase 2C-2；在 Phase 2C-2 与最终审查完成前，本分支不得合并或发布。
+运行时 AI、流式请求和 Embedding 都沿用相同的出站安全边界。配置刷新不会改变已开始请求的不可变快照；后续请求才会使用新配置。
 
 ## 前端
 
