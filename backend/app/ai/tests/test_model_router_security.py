@@ -314,6 +314,17 @@ class AdvancingRuntimeClient(RecordingSafeRuntimeClient):
         return outcome
 
 
+class ExplodingSemaphore:
+    def __init__(self) -> None:
+        self.release_count = 0
+
+    async def acquire(self) -> None:
+        raise RuntimeError("ACQUIRE-SENTINEL")
+
+    def release(self) -> None:
+        self.release_count += 1
+
+
 @pytest.fixture
 def router() -> ModelRouter:
     runtime_client = RecordingSafeRuntimeClient()
@@ -794,6 +805,44 @@ def test_ainvoke_retries_share_one_budget_and_count_one_timeout(
     assert diagnostics["request_stats"]["generate"]["error"] == 0
 
 
+def test_ainvoke_max_retry_exhaustion_preserves_linear_capped_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(100.0, clock=clock)
+    runtime_client = RecordingSafeRuntimeClient()
+    runtime_client.async_results = [
+        OutboundRequestError("outbound_timeout", 504, PUBLIC_TIMEOUT)
+        for _ in range(5)
+    ]
+    router = _remote_router(
+        runtime_client, max_retries=5, allow_local=False
+    )
+    sleep_calls: list[float] = []
+
+    async def record_backoff(delay: float) -> None:
+        sleep_calls.append(delay)
+        clock.advance(delay)
+
+    monkeypatch.setattr(model_router_module.asyncio, "sleep", record_backoff)
+
+    result = asyncio.run(
+        router.ainvoke("generate", {"name": "elm"}, budget=budget)
+    )
+
+    assert result["error"] == f"{PUBLIC_TIMEOUT} (after 5 attempts)"
+    assert len(runtime_client.calls) == 5
+    assert all(call["budget"] is budget for call in runtime_client.calls)
+    assert sleep_calls == [0.5, 1.0, 1.5, 2.0]
+    diagnostics = router.get_diagnostics()
+    assert diagnostics["total_requests"] == 1
+    assert diagnostics["total_timeouts"] == 1
+    stats = diagnostics["request_stats"]["generate"]
+    assert stats["total"] == 1
+    assert stats["timeout"] == 1
+    assert stats["error"] == 0
+
+
 def test_ainvoke_does_not_backoff_or_retry_after_budget_expires(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -822,6 +871,146 @@ def test_ainvoke_does_not_backoff_or_retry_after_budget_expires(
     assert result["error"] == PUBLIC_TIMEOUT
     assert len(runtime_client.calls) == 1
     assert sleep_calls == []
+
+
+def test_ainvoke_provider_latency_excludes_queue_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        clock = ManualClock()
+        budget = DeadlineBudget.from_timeout(100.0, clock=clock)
+        runtime_client = RecordingSafeRuntimeClient()
+        runtime_client.async_results = [
+            {"choices": [{"message": {"content": "oak"}}]}
+        ]
+        runtime_client.on_async_call = lambda _: clock.advance(2.0)
+        router = _remote_router(
+            runtime_client, max_retries=1, allow_local=False
+        )
+        router.configure_load_balance(True)
+        router.set_provider_pool(
+            "generate",
+            [
+                ProviderPoolConfig(
+                    provider_id="selected-provider",
+                    base_url="https://pool.example/v1",
+                    api_key="pool-key",
+                    model="pool-model",
+                )
+            ],
+        )
+        router.set_concurrency_limit(1)
+        monkeypatch.setattr(model_router_module.time, "monotonic", clock)
+
+        await router._semaphore.acquire()
+        task = asyncio.create_task(
+            router.ainvoke("generate", {"name": "oak"}, budget=budget)
+        )
+        try:
+            for _ in range(10):
+                if router._queued_requests == 1:
+                    break
+                await asyncio.sleep(0)
+            assert router._queued_requests == 1
+            clock.advance(7.0)
+        finally:
+            router._semaphore.release()
+
+        result = await task
+        assert result["content"] == "oak"
+        assert router._provider_latencies["selected-provider"] == 2.0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "entry_name", ["ainvoke", "acall_capability", "chat"]
+)
+def test_async_entry_releases_exact_acquired_semaphore_after_replacement(
+    entry_name: str,
+) -> None:
+    async def scenario() -> None:
+        runtime_client = RecordingSafeRuntimeClient()
+        runtime_client.async_results = [
+            {"choices": [{"message": {"content": "oak"}}]}
+        ]
+        runtime_client.async_started = asyncio.Event()
+        runtime_client.async_release = asyncio.Event()
+        router = _remote_router(runtime_client, allow_local=False)
+        router.set_concurrency_limit(1)
+        old_semaphore = router._semaphore
+
+        if entry_name == "ainvoke":
+            task = asyncio.create_task(
+                router.ainvoke("generate", {"name": "oak"})
+            )
+        elif entry_name == "acall_capability":
+            task = asyncio.create_task(
+                router.acall_capability("generate", _messages())
+            )
+        else:
+            task = asyncio.create_task(
+                router.chat("Name a tree", capability="generate")
+            )
+
+        await runtime_client.async_started.wait()
+        assert old_semaphore._value == 0
+        router.set_concurrency_limit(1)
+        new_semaphore = router._semaphore
+        assert new_semaphore is not old_semaphore
+        assert new_semaphore._value == 1
+
+        runtime_client.async_release.set()
+        await task
+
+        assert old_semaphore._value == 1
+        assert new_semaphore._value == 1
+        diagnostics = router.get_diagnostics()
+        assert diagnostics["queued_requests"] == 0
+        assert diagnostics["active_requests"] == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "entry_name", ["ainvoke", "acall_capability", "chat"]
+)
+def test_async_entry_redacts_unexpected_acquire_error_and_cleans_up(
+    entry_name: str,
+) -> None:
+    async def scenario() -> None:
+        runtime_client = RecordingSafeRuntimeClient()
+        router = _remote_router(runtime_client, allow_local=False)
+        semaphore = ExplodingSemaphore()
+        router._semaphore = semaphore  # type: ignore[assignment]
+
+        if entry_name == "ainvoke":
+            result = await router.ainvoke("generate", {"name": "oak"})
+            assert result["error"] == "AI request failed"
+            assert "ACQUIRE-SENTINEL" not in repr(result)
+        elif entry_name == "acall_capability":
+            with pytest.raises(RuntimeError) as exc_info:
+                await router.acall_capability("generate", _messages())
+            assert str(exc_info.value) == "AI request failed"
+        else:
+            with pytest.raises(RuntimeError) as exc_info:
+                await router.chat("Name a tree", capability="generate")
+            assert str(exc_info.value) == "AI request failed"
+
+        assert runtime_client.calls == []
+        assert semaphore.release_count == 0
+        diagnostics = router.get_diagnostics()
+        assert diagnostics["queued_requests"] == 0
+        assert diagnostics["active_requests"] == 0
+        assert diagnostics["total_timeouts"] == 0
+        assert diagnostics["total_cancellations"] == 0
+        stats = diagnostics["request_stats"]["generate"]
+        assert stats["total"] == 1
+        assert stats["error"] == 1
+        assert stats["timeout"] == 0
+        assert stats["cancelled"] == 0
+
+    asyncio.run(scenario())
 
 
 def test_ainvoke_cancellation_while_waiting_for_semaphore_restores_counters() -> None:
