@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -343,3 +344,129 @@ async def test_staggered_gather_leaves_child_timeout_as_child_error() -> None:
     assert "ai_parallel_task_error" in events
     assert "ai_parallel_task_timeout" not in events
     assert "task_timeout" not in inspect.signature(staggered_gather).parameters
+
+
+_SECRET_SENTINEL = "DO_NOT_EXPOSE_HELPER_EXCEPTION_SENTINEL"
+
+
+class RaisingRouter:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def ainvoke(self, capability: str, payload: dict[str, Any]) -> dict:
+        raise self.error
+
+    async def acall_capability(
+        self,
+        capability: str,
+        messages: list[dict[str, str]],
+        response_format: dict[str, Any] | None,
+    ) -> str:
+        raise self.error
+
+    async def astream(self, capability: str, payload: dict[str, Any]):
+        raise self.error
+        yield  # pragma: no cover - keeps this an async generator
+
+    async def astream_capability(
+        self,
+        capability: str,
+        messages: list[dict[str, str]],
+        response_format: dict[str, Any] | None = None,
+    ):
+        raise self.error
+        yield  # pragma: no cover - keeps this an async generator
+
+
+@pytest.mark.parametrize("helper_name", ["invoke", "acall"])
+@pytest.mark.asyncio
+async def test_ordinary_helper_redacts_exception_from_logs_and_events(
+    helper_name: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = RuntimeError(_SECRET_SENTINEL)
+    router = RaisingRouter(error)
+    events: list[tuple[str, str, str]] = []
+    caplog.set_level(logging.DEBUG, logger="app.ai.streaming_helper")
+
+    with pytest.raises(RuntimeError) as raised:
+        if helper_name == "invoke":
+            await invoke_with_heartbeat(
+                router,
+                "generate",
+                {},
+                event_callback=lambda *event: events.append(event),
+            )
+        else:
+            await acall_with_heartbeat(
+                router,
+                "generate",
+                [],
+                event_callback=lambda *event: events.append(event),
+            )
+
+    assert raised.value is error
+    assert [event for event in events if event[0] == "ai_request_error"]
+    assert _SECRET_SENTINEL not in caplog.text
+    assert all(_SECRET_SENTINEL not in message for _, message, _ in events)
+
+
+@pytest.mark.parametrize("helper_name", ["stream_invoke", "stream_call"])
+@pytest.mark.asyncio
+async def test_stream_helper_redacts_exception_and_preserves_rethrow(
+    helper_name: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = RuntimeError(_SECRET_SENTINEL)
+    router = RaisingRouter(error)
+    events: list[tuple[str, str, str]] = []
+    caplog.set_level(logging.DEBUG, logger="app.ai.streaming_helper")
+
+    with pytest.raises(RuntimeError) as raised:
+        if helper_name == "stream_invoke":
+            await stream_invoke_with_heartbeat(
+                router,
+                "generate",
+                {},
+                event_callback=lambda *event: events.append(event),
+            )
+        else:
+            await stream_call_with_heartbeat(
+                router,
+                "generate",
+                [],
+                event_callback=lambda *event: events.append(event),
+            )
+
+    assert raised.value is error
+    assert [event for event in events if event[0] == "ai_stream_error"]
+    assert _SECRET_SENTINEL not in caplog.text
+    assert all(_SECRET_SENTINEL not in message for _, message, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_event_callback_failure_is_redacted_and_stream_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    router = StreamRouter(
+        [
+            {"type": "status", "state": "connected"},
+            "done",
+            {"type": "status", "state": "completed"},
+        ]
+    )
+    caplog.set_level(logging.DEBUG, logger="app.ai.streaming_helper")
+
+    def failing_callback(*_args: Any) -> None:
+        raise RuntimeError(_SECRET_SENTINEL)
+
+    outcome = await stream_call_with_heartbeat(
+        router,
+        "generate",
+        [],
+        event_callback=failing_callback,
+    )
+
+    assert outcome.completed is True
+    assert outcome.content == "done"
+    assert _SECRET_SENTINEL not in caplog.text

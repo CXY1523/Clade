@@ -73,8 +73,11 @@ class ReportBuilder:
                         outcome.reason,
                     )
                     full_text = ""
-            except Exception as e:
-                logger.error(f"[ReportBuilder] Stream error: {e}")
+            except Exception as exc:
+                logger.error(
+                    "[ReportBuilder] Stream error type=%s",
+                    type(exc).__name__,
+                )
                 full_text = ""
         
         # turn_report 返回的是 Markdown 格式文本，无需 JSON 解析

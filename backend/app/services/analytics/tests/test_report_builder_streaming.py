@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -10,6 +11,7 @@ from app.simulation.environment import ParsedPressure
 from app.services.analytics.report_builder import ReportBuilder
 from app.services.analytics.report_builder_v2 import ReportBuilderV2
 from app.services.analytics.turn_report import TurnReportService
+from app.simulation.stages import BuildReportStage
 
 
 class InterruptedStreamRouter:
@@ -302,3 +304,123 @@ async def test_v2_awaits_heartbeat_and_stream_awaitables_in_order() -> None:
         "stream-called:chunk-05-data-",
         "stream-awaited:chunk-05-data-",
     ]
+
+
+_SECRET_SENTINEL = "DO_NOT_EXPOSE_REPORT_EXCEPTION_SENTINEL"
+
+
+class RaisingReportRouter:
+    async def astream(self, capability: str, payload: dict[str, Any]):
+        raise RuntimeError(_SECRET_SENTINEL)
+        yield  # pragma: no cover - keeps this an async generator
+
+    async def astream_capability(
+        self,
+        capability: str,
+        messages: list[dict[str, str]],
+        response_format: dict[str, Any] | None = None,
+    ):
+        raise RuntimeError(_SECRET_SENTINEL)
+        yield  # pragma: no cover - keeps this an async generator
+
+
+@pytest.mark.parametrize("builder_type", [ReportBuilder, ReportBuilderV2])
+@pytest.mark.asyncio
+async def test_report_builders_redact_upstream_exception_logs(
+    builder_type: type[ReportBuilder] | type[ReportBuilderV2],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    builder = builder_type(RaisingReportRouter())
+    kwargs: dict[str, Any] = {
+        "species": [],
+        "pressures": [_pressure()],
+        "stream_callback": lambda _chunk: None,
+    }
+    if builder_type is ReportBuilderV2:
+        kwargs["turn_index"] = 11
+
+    report = await builder.build_turn_narrative_async(**kwargs)
+
+    assert report
+    assert _SECRET_SENTINEL not in report
+    assert _SECRET_SENTINEL not in caplog.text
+
+
+class RaisingReportBuilder:
+    async def build_turn_narrative_async(self, **_kwargs: Any) -> str:
+        raise RuntimeError(_SECRET_SENTINEL)
+
+
+@pytest.mark.asyncio
+async def test_turn_report_service_redacts_upstream_exception_from_log_and_event(
+    monkeypatch,
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = SimpleNamespace(
+        ui_config_path=tmp_path / "missing-settings.json",
+        enable_turn_report_llm=True,
+    )
+    monkeypatch.setattr("app.services.analytics.turn_report.get_settings", lambda: settings)
+    events: list[tuple[str, str, str]] = []
+    service = TurnReportService(
+        report_builder=RaisingReportBuilder(),
+        environment_repository=object(),
+        trophic_service=object(),
+        emit_event_fn=lambda *event: events.append(event),
+    )
+    caplog.set_level(logging.DEBUG, logger="app.services.analytics.turn_report")
+
+    report = await service.build_report(
+        turn_index=12,
+        mortality_results=[],
+        pressures=[],
+        branching_events=[],
+        all_species=[],
+    )
+
+    assert report.narrative
+    assert _SECRET_SENTINEL not in caplog.text
+    assert all(_SECRET_SENTINEL not in message for _, message, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_build_report_stage_redacts_service_exception_log(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class RaisingTurnReportService:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def build_report(self, **_kwargs: Any) -> Any:
+            raise RuntimeError(_SECRET_SENTINEL)
+
+    monkeypatch.setattr(
+        "app.simulation.stages.TurnReportService",
+        RaisingTurnReportService,
+    )
+    ctx = SimpleNamespace(
+        command=SimpleNamespace(auto_reports=True),
+        turn_index=13,
+        species_batch=[],
+        all_species=[],
+        combined_results=[],
+        pressures=[],
+        branching_events=[],
+        background_summary=[],
+        reemergence_events=[],
+        major_events=[],
+        map_changes=[],
+        migration_events=[],
+        plugin_data={},
+        modifiers={},
+        emit_event=lambda *_args: None,
+    )
+    engine = SimpleNamespace(report_builder=object(), trophic_service=object())
+    caplog.set_level(logging.DEBUG, logger="app.simulation.stages")
+
+    await BuildReportStage().execute(ctx, engine)
+
+    assert _SECRET_SENTINEL not in caplog.text

@@ -1113,11 +1113,12 @@ class TurnReportService:
                 logger.warning(f"[TurnReportService] ⚠️ UI 配置文件不存在: {ui_config_path}，使用系统配置")
                 enable_turn_report_llm = settings.enable_turn_report_llm
                 config_source = "系统配置(文件不存在)"
-        except Exception as e:
+        except Exception as exc:
             # 回退到系统配置
-            logger.warning(f"[TurnReportService] ⚠️ 读取 UI 配置失败: {e}，回退到系统配置")
-            import traceback
-            logger.debug(f"[TurnReportService] 异常详情: {traceback.format_exc()}")
+            logger.warning(
+                "[TurnReportService] ⚠️ 读取 UI 配置失败 type=%s，回退到系统配置",
+                type(exc).__name__,
+            )
             settings = get_settings()
             enable_turn_report_llm = settings.enable_turn_report_llm
             config_source = "系统配置(异常)"
@@ -1250,9 +1251,12 @@ class TurnReportService:
             logger.warning("[TurnReportService] LLM 叙事生成超时")
             self._emit_event("warning", "⏱️ AI 叙事超时", "报告")
             narrative = ""
-        except Exception as e:
-            logger.error(f"[TurnReportService] LLM 叙事生成失败: {e}")
-            self._emit_event("warning", f"⚠️ AI 叙事失败: {e}", "报告")
+        except Exception as exc:
+            logger.error(
+                "[TurnReportService] LLM 叙事生成失败 type=%s",
+                type(exc).__name__,
+            )
+            self._emit_event("warning", "⚠️ AI 叙事失败，已使用备用报告", "报告")
             narrative = ""
         
         # 如果 LLM 失败，使用丰富的回退叙事

@@ -129,7 +129,10 @@ async def stream_call_with_heartbeat(
         try:
             event_callback(event_type, message, "AI")
         except Exception as exc:
-            logger.debug("Stream event callback failed: %s", exc)
+            logger.debug(
+                "Stream event callback failed type=%s",
+                type(exc).__name__,
+            )
 
     try:
         iterator = router.astream_capability(
@@ -149,7 +152,11 @@ async def stream_call_with_heartbeat(
         finally:
             await _close_stream(iterator)
     except Exception as exc:
-        logger.error("Streaming call %s failed: %s", task_name, exc)
+        logger.error(
+            "Streaming call %s failed type=%s",
+            task_name,
+            type(exc).__name__,
+        )
         emit_event("ai_stream_error", f"{task_name} stream failed")
         raise
 
@@ -188,7 +195,11 @@ async def stream_invoke_with_heartbeat(
         finally:
             await _close_stream(iterator)
     except Exception as exc:
-        logger.error("Streaming invoke %s failed: %s", task_name, exc)
+        logger.error(
+            "Streaming invoke %s failed type=%s",
+            task_name,
+            type(exc).__name__,
+        )
         emit_event("ai_stream_error", f"{task_name} stream failed")
         raise
 
@@ -233,9 +244,13 @@ async def invoke_with_heartbeat(
     except asyncio.CancelledError:
         emit_event("ai_request_cancelled", f"🚫 {task_name} 已取消")
         raise
-    except Exception as e:
-        emit_event("ai_request_error", f"❌ {task_name} 失败: {e}")
-        logger.error(f"[AI请求] {task_name} 失败: {e}")
+    except Exception as exc:
+        emit_event("ai_request_error", f"❌ {task_name} 失败")
+        logger.error(
+            "[AI请求] %s 失败 type=%s",
+            task_name,
+            type(exc).__name__,
+        )
         raise
     finally:
         if heartbeat_task:
@@ -286,9 +301,13 @@ async def acall_with_heartbeat(
     except asyncio.CancelledError:
         emit_event("ai_request_cancelled", f"🚫 {task_name} 已取消")
         raise
-    except Exception as e:
-        emit_event("ai_request_error", f"❌ {task_name} 失败: {e}")
-        logger.error(f"[AI请求] {task_name} 失败: {e}")
+    except Exception as exc:
+        emit_event("ai_request_error", f"❌ {task_name} 失败")
+        logger.error(
+            "[AI请求] %s 失败 type=%s",
+            task_name,
+            type(exc).__name__,
+        )
         raise
     finally:
         if heartbeat_task:

@@ -4,13 +4,30 @@ Pipeline Tests - 流水线测试
 测试 Pipeline 执行器、StageLoader 和模式切换功能。
 """
 
-import pytest
 import asyncio
+import ast
+import inspect
+import textwrap
 from unittest.mock import MagicMock, AsyncMock
+
+import pytest
 
 from ..pipeline import Pipeline, PipelineConfig, PipelineBuilder, PipelineResult
 from ..stage_config import StageLoader, stage_registry, AVAILABLE_MODES
-from ..stages import BaseStage, StageDependency, get_default_stages
+from ..ecological_realism_stage import EcologicalRealismStage
+from ..stages import (
+    AutoHybridizationStage,
+    BaseStage,
+    BuildReportStage,
+    EmbeddingPluginsStage,
+    EmbeddingStage,
+    FetchSpeciesStage,
+    GeneActivationStage,
+    InitStage,
+    SpeciationStage,
+    StageDependency,
+    get_default_stages,
+)
 from ..context import SimulationContext
 
 # 标记整个模块使用 asyncio
@@ -62,6 +79,35 @@ class DependentTestStage(BaseStage):
         if not getattr(ctx, "_test_stage_executed", False):
             raise RuntimeError("依赖未满足")
         ctx._dependent_result = True
+
+
+class InternallyBudgetedTestStage(BaseStage):
+    """A stage whose remote request owns its complete deadline."""
+
+    uses_internal_request_budget = True
+
+    def __init__(self, delay: float = 0.02):
+        super().__init__(order=40, name="internally-budgeted")
+        self.delay = delay
+        self.completed = False
+
+    async def execute(self, ctx, engine):
+        await asyncio.sleep(self.delay)
+        self.completed = True
+
+
+class SlowBusinessTestStage(BaseStage):
+    def __init__(self, delay: float = 0.02):
+        super().__init__(order=50, name="slow-business")
+        self.delay = delay
+        self.cancelled = False
+
+    async def execute(self, ctx, engine):
+        try:
+            await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
 
 # ============================================================================
@@ -190,6 +236,77 @@ class TestPipeline:
         assert not stages[0].executed
         assert stages[1].executed
         assert not stages[2].executed
+
+    async def test_internal_request_budget_stage_is_not_cancelled_by_stage_timeout(
+        self,
+        mock_ctx,
+        mock_engine,
+    ):
+        stage = InternallyBudgetedTestStage()
+        pipeline = Pipeline(
+            [stage],
+            PipelineConfig(stage_timeout=0.001, validate_dependencies=False),
+        )
+
+        result = await pipeline.execute(mock_ctx, mock_engine)
+
+        assert result.success
+        assert stage.completed is True
+
+    async def test_business_stage_still_uses_generic_stage_timeout(
+        self,
+        mock_ctx,
+        mock_engine,
+    ):
+        stage = SlowBusinessTestStage()
+        pipeline = Pipeline(
+            [stage],
+            PipelineConfig(stage_timeout=0.001, validate_dependencies=False),
+        )
+
+        result = await pipeline.execute(mock_ctx, mock_engine)
+
+        assert result.success is False
+        assert stage.cancelled is True
+        assert isinstance(result.stage_results[0].error, asyncio.TimeoutError)
+
+
+async def test_all_remote_request_stages_declare_internal_budget_ownership() -> None:
+    remote_request_stages = [
+        InitStage,
+        FetchSpeciesStage,
+        GeneActivationStage,
+        AutoHybridizationStage,
+        SpeciationStage,
+        BuildReportStage,
+        EmbeddingStage,
+        EmbeddingPluginsStage,
+        EcologicalRealismStage,
+    ]
+
+    assert BaseStage.uses_internal_request_budget is False
+    assert all(
+        stage_type.uses_internal_request_budget is True
+        for stage_type in remote_request_stages
+    )
+
+
+@pytest.mark.parametrize("stage_type", [SpeciationStage, BuildReportStage])
+async def test_ai_stage_has_no_local_wait_for_wrapper(
+    stage_type: type[BaseStage],
+) -> None:
+    tree = ast.parse(textwrap.dedent(inspect.getsource(stage_type.execute)))
+    wait_for_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "asyncio"
+        and node.func.attr == "wait_for"
+    ]
+
+    assert wait_for_calls == []
 
 
 class TestPipelineBuilder:

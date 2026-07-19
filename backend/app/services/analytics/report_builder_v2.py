@@ -708,8 +708,11 @@ class ReportBuilderV2:
         except asyncio.TimeoutError:
             logger.warning(f"[ReportV2] LLM生成超时，使用简化报告")
             return self._generate_fallback_report(stats, pressures, highlight_species)
-        except Exception as e:
-            logger.error(f"[ReportV2] LLM生成失败: {e}")
+        except Exception as exc:
+            logger.error(
+                "[ReportV2] LLM生成失败 type=%s",
+                type(exc).__name__,
+            )
             return self._generate_fallback_report(stats, pressures, highlight_species)
 
     async def _stream_narrative_with_heartbeat(
@@ -736,16 +739,22 @@ class ReportBuilderV2:
                     result = heartbeat_callback(chunk_count)
                     if inspect.isawaitable(result):
                         await result
-                except Exception as e:
-                    logger.debug(f"[ReportV2] 心跳回调异常: {e}")
+                except Exception as exc:
+                    logger.debug(
+                        "[ReportV2] 心跳回调异常 type=%s",
+                        type(exc).__name__,
+                    )
 
             if stream_callback:
                 try:
                     result = stream_callback(chunk)
                     if inspect.isawaitable(result):
                         await result
-                except Exception as e:
-                    logger.debug(f"[ReportV2] 流式回调异常: {e}")
+                except Exception as exc:
+                    logger.debug(
+                        "[ReportV2] 流式回调异常 type=%s",
+                        type(exc).__name__,
+                    )
 
         outcome = await stream_call_with_heartbeat(
             router=self.router,

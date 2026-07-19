@@ -268,6 +268,8 @@ class StageOrder(Enum):
 @runtime_checkable
 class Stage(Protocol):
     """阶段协议 - 所有阶段必须实现此接口"""
+
+    uses_internal_request_budget: bool
     
     @property
     def name(self) -> str:
@@ -308,6 +310,11 @@ class BaseStage(ABC):
     
     子类应该重写 `get_dependency()` 方法来声明依赖关系。
     """
+
+    # Stages that can enter ModelRouter or remote Embedding set this to True.
+    # Their request layer owns the complete deadline, so the pipeline must not
+    # add its generic business-stage timeout around them.
+    uses_internal_request_budget = False
     
     def __init__(self, order: int, name: str, is_async: bool = False):
         self._order = order
@@ -346,6 +353,8 @@ class BaseStage(ABC):
 class InitStage(BaseStage):
     """回合初始化阶段"""
     
+    uses_internal_request_budget = True
+
     def __init__(self):
         super().__init__(StageOrder.INIT.value, "回合初始化")
         self._plugin_manager = None
@@ -657,6 +666,8 @@ class FetchSpeciesStage(BaseStage):
     3. 提高气候调整阈值，减少触发频率
     """
     
+    uses_internal_request_budget = True
+
     def __init__(self):
         super().__init__(StageOrder.FETCH_SPECIES.value, "获取物种列表")
     
@@ -1624,6 +1635,8 @@ class SpeciationDataTransferStage(BaseStage):
 class GeneActivationStage(BaseStage):
     """基因激活阶段"""
     
+    uses_internal_request_budget = True
+
     def __init__(self):
         super().__init__(StageOrder.GENE_ACTIVATION.value, "基因激活")
     
@@ -1823,6 +1836,8 @@ class AutoHybridizationStage(BaseStage):
     - 杂交成功率骰点（通过基础检查后还需骰点成功）
     """
     
+    uses_internal_request_budget = True
+
     # 【参数配置】从 settings 读取，此处仅定义备用默认值
     MIN_POPULATION_FOR_HYBRIDIZATION = 500  # 最小种群才能参与杂交
     SYMPATRIC_BONUS = 0.08  # 完全同域时的概率加成
@@ -2216,6 +2231,8 @@ class SpeciationStage(BaseStage):
     - speciation_signal < 0.3: 低概率分化
     """
     
+    uses_internal_request_budget = True
+
     def __init__(self):
         super().__init__(StageOrder.SPECIATION.value, "物种分化", is_async=True)
     
@@ -2298,20 +2315,17 @@ class SpeciationStage(BaseStage):
             def speciation_stream_callback(event_type: str, message: str, category: str = "AI"):
                 ctx.emit_event(event_type, message, category)
             
-            ctx.branching_events = await asyncio.wait_for(
-                engine.speciation.process_async(
-                    mortality_results=ctx.combined_results,  # 【修复】使用所有物种
-                    existing_codes={s.lineage_code for s in ctx.species_batch},
-                    average_pressure=sum(ctx.modifiers.values()) / (len(ctx.modifiers) or 1),
-                    turn_index=ctx.turn_index,
-                    map_changes=ctx.map_changes,
-                    major_events=ctx.major_events,
-                    pressures=ctx.pressures,
-                    trophic_interactions=ctx.trophic_interactions,
-                    stream_callback=speciation_stream_callback,  # 【新增】传递心跳回调
-                    speciation_candidates=speciation_candidates if speciation_candidates else None,
-                ),
-                timeout=600
+            ctx.branching_events = await engine.speciation.process_async(
+                mortality_results=ctx.combined_results,  # 【修复】使用所有物种
+                existing_codes={s.lineage_code for s in ctx.species_batch},
+                average_pressure=sum(ctx.modifiers.values()) / (len(ctx.modifiers) or 1),
+                turn_index=ctx.turn_index,
+                map_changes=ctx.map_changes,
+                major_events=ctx.major_events,
+                pressures=ctx.pressures,
+                trophic_interactions=ctx.trophic_interactions,
+                stream_callback=speciation_stream_callback,  # 【新增】传递心跳回调
+                speciation_candidates=speciation_candidates if speciation_candidates else None,
             )
             
             if ctx.branching_events:
@@ -2485,6 +2499,8 @@ class BackgroundManagementStage(BaseStage):
 class BuildReportStage(BaseStage):
     """构建报告阶段"""
     
+    uses_internal_request_budget = True
+
     def __init__(self):
         super().__init__(StageOrder.BUILD_REPORT.value, "构建报告", is_async=True)
     
@@ -2544,23 +2560,20 @@ class BuildReportStage(BaseStage):
                 extinct_species = [sp for sp in ctx.all_species if sp.status == "extinct"]
                 all_species_for_report.extend(extinct_species)
             
-            ctx.report = await asyncio.wait_for(
-                turn_report_service.build_report(
-                    turn_index=ctx.turn_index,
-                    mortality_results=ctx.combined_results,
-                    pressures=ctx.pressures,
-                    branching_events=ctx.branching_events,
-                    background_summary=ctx.background_summary,
-                    reemergence_events=ctx.reemergence_events,
-                    major_events=ctx.major_events,
-                    map_changes=ctx.map_changes,
-                    migration_events=ctx.migration_events,
-                    stream_callback=on_narrative_chunk,
-                    all_species=all_species_for_report,
-                    ecological_realism_data=ctx.plugin_data.get("ecological_realism"),  # 【新增】
-                    gene_diversity_events=ctx.plugin_data.get("gene_diversity", {}).get("events", []),
-                ),
-                timeout=90
+            ctx.report = await turn_report_service.build_report(
+                turn_index=ctx.turn_index,
+                mortality_results=ctx.combined_results,
+                pressures=ctx.pressures,
+                branching_events=ctx.branching_events,
+                background_summary=ctx.background_summary,
+                reemergence_events=ctx.reemergence_events,
+                major_events=ctx.major_events,
+                map_changes=ctx.map_changes,
+                migration_events=ctx.migration_events,
+                stream_callback=on_narrative_chunk,
+                all_species=all_species_for_report,
+                ecological_realism_data=ctx.plugin_data.get("ecological_realism"),  # 【新增】
+                gene_diversity_events=ctx.plugin_data.get("gene_diversity", {}).get("events", []),
             )
             ctx.emit_event("stage", "✅ 报告生成完成", "报告")
         
@@ -2579,8 +2592,8 @@ class BuildReportStage(BaseStage):
                 branching_events=ctx.branching_events,
                 major_events=ctx.major_events,
             )
-        except Exception as e:
-            logger.error(f"[报告生成] 失败: {e}")
+        except Exception as exc:
+            logger.error("[报告生成] 失败 type=%s", type(exc).__name__)
     
     def _build_simple_species_data(self, ctx: SimulationContext) -> list:
         """从上下文中构建简单的物种快照列表（用于跳过报告或超时时）"""
@@ -2807,6 +2820,8 @@ class SavePopulationSnapshotStage(BaseStage):
 class EmbeddingStage(BaseStage):
     """Embedding 集成阶段"""
     
+    uses_internal_request_budget = True
+
     def __init__(self):
         super().__init__(StageOrder.EMBEDDING_INTEGRATION.value, "Embedding集成")
     
@@ -2870,6 +2885,8 @@ class EmbeddingPluginsStage(BaseStage):
     配置从 stage_config.yaml 加载。
     """
     
+    uses_internal_request_budget = True
+
     def __init__(self):
         super().__init__(StageOrder.EMBEDDING_PLUGINS.value, "Embedding扩展插件")
         self._manager = None

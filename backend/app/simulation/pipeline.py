@@ -545,7 +545,10 @@ class Pipeline:
         from .stages import StageResult
         
         try:
-            if self.config.stage_timeout > 0:
+            if (
+                self.config.stage_timeout > 0
+                and not stage.uses_internal_request_budget
+            ):
                 await asyncio.wait_for(
                     stage.execute(ctx, engine),
                     timeout=self.config.stage_timeout
