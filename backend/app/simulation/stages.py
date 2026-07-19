@@ -353,8 +353,6 @@ class BaseStage(ABC):
 class InitStage(BaseStage):
     """回合初始化阶段"""
     
-    uses_internal_request_budget = True
-
     def __init__(self):
         super().__init__(StageOrder.INIT.value, "回合初始化")
         self._plugin_manager = None
@@ -961,6 +959,8 @@ class FoodWebStage(BaseStage):
 
 class TieringAndNicheStage(BaseStage):
     """物种分层与生态位分析阶段"""
+
+    uses_internal_request_budget = True
     
     def __init__(self):
         super().__init__(StageOrder.TIERING_AND_NICHE.value, "物种分层与生态位")
@@ -1060,6 +1060,8 @@ class PreliminaryMortalityStage(BaseStage):
 
 class FinalMortalityStage(BaseStage):
     """最终死亡率评估阶段（迁徙后）"""
+
+    uses_internal_request_budget = True
     
     def __init__(self):
         super().__init__(StageOrder.FINAL_MORTALITY.value, "最终死亡率评估")
@@ -1461,6 +1463,8 @@ class PopulationUpdateStage(BaseStage):
 
 class PostMigrationNicheStage(BaseStage):
     """迁徙后生态位重新分析阶段"""
+
+    uses_internal_request_budget = True
     
     def __init__(self):
         super().__init__(StageOrder.POST_MIGRATION_NICHE.value, "后迁徙生态位")
@@ -1836,8 +1840,6 @@ class AutoHybridizationStage(BaseStage):
     - 杂交成功率骰点（通过基础检查后还需骰点成功）
     """
     
-    uses_internal_request_budget = True
-
     # 【参数配置】从 settings 读取，此处仅定义备用默认值
     MIN_POPULATION_FOR_HYBRIDIZATION = 500  # 最小种群才能参与杂交
     SYMPATRIC_BONUS = 0.08  # 完全同域时的概率加成

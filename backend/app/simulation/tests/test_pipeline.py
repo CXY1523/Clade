@@ -8,6 +8,7 @@ import asyncio
 import ast
 import inspect
 import textwrap
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock
 
 import pytest
@@ -22,13 +23,19 @@ from ..stages import (
     EmbeddingPluginsStage,
     EmbeddingStage,
     FetchSpeciesStage,
+    FinalMortalityStage,
     GeneActivationStage,
     InitStage,
+    PostMigrationNicheStage,
     SpeciationStage,
     StageDependency,
+    TieringAndNicheStage,
     get_default_stages,
 )
 from ..context import SimulationContext
+from ...services.species.description_enhancer import DescriptionEnhancerService
+from ...services.species.genetic_distance import GeneticDistanceCalculator
+from ...services.species.niche import NicheAnalyzer
 
 # 标记整个模块使用 asyncio
 pytestmark = pytest.mark.asyncio
@@ -79,21 +86,6 @@ class DependentTestStage(BaseStage):
         if not getattr(ctx, "_test_stage_executed", False):
             raise RuntimeError("依赖未满足")
         ctx._dependent_result = True
-
-
-class InternallyBudgetedTestStage(BaseStage):
-    """A stage whose remote request owns its complete deadline."""
-
-    uses_internal_request_budget = True
-
-    def __init__(self, delay: float = 0.02):
-        super().__init__(order=40, name="internally-budgeted")
-        self.delay = delay
-        self.completed = False
-
-    async def execute(self, ctx, engine):
-        await asyncio.sleep(self.delay)
-        self.completed = True
 
 
 class SlowBusinessTestStage(BaseStage):
@@ -237,22 +229,6 @@ class TestPipeline:
         assert stages[1].executed
         assert not stages[2].executed
 
-    async def test_internal_request_budget_stage_is_not_cancelled_by_stage_timeout(
-        self,
-        mock_ctx,
-        mock_engine,
-    ):
-        stage = InternallyBudgetedTestStage()
-        pipeline = Pipeline(
-            [stage],
-            PipelineConfig(stage_timeout=0.001, validate_dependencies=False),
-        )
-
-        result = await pipeline.execute(mock_ctx, mock_engine)
-
-        assert result.success
-        assert stage.completed is True
-
     async def test_business_stage_still_uses_generic_stage_timeout(
         self,
         mock_ctx,
@@ -271,24 +247,159 @@ class TestPipeline:
         assert isinstance(result.stage_results[0].error, asyncio.TimeoutError)
 
 
-async def test_all_remote_request_stages_declare_internal_budget_ownership() -> None:
-    remote_request_stages = [
-        InitStage,
+@pytest.mark.parametrize(
+    "stage_type",
+    [TieringAndNicheStage, FinalMortalityStage, PostMigrationNicheStage],
+)
+async def test_niche_stage_reaches_embedding_when_vectors_are_missing(
+    stage_type: type[BaseStage],
+    monkeypatch,
+) -> None:
+    class RecordingEmbedding:
+        def __init__(self) -> None:
+            self.embed_calls: list[tuple[list[str], bool]] = []
+
+        def get_species_vectors(self, lineage_codes):
+            return [], []
+
+        def embed(self, texts, require_real=False):
+            text_list = list(texts)
+            self.embed_calls.append((text_list, require_real))
+            return [[1.0, 0.0] for _ in text_list]
+
+    species = SimpleNamespace(
+        id=1,
+        lineage_code="SP001",
+        common_name="test species",
+        latin_name="Species testus",
+        description="terrestrial test species",
+        abstract_traits={},
+        morphology_stats={"population": 100},
+    )
+    embedding = RecordingEmbedding()
+    engine = MagicMock()
+    engine.watchlist = set()
+    engine.tiering.classify.return_value = SimpleNamespace(
+        critical=[], focus=[], background=[]
+    )
+    engine.niche_analyzer = NicheAnalyzer(embedding, carrying_capacity=1000)
+    engine._use_tile_based_mortality = False
+    engine.mortality.evaluate.return_value = []
+    ctx = SimulationContext(turn_index=0, species_batch=[species])
+    ctx.tiered = SimpleNamespace(critical=[], focus=[], background=[])
+    ctx.migration_count = 1
+
+    from ...repositories.environment_repository import environment_repository
+
+    monkeypatch.setattr(environment_repository, "latest_habitats", lambda: [])
+    monkeypatch.setattr(environment_repository, "list_tiles", lambda: [])
+
+    await stage_type().execute(ctx, engine)
+
+    assert embedding.embed_calls == [(["test species Species testus terrestrial test species"], False)]
+    assert "SP001" in ctx.niche_metrics
+
+
+@pytest.mark.parametrize(
+    "stage_type",
+    [TieringAndNicheStage, FinalMortalityStage, PostMigrationNicheStage],
+)
+async def test_niche_stage_uses_its_internal_request_budget_in_pipeline(
+    stage_type: type[BaseStage],
+) -> None:
+    stage = stage_type()
+    completed = False
+
+    async def delayed_execute(ctx, engine):
+        nonlocal completed
+        await asyncio.sleep(0.02)
+        completed = True
+
+    stage.execute = delayed_execute
+    pipeline = Pipeline(
+        [stage],
+        PipelineConfig(stage_timeout=0.001, validate_dependencies=False),
+    )
+
+    result = await pipeline.execute(SimulationContext(turn_index=0), MagicMock())
+
+    assert stage.uses_internal_request_budget is True
+    assert result.success is True
+    assert completed is True
+
+
+@pytest.mark.parametrize("stage_type", [InitStage, AutoHybridizationStage])
+async def test_local_stage_remains_protected_by_pipeline_timeout(
+    stage_type: type[BaseStage],
+) -> None:
+    stage = stage_type()
+    cancelled = False
+
+    async def delayed_execute(ctx, engine):
+        nonlocal cancelled
+        try:
+            await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    stage.execute = delayed_execute
+    pipeline = Pipeline(
+        [stage],
+        PipelineConfig(stage_timeout=0.001, validate_dependencies=False),
+    )
+
+    result = await pipeline.execute(SimulationContext(turn_index=0), MagicMock())
+
+    assert stage.uses_internal_request_budget is False
+    assert result.success is False
+    assert cancelled is True
+    assert isinstance(result.stage_results[0].error, asyncio.TimeoutError)
+
+
+async def test_init_and_auto_hybridization_current_paths_do_not_own_remote_requests() -> None:
+    from ...services.embedding_plugins.ancestry_embedding import AncestryEmbeddingPlugin
+    from ...services.embedding_plugins.base import EmbeddingPlugin
+    from ...services.embedding_plugins.behavior_strategy import BehaviorStrategyPlugin
+    from ...services.embedding_plugins.evolution_space import EvolutionSpacePlugin
+    from ...services.embedding_plugins.food_web_embedding import FoodWebEmbeddingPlugin
+    from ...services.embedding_plugins.prompt_optimizer import PromptOptimizerPlugin
+    from ...services.embedding_plugins.tile_embedding import TileBiomePlugin
+
+    built_in_plugin_types = [
+        BehaviorStrategyPlugin,
+        FoodWebEmbeddingPlugin,
+        TileBiomePlugin,
+        PromptOptimizerPlugin,
+        EvolutionSpacePlugin,
+        AncestryEmbeddingPlugin,
+    ]
+
+    assert all(
+        plugin_type.on_turn_start is EmbeddingPlugin.on_turn_start
+        for plugin_type in built_in_plugin_types
+    )
+    assert GeneticDistanceCalculator().embedding_service is None
+    assert not hasattr(DescriptionEnhancerService(router=object()), "router")
+
+
+@pytest.mark.parametrize(
+    "stage_type",
+    [
         FetchSpeciesStage,
         GeneActivationStage,
-        AutoHybridizationStage,
         SpeciationStage,
         BuildReportStage,
         EmbeddingStage,
         EmbeddingPluginsStage,
         EcologicalRealismStage,
-    ]
-
+    ],
+)
+async def test_previously_verified_remote_stage_keeps_budget_ownership(
+    stage_type: type[BaseStage],
+) -> None:
     assert BaseStage.uses_internal_request_budget is False
-    assert all(
-        stage_type.uses_internal_request_budget is True
-        for stage_type in remote_request_stages
-    )
+    assert stage_type.uses_internal_request_budget is True
 
 
 @pytest.mark.parametrize("stage_type", [SpeciationStage, BuildReportStage])
