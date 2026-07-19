@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 from ipaddress import ip_address
@@ -14,6 +15,8 @@ import pytest
 
 import app.security as security
 import app.security.runtime_http as runtime_http
+from app.security.bounded_runner import BoundedDaemonRunner
+from app.security.deadline import DeadlineBudget
 from app.security.outbound_url import (
     OutboundRequestError,
     OutboundURLPolicy,
@@ -81,6 +84,33 @@ class RecordingPolicy:
         if self.error is not None:
             raise self.error
         return self.result
+
+
+class ManualClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class AdvancingPolicy(RecordingPolicy):
+    def __init__(self, clock: ManualClock, *, dns_seconds: float) -> None:
+        super().__init__()
+        self._clock = clock
+        self._dns_seconds = dns_seconds
+
+    def validate(
+        self,
+        url: str,
+        *,
+        allow_local: bool,
+    ) -> ValidatedOutboundURL:
+        self._clock.advance(self._dns_seconds)
+        return super().validate(url, allow_local=allow_local)
 
 
 _AUTO_CONTENT_LENGTH = object()
@@ -181,6 +211,23 @@ class RecordingSyncStream(httpcore.NetworkStream):
         return self
 
 
+class AdvancingSyncStream(RecordingSyncStream):
+    def __init__(
+        self,
+        clock: ManualClock,
+        *,
+        read_advances: list[float],
+    ) -> None:
+        super().__init__(body_chunk_size=6)
+        self._clock = clock
+        self._read_advances = iter(read_advances)
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        if not self._head and self._body:
+            self._clock.advance(next(self._read_advances))
+        return super().read(max_bytes, timeout=timeout)
+
+
 class RecordingAsyncStream(httpcore.AsyncNetworkStream):
     def __init__(
         self,
@@ -263,6 +310,27 @@ class RecordingAsyncStream(httpcore.AsyncNetworkStream):
         if self.tls_error is not None:
             raise self.tls_error
         return self
+
+
+class AdvancingAsyncStream(RecordingAsyncStream):
+    def __init__(
+        self,
+        clock: ManualClock,
+        *,
+        read_advances: list[float],
+    ) -> None:
+        super().__init__(body_chunk_size=6)
+        self._clock = clock
+        self._read_advances = iter(read_advances)
+
+    async def read(
+        self,
+        max_bytes: int,
+        timeout: float | None = None,
+    ) -> bytes:
+        if not self._head and self._body:
+            self._clock.advance(next(self._read_advances))
+        return await super().read(max_bytes, timeout=timeout)
 
 
 class RecordingSyncBackend(httpcore.NetworkBackend):
@@ -384,7 +452,8 @@ async def _invoke(
     headers: Mapping[str, str] | None = None,
     json_body: Mapping[str, Any] | None = None,
     allow_local: bool = False,
-    read_timeout: float = 7.5,
+    read_timeout: float | None = 7.5,
+    budget: DeadlineBudget | None = None,
     max_bytes: int = AI_JSON_MAX_BYTES,
 ) -> dict[str, Any]:
     kwargs = {
@@ -393,11 +462,212 @@ async def _invoke(
         "json_body": {"request": True} if json_body is None else json_body,
         "allow_local": allow_local,
         "read_timeout": read_timeout,
+        "budget": budget,
         "max_bytes": max_bytes,
     }
     if mode == "sync":
         return client.post_json(base_url, **kwargs)
     return await client.apost_json(base_url, **kwargs)
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.asyncio
+async def test_normal_budget_spans_dns_connect_and_complete_body(
+    mode: Mode,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(6.0, clock=clock)
+    policy = AdvancingPolicy(clock, dns_seconds=2.0)
+    stream: RecordingSyncStream | RecordingAsyncStream
+    if mode == "sync":
+        stream = AdvancingSyncStream(clock, read_advances=[2.0, 2.1])
+    else:
+        stream = AdvancingAsyncStream(clock, read_advances=[2.0, 2.1])
+    client, _, backend = _runtime_client(mode, stream, policy=policy)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _invoke(
+            mode,
+            client,
+            budget=budget,
+            read_timeout=None,
+        )
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert backend.connect_calls == [("93.184.216.34", 443)]
+    assert stream.close_count == 1
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.asyncio
+async def test_normal_budget_spans_json_parse(
+    mode: Mode,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(3.0, clock=clock)
+    policy = AdvancingPolicy(clock, dns_seconds=1.0)
+    stream: RecordingSyncStream | RecordingAsyncStream
+    if mode == "sync":
+        stream = AdvancingSyncStream(clock, read_advances=[0.5, 0.5])
+    else:
+        stream = AdvancingAsyncStream(clock, read_advances=[0.5, 0.5])
+    client, _, _ = _runtime_client(mode, stream, policy=policy)
+    real_parse = runtime_http._parse_json_object
+
+    def advancing_parse(content: bytearray) -> dict[str, Any]:
+        clock.advance(1.1)
+        return real_parse(content)
+
+    monkeypatch.setattr(runtime_http, "_parse_json_object", advancing_parse)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _invoke(mode, client, budget=budget, read_timeout=None)
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert stream.close_count == 1
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.asyncio
+async def test_normal_budget_spans_cleanup(
+    mode: Mode,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(3.0, clock=clock)
+    policy = AdvancingPolicy(clock, dns_seconds=1.0)
+    stream = _stream_for(mode)
+    if mode == "sync":
+        real_transport = runtime_http.PinnedSyncTransport
+
+        class CleanupAdvancingTransport(real_transport):
+            def close(self) -> None:
+                super().close()
+                clock.advance(2.1)
+
+        monkeypatch.setattr(
+            runtime_http,
+            "PinnedSyncTransport",
+            CleanupAdvancingTransport,
+        )
+    else:
+        real_async_transport = runtime_http.PinnedAsyncTransport
+
+        class CleanupAdvancingAsyncTransport(real_async_transport):
+            async def aclose(self) -> None:
+                await super().aclose()
+                clock.advance(2.1)
+
+        monkeypatch.setattr(
+            runtime_http,
+            "PinnedAsyncTransport",
+            CleanupAdvancingAsyncTransport,
+        )
+    client, _, _ = _runtime_client(mode, stream, policy=policy)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _invoke(mode, client, budget=budget, read_timeout=None)
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert stream.close_count == 1
+
+
+def test_sync_blocking_dns_timeout_is_bounded_by_normal_budget() -> None:
+    release = threading.Event()
+    started = threading.Event()
+
+    def resolver(hostname: str, port: int) -> tuple[Any, ...]:
+        started.set()
+        release.wait()
+        return (ip_address("93.184.216.34"),)
+
+    client = SafeRuntimeClient(
+        policy=OutboundURLPolicy(resolver),
+        runner=BoundedDaemonRunner(max_workers=1),
+    )
+    try:
+        with pytest.raises(OutboundRequestError) as exc_info:
+            client.post_json(
+                VALIDATED_BASE,
+                request_target=VALID_TARGET,
+                headers={"Authorization": "Bearer test-sentinel"},
+                json_body={"model": "test", "messages": []},
+                allow_local=False,
+                read_timeout=None,
+                budget=DeadlineBudget.from_timeout(0.02),
+                max_bytes=1024,
+            )
+        assert exc_info.value.code == "outbound_timeout"
+        assert started.is_set()
+    finally:
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_async_blocking_dns_timeout_does_not_block_other_task() -> None:
+    release = threading.Event()
+    started = threading.Event()
+    ticks = 0
+
+    def resolver(hostname: str, port: int) -> tuple[Any, ...]:
+        started.set()
+        release.wait()
+        return (ip_address("93.184.216.34"),)
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while ticks < 3:
+            await asyncio.sleep(0)
+            ticks += 1
+
+    client = SafeRuntimeClient(
+        policy=OutboundURLPolicy(resolver),
+        runner=BoundedDaemonRunner(max_workers=1),
+    )
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        with pytest.raises(OutboundRequestError) as exc_info:
+            await client.apost_json(
+                VALIDATED_BASE,
+                request_target=VALID_TARGET,
+                headers={"Authorization": "Bearer test-sentinel"},
+                json_body={"model": "test", "messages": []},
+                allow_local=False,
+                read_timeout=None,
+                budget=DeadlineBudget.from_timeout(0.02),
+                max_bytes=1024,
+            )
+        assert exc_info.value.code == "outbound_timeout"
+        await ticker_task
+        assert ticks == 3
+        assert started.is_set()
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.asyncio
+async def test_caller_budget_wins_over_transitional_read_timeout(
+    mode: Mode,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(1.0, clock=clock)
+    clock.advance(1.0)
+    stream = _stream_for(mode)
+    client, policy, backend = _runtime_client(mode, stream)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _invoke(
+            mode,
+            client,
+            budget=budget,
+            read_timeout=60.0,
+        )
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert policy.calls == []
+    assert backend.connect_calls == []
 
 
 def _request_bytes(stream: Any) -> bytes:
@@ -1024,7 +1294,7 @@ async def test_client_cleans_headers_and_disables_env_and_redirects(
     assert isinstance(timeout, httpx.Timeout)
     assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (
         1.25,
-        9.25,
+        2.5,
         3.75,
         4.5,
     )

@@ -14,6 +14,8 @@ from urllib.parse import urlsplit
 import httpcore
 import httpx
 
+from .bounded_runner import BoundedDaemonRunner, DEFAULT_BOUNDED_RUNNER
+from .deadline import DeadlineBudget, DeadlineExpired
 from .outbound_url import (
     OutboundRequestError,
     OutboundURLPolicy,
@@ -190,7 +192,12 @@ def _parse_json_object(content: bytearray) -> dict[str, Any]:
     return cast(dict[str, Any], parsed)
 
 
-def _read_sync_json(response: httpx.Response, max_bytes: int) -> dict[str, Any]:
+def _read_sync_json(
+    response: httpx.Response,
+    max_bytes: int,
+    budget: DeadlineBudget,
+) -> dict[str, Any]:
+    budget.phase_timeout()
     _check_response_headers(response, max_bytes)
     content = bytearray()
     for chunk in response.iter_raw(chunk_size=max_bytes + 1):
@@ -198,13 +205,20 @@ def _read_sync_json(response: httpx.Response, max_bytes: int) -> dict[str, Any]:
         content.extend(chunk[:remaining])
         if len(content) > max_bytes or len(chunk) > remaining:
             raise _response_too_large()
-    return _parse_json_object(content)
+        budget.phase_timeout()
+    budget.phase_timeout()
+    try:
+        return _parse_json_object(content)
+    finally:
+        budget.phase_timeout()
 
 
 async def _read_async_json(
     response: httpx.Response,
     max_bytes: int,
+    budget: DeadlineBudget,
 ) -> dict[str, Any]:
+    budget.phase_timeout()
     _check_response_headers(response, max_bytes)
     content = bytearray()
     async for chunk in response.aiter_raw(chunk_size=max_bytes + 1):
@@ -212,7 +226,12 @@ async def _read_async_json(
         content.extend(chunk[:remaining])
         if len(content) > max_bytes or len(chunk) > remaining:
             raise _response_too_large()
-    return _parse_json_object(content)
+        budget.phase_timeout()
+    budget.phase_timeout()
+    try:
+        return _parse_json_object(content)
+    finally:
+        budget.phase_timeout()
 
 
 class SafeRuntimeClient:
@@ -222,12 +241,36 @@ class SafeRuntimeClient:
         *,
         sync_network_backend: httpcore.NetworkBackend | None = None,
         async_network_backend: httpcore.AsyncNetworkBackend | None = None,
+        runner: BoundedDaemonRunner | None = None,
         timeouts: RuntimeTimeouts = RuntimeTimeouts(),
     ) -> None:
+        self._runner = runner or DEFAULT_BOUNDED_RUNNER
         self._policy = OutboundURLPolicy() if policy is None else policy
         self._sync_network_backend = sync_network_backend
         self._async_network_backend = async_network_backend
         self._timeouts = timeouts
+
+    @staticmethod
+    def _normal_budget(
+        budget: DeadlineBudget | None,
+        read_timeout: float | None,
+    ) -> DeadlineBudget:
+        if budget is not None:
+            return budget
+        if read_timeout is None:
+            raise _invalid_url()
+        try:
+            return DeadlineBudget.from_timeout(read_timeout)
+        except ValueError:
+            raise _invalid_url() from None
+
+    def _httpx_timeout(self, budget: DeadlineBudget) -> httpx.Timeout:
+        return httpx.Timeout(
+            connect=budget.phase_timeout(self._timeouts.connect),
+            read=budget.phase_timeout(self._timeouts.read),
+            write=budget.phase_timeout(self._timeouts.write),
+            pool=budget.phase_timeout(self._timeouts.pool),
+        )
 
     def post_json(
         self,
@@ -237,8 +280,50 @@ class SafeRuntimeClient:
         headers: Mapping[str, str],
         json_body: Mapping[str, Any],
         allow_local: bool,
-        read_timeout: float,
+        read_timeout: float | None = None,
+        budget: DeadlineBudget | None = None,
         max_bytes: int = AI_JSON_MAX_BYTES,
+    ) -> dict[str, Any]:
+        effective_budget = self._normal_budget(budget, read_timeout)
+        try:
+            return self._runner.run(
+                lambda: self._post_json_impl(
+                    base_url,
+                    request_target=request_target,
+                    headers=headers,
+                    json_body=json_body,
+                    allow_local=allow_local,
+                    max_bytes=max_bytes,
+                    budget=effective_budget,
+                ),
+                timeout=effective_budget.phase_timeout(),
+            )
+        except OutboundRequestError:
+            raise
+        except (
+            DeadlineExpired,
+            TimeoutError,
+            httpx.TimeoutException,
+            httpcore.TimeoutException,
+        ):
+            raise _timeout() from None
+        except (httpx.DecodingError, httpx.ProtocolError, httpcore.ProtocolError):
+            raise _bad_response() from None
+        except (httpx.RequestError, httpcore.NetworkError, OSError):
+            raise _connect_failed() from None
+        except Exception:
+            raise _bad_response() from None
+
+    def _post_json_impl(
+        self,
+        base_url: str,
+        *,
+        request_target: str,
+        headers: Mapping[str, str],
+        json_body: Mapping[str, Any],
+        allow_local: bool,
+        max_bytes: int,
+        budget: DeadlineBudget,
     ) -> dict[str, Any]:
         token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(True)
         try:
@@ -253,17 +338,13 @@ class SafeRuntimeClient:
             transport = PinnedSyncTransport(
                 validated,
                 self._sync_network_backend,
+                budget=budget,
             )
             client: httpx.Client | None = None
             try:
                 client = httpx.Client(
                     transport=transport,
-                    timeout=httpx.Timeout(
-                        connect=self._timeouts.connect,
-                        read=read_timeout,
-                        write=self._timeouts.write,
-                        pool=self._timeouts.pool,
-                    ),
+                    timeout=self._httpx_timeout(budget),
                     trust_env=False,
                     follow_redirects=False,
                 )
@@ -273,22 +354,13 @@ class SafeRuntimeClient:
                     headers=_request_headers(headers),
                     json=json_body,
                 ) as response:
-                    return _read_sync_json(response, max_bytes)
+                    return _read_sync_json(response, max_bytes, budget)
             finally:
                 if client is None:
                     transport.close()
                 else:
                     client.close()
-        except OutboundRequestError:
-            raise
-        except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
-            raise _timeout() from None
-        except (httpx.DecodingError, httpx.ProtocolError, httpcore.ProtocolError):
-            raise _bad_response() from None
-        except (httpx.RequestError, httpcore.NetworkError, OSError):
-            raise _connect_failed() from None
-        except Exception:
-            raise _bad_response() from None
+                budget.phase_timeout()
         finally:
             _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
 
@@ -300,12 +372,20 @@ class SafeRuntimeClient:
         headers: Mapping[str, str],
         json_body: Mapping[str, Any],
         allow_local: bool,
-        read_timeout: float,
+        read_timeout: float | None = None,
+        budget: DeadlineBudget | None = None,
         max_bytes: int = AI_JSON_MAX_BYTES,
     ) -> dict[str, Any]:
+        effective_budget = self._normal_budget(budget, read_timeout)
         token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(True)
         try:
-            validated = self._policy.validate(base_url, allow_local=allow_local)
+            validated = await self._runner.arun(
+                lambda: self._policy.validate(
+                    base_url,
+                    allow_local=allow_local,
+                ),
+                timeout=effective_budget.phase_timeout(),
+            )
             request_url = _validated_request_url(validated, request_target)
             if (
                 not isinstance(max_bytes, int)
@@ -313,38 +393,47 @@ class SafeRuntimeClient:
                 or max_bytes < 0
             ):
                 raise _invalid_url()
-            transport = PinnedAsyncTransport(
-                validated,
-                self._async_network_backend,
-            )
-            client: httpx.AsyncClient | None = None
-            try:
-                client = httpx.AsyncClient(
-                    transport=transport,
-                    timeout=httpx.Timeout(
-                        connect=self._timeouts.connect,
-                        read=read_timeout,
-                        write=self._timeouts.write,
-                        pool=self._timeouts.pool,
-                    ),
-                    trust_env=False,
-                    follow_redirects=False,
+            async with asyncio.timeout(effective_budget.phase_timeout()):
+                transport = PinnedAsyncTransport(
+                    validated,
+                    self._async_network_backend,
+                    budget=effective_budget,
                 )
-                async with client.stream(
-                    "POST",
-                    request_url,
-                    headers=_request_headers(headers),
-                    json=json_body,
-                ) as response:
-                    return await _read_async_json(response, max_bytes)
-            finally:
-                if client is None:
-                    await transport.aclose()
-                else:
-                    await client.aclose()
+                client: httpx.AsyncClient | None = None
+                try:
+                    client = httpx.AsyncClient(
+                        transport=transport,
+                        timeout=self._httpx_timeout(effective_budget),
+                        trust_env=False,
+                        follow_redirects=False,
+                    )
+                    async with client.stream(
+                        "POST",
+                        request_url,
+                        headers=_request_headers(headers),
+                        json=json_body,
+                    ) as response:
+                        return await _read_async_json(
+                            response,
+                            max_bytes,
+                            effective_budget,
+                        )
+                finally:
+                    if client is None:
+                        await transport.aclose()
+                    else:
+                        await client.aclose()
+                    effective_budget.phase_timeout()
         except OutboundRequestError:
             raise
-        except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
+        except asyncio.CancelledError:
+            raise
+        except (
+            DeadlineExpired,
+            TimeoutError,
+            httpx.TimeoutException,
+            httpcore.TimeoutException,
+        ):
             raise _timeout() from None
         except (httpx.DecodingError, httpx.ProtocolError, httpcore.ProtocolError):
             raise _bad_response() from None
