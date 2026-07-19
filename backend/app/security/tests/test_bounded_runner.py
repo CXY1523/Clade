@@ -7,6 +7,46 @@ import pytest
 from app.security.bounded_runner import BoundedDaemonRunner
 
 
+def _raise_operation_error(error: BaseException) -> None:
+    raise error
+
+
+def _traceback_names(error: BaseException) -> list[str]:
+    names: list[str] = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    return names
+
+
+def test_sync_run_preserves_operation_timeout_exception() -> None:
+    runner = BoundedDaemonRunner(max_workers=1)
+    operation_error = TimeoutError("operation timeout sentinel")
+
+    with pytest.raises(TimeoutError) as exc_info:
+        runner.run(lambda: _raise_operation_error(operation_error), timeout=1.0)
+
+    assert exc_info.value is operation_error
+    assert str(exc_info.value) == "operation timeout sentinel"
+    assert "_raise_operation_error" in _traceback_names(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_async_run_preserves_operation_timeout_exception() -> None:
+    runner = BoundedDaemonRunner(max_workers=1)
+    operation_error = asyncio.TimeoutError("operation timeout sentinel")
+
+    with pytest.raises(asyncio.TimeoutError) as exc_info:
+        await runner.arun(
+            lambda: _raise_operation_error(operation_error), timeout=1.0
+        )
+
+    assert exc_info.value is operation_error
+    assert str(exc_info.value) == "operation timeout sentinel"
+    assert "_raise_operation_error" in _traceback_names(exc_info.value)
+
+
 def test_runner_never_starts_more_than_four_expired_workers() -> None:
     runner = BoundedDaemonRunner(max_workers=4)
     release = threading.Event()

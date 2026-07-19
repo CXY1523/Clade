@@ -116,16 +116,17 @@ class BoundedDaemonRunner:
 
         self._start_worker(worker)
         try:
-            return await asyncio.wait_for(
-                asyncio.shield(future),
+            done, _ = await asyncio.wait(
+                {future},
                 timeout=max(deadline - time.monotonic(), 0.0),
             )
         except asyncio.CancelledError:
             future.cancel()
             raise
-        except asyncio.TimeoutError:
+        if not done:
             future.cancel()
             raise TimeoutError from None
+        return future.result()
 
 
 DEFAULT_BOUNDED_RUNNER = BoundedDaemonRunner(max_workers=4)
