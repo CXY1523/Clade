@@ -685,10 +685,11 @@ async def test_timeout_primary_survives_failing_cleanup(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     cleanup_sentinel = f"{mode}-timeout-cleanup-secret"
+    cleanup_error = OSError(cleanup_sentinel)
     stream = _stream_for(
         mode,
         read_error=httpcore.ReadTimeout("primary-timeout"),
-        close_error=OSError(cleanup_sentinel),
+        close_error=cleanup_error,
     )
     client, _, _ = _runtime_client(mode, stream)
     for logger_name in ("httpx", "httpcore.connection", "httpcore.http11"):
@@ -701,6 +702,11 @@ async def test_timeout_primary_survives_failing_cleanup(
     assert stream.close_count == 1
     assert cleanup_sentinel not in repr(exc_info.value)
     assert cleanup_sentinel not in caplog.text
+    _assert_no_displaced_cleanup_traceback_artifacts(
+        exc_info.value,
+        stream=stream,
+        cleanup_error=cleanup_error,
+    )
 
 
 @pytest.mark.asyncio
@@ -709,9 +715,10 @@ async def test_caller_cancellation_survives_failing_cleanup(
 ) -> None:
     cancel_sentinel = "caller-cancel-primary"
     cleanup_sentinel = "cancel-cleanup-secret"
+    cleanup_error = OSError(cleanup_sentinel)
     stream = RecordingAsyncStream(
         block_body=True,
-        close_error=OSError(cleanup_sentinel),
+        close_error=cleanup_error,
     )
     client, _, _ = _runtime_client("async", stream)
     for logger_name in ("httpx", "httpcore.connection", "httpcore.http11"):
@@ -727,6 +734,11 @@ async def test_caller_cancellation_survives_failing_cleanup(
     assert stream.close_count == 1
     assert cleanup_sentinel not in repr(exc_info.value)
     assert cleanup_sentinel not in caplog.text
+    _assert_no_displaced_cleanup_traceback_artifacts(
+        exc_info.value,
+        stream=stream,
+        cleanup_error=cleanup_error,
+    )
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
@@ -752,6 +764,85 @@ async def test_cleanup_failure_without_primary_keeps_fixed_error(
 
 class StaleFatalCleanupContext(BaseException):
     pass
+
+
+def _assert_no_displaced_cleanup_traceback_artifacts(
+    error: BaseException,
+    *,
+    stream: RecordingSyncStream | RecordingAsyncStream,
+    cleanup_error: BaseException,
+) -> None:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback = current.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code.co_name.startswith("test_"):
+                traceback = traceback.tb_next
+                continue
+            frame_locals = traceback.tb_frame.f_locals
+            assert "escaped_error" not in frame_locals
+            assert cleanup_error not in frame_locals.values()
+            assert stream not in frame_locals.values()
+            retained_responses = [
+                name
+                for name, value in frame_locals.items()
+                if isinstance(value, httpx.Response)
+            ]
+            assert not retained_responses, (
+                type(current).__name__,
+                traceback.tb_frame.f_code.co_name,
+                retained_responses,
+            )
+            assert not any(
+                type(value).__name__ == "_ReadInvocationMarker"
+                for value in frame_locals.values()
+            )
+            traceback = traceback.tb_next
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.asyncio
+async def test_ordinary_read_error_preserves_traceback_and_cause(
+    mode: Mode,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cause = RuntimeError("ordinary-read-cause")
+    original = OutboundRequestError(
+        "outbound_bad_response",
+        502,
+        "fixed ordinary read failure",
+    )
+
+    def fail_parse(content: bytearray) -> dict[str, Any]:
+        raise original from cause
+
+    monkeypatch.setattr(runtime_http, "_parse_json_object", fail_parse)
+    stream = _stream_for(mode)
+    client, _, _ = _runtime_client(mode, stream)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _invoke(mode, client)
+
+    frame_names: list[str] = []
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        frame_names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    assert exc_info.value is original
+    assert exc_info.value.__cause__ is cause
+    assert "fail_parse" in frame_names
+    assert (
+        "_read_sync_json_impl" if mode == "sync" else "_read_async_json_impl"
+    ) in frame_names
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])

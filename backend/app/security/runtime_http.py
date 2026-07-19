@@ -202,6 +202,10 @@ class _ReadInvocationMarker:
         self.stream_identities = frozenset(identities)
 
 
+_CLEANUP_DISPLACED = object()
+_CLEANUP_DISPLACED_ATTRIBUTE = "_clade_cleanup_displaced"
+
+
 def _cleanup_displaced_primary(
     cleanup_error: httpcore.NetworkError,
     marker: _ReadInvocationMarker,
@@ -225,20 +229,73 @@ def _cleanup_displaced_primary(
     return None
 
 
-def _sanitized_read_error(
+def _is_sanitized_close_error(error: BaseException) -> bool:
+    if type(error) is not httpcore.NetworkError:
+        return False
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if (
+            frame.f_globals.get("__name__") == "app.security.pinned_transport"
+            and frame.f_code.co_name in {"close", "aclose"}
+            and type(frame.f_locals.get("self")).__name__
+            in {"_SanitizedNetworkStream", "_SanitizedAsyncNetworkStream"}
+        ):
+            return True
+        traceback = traceback.tb_next
+    return False
+
+
+def _displaced_read_error(
     captured_error: BaseException,
     marker: _ReadInvocationMarker,
-) -> BaseException:
+) -> BaseException | None:
     primary_error = (
         _cleanup_displaced_primary(captured_error, marker)
         if isinstance(captured_error, httpcore.NetworkError)
         else None
     )
+    if primary_error is None and not _is_sanitized_close_error(captured_error):
+        return None
     escaped_error = captured_error if primary_error is None else primary_error
     escaped_error.__traceback__ = None
     escaped_error.__context__ = None
     escaped_error.__cause__ = None
+    setattr(
+        escaped_error,
+        _CLEANUP_DISPLACED_ATTRIBUTE,
+        _CLEANUP_DISPLACED,
+    )
     return escaped_error
+
+
+def _clear_displaced_cleanup_artifacts(error: BaseException) -> None:
+    chain: list[BaseException] = []
+    pending = [error]
+    seen: set[int] = set()
+    displaced = False
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        displaced = displaced or (
+            getattr(current, _CLEANUP_DISPLACED_ATTRIBUTE, None)
+            is _CLEANUP_DISPLACED
+        )
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+    if not displaced:
+        return
+    for current in chain:
+        current.__traceback__ = None
+        current.__context__ = None
+        current.__cause__ = None
+        if hasattr(current, _CLEANUP_DISPLACED_ATTRIBUTE):
+            delattr(current, _CLEANUP_DISPLACED_ATTRIBUTE)
 
 
 def _read_sync_json_impl(
@@ -271,11 +328,12 @@ def _read_sync_json(
     try:
         return _read_sync_json_impl(response, max_bytes, budget)
     except BaseException as exc:
-        captured_error = exc
-    escaped_error = _sanitized_read_error(captured_error, marker)
-    del captured_error
+        displaced_error = _displaced_read_error(exc, marker)
+        if displaced_error is None:
+            del marker
+            raise
     del marker
-    raise escaped_error from None
+    raise displaced_error from None
 
 
 async def _read_async_json_impl(
@@ -308,11 +366,12 @@ async def _read_async_json(
     try:
         return await _read_async_json_impl(response, max_bytes, budget)
     except BaseException as exc:
-        captured_error = exc
-    escaped_error = _sanitized_read_error(captured_error, marker)
-    del captured_error
+        displaced_error = _displaced_read_error(exc, marker)
+        if displaced_error is None:
+            del marker
+            raise
     del marker
-    raise escaped_error from None
+    raise displaced_error from None
 
 
 class SafeRuntimeClient:
@@ -379,21 +438,33 @@ class SafeRuntimeClient:
                 ),
                 timeout=effective_budget.phase_timeout(),
             )
-        except OutboundRequestError:
+        except OutboundRequestError as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise
         except (
             DeadlineExpired,
             TimeoutError,
             httpx.TimeoutException,
             httpcore.TimeoutException,
-        ):
+        ) as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _timeout() from None
-        except (httpx.DecodingError, httpx.ProtocolError, httpcore.ProtocolError):
+        except (
+            httpx.DecodingError,
+            httpx.ProtocolError,
+            httpcore.ProtocolError,
+        ) as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _bad_response() from None
-        except (httpx.RequestError, httpcore.NetworkError, OSError):
+        except (httpx.RequestError, httpcore.NetworkError, OSError) as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _connect_failed() from None
-        except Exception:
+        except Exception as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _bad_response() from None
+        except BaseException as exc:
+            _clear_displaced_cleanup_artifacts(exc)
+            raise
 
     def _post_json_impl(
         self,
@@ -577,23 +648,50 @@ class SafeRuntimeClient:
                                 raise
                     if primary_error is None:
                         effective_budget.phase_timeout()
-        except OutboundRequestError:
+                    if (
+                        getattr(
+                            primary_error,
+                            _CLEANUP_DISPLACED_ATTRIBUTE,
+                            None,
+                        )
+                        is _CLEANUP_DISPLACED
+                    ):
+                        transport = None
+                        client = None
+                        response_context = None
+                        response = None
+                        result = None
+                        primary_error = None
+        except OutboundRequestError as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise
         except (
             DeadlineExpired,
             TimeoutError,
             httpx.TimeoutException,
             httpcore.TimeoutException,
-        ):
+        ) as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _timeout() from None
-        except (httpx.DecodingError, httpx.ProtocolError, httpcore.ProtocolError):
+        except (
+            httpx.DecodingError,
+            httpx.ProtocolError,
+            httpcore.ProtocolError,
+        ) as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _bad_response() from None
-        except (httpx.RequestError, httpcore.NetworkError, OSError):
+        except (httpx.RequestError, httpcore.NetworkError, OSError) as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _connect_failed() from None
-        except Exception:
+        except Exception as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _bad_response() from None
+        except BaseException as exc:
+            _clear_displaced_cleanup_artifacts(exc)
+            raise
         finally:
             _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
 
