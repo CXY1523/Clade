@@ -750,6 +750,57 @@ async def test_cleanup_failure_without_primary_keeps_fixed_error(
     assert cleanup_sentinel not in caplog.text
 
 
+class StaleFatalCleanupContext(BaseException):
+    pass
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize(
+    "stale_error",
+    [
+        asyncio.CancelledError("stale-cancel-context"),
+        StaleFatalCleanupContext("stale-fatal-context"),
+    ],
+    ids=["cancelled", "fatal"],
+)
+@pytest.mark.asyncio
+async def test_reused_cleanup_error_ignores_unrelated_stale_context(
+    mode: Mode,
+    stale_error: BaseException,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cleanup_sentinel = f"{mode}-reused-cleanup-secret"
+    cleanup_error = OSError(cleanup_sentinel)
+    try:
+        raise stale_error
+    except BaseException:
+        try:
+            raise cleanup_error
+        except OSError:
+            pass
+    assert cleanup_error.__context__ is stale_error
+
+    stream = _stream_for(mode, close_error=cleanup_error)
+    client, _, _ = _runtime_client(mode, stream)
+    for logger_name in ("httpx", "httpcore.connection", "httpcore.http11"):
+        caplog.set_level(logging.DEBUG, logger=logger_name)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _invoke(mode, client)
+
+    context_chain: list[BaseException] = []
+    current: BaseException | None = exc_info.value
+    while current is not None and current not in context_chain:
+        context_chain.append(current)
+        current = current.__context__
+    assert exc_info.value.code == "outbound_connect_failed"
+    assert stream.close_count == 1
+    assert stale_error not in context_chain
+    assert cleanup_error not in context_chain
+    assert cleanup_sentinel not in repr(context_chain)
+    assert cleanup_sentinel not in caplog.text
+
+
 def _request_bytes(stream: Any) -> bytes:
     return bytes(stream.request_bytes)
 

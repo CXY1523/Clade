@@ -192,15 +192,53 @@ def _parse_json_object(content: bytearray) -> dict[str, Any]:
     return cast(dict[str, Any], parsed)
 
 
+class _ReadInvocationMarker:
+    def __init__(self, response: httpx.Response) -> None:
+        identities: set[int] = set()
+        current: object | None = response.stream
+        while current is not None and id(current) not in identities:
+            identities.add(id(current))
+            current = getattr(current, "_stream", None)
+        self.stream_identities = frozenset(identities)
+
+
 def _cleanup_displaced_primary(
     cleanup_error: httpcore.NetworkError,
+    marker: _ReadInvocationMarker,
 ) -> BaseException | None:
     if type(cleanup_error) is not httpcore.NetworkError:
         return None
     delegate_cleanup_error = cleanup_error.__context__
     if delegate_cleanup_error is None:
         return None
-    return delegate_cleanup_error.__context__
+    candidate = delegate_cleanup_error.__context__
+    if candidate is None:
+        return None
+    traceback = candidate.__traceback__
+    while traceback is not None:
+        if any(
+            id(value) in marker.stream_identities
+            for value in traceback.tb_frame.f_locals.values()
+        ):
+            return candidate
+        traceback = traceback.tb_next
+    return None
+
+
+def _sanitized_read_error(
+    captured_error: BaseException,
+    marker: _ReadInvocationMarker,
+) -> BaseException:
+    primary_error = (
+        _cleanup_displaced_primary(captured_error, marker)
+        if isinstance(captured_error, httpcore.NetworkError)
+        else None
+    )
+    escaped_error = captured_error if primary_error is None else primary_error
+    escaped_error.__traceback__ = None
+    escaped_error.__context__ = None
+    escaped_error.__cause__ = None
+    return escaped_error
 
 
 def _read_sync_json_impl(
@@ -229,16 +267,15 @@ def _read_sync_json(
     max_bytes: int,
     budget: DeadlineBudget,
 ) -> dict[str, Any]:
+    marker = _ReadInvocationMarker(response)
     try:
         return _read_sync_json_impl(response, max_bytes, budget)
-    except httpcore.NetworkError as exc:
-        primary_error = _cleanup_displaced_primary(exc)
-        if primary_error is None:
-            raise
-        primary_traceback = primary_error.__traceback__
-        primary_error.__context__ = None
-        primary_error.__cause__ = None
-    raise primary_error.with_traceback(primary_traceback) from None
+    except BaseException as exc:
+        captured_error = exc
+    escaped_error = _sanitized_read_error(captured_error, marker)
+    del captured_error
+    del marker
+    raise escaped_error from None
 
 
 async def _read_async_json_impl(
@@ -267,16 +304,15 @@ async def _read_async_json(
     max_bytes: int,
     budget: DeadlineBudget,
 ) -> dict[str, Any]:
+    marker = _ReadInvocationMarker(response)
     try:
         return await _read_async_json_impl(response, max_bytes, budget)
-    except httpcore.NetworkError as exc:
-        primary_error = _cleanup_displaced_primary(exc)
-        if primary_error is None:
-            raise
-        primary_traceback = primary_error.__traceback__
-        primary_error.__context__ = None
-        primary_error.__cause__ = None
-    raise primary_error.with_traceback(primary_traceback) from None
+    except BaseException as exc:
+        captured_error = exc
+    escaped_error = _sanitized_read_error(captured_error, marker)
+    del captured_error
+    del marker
+    raise escaped_error from None
 
 
 class SafeRuntimeClient:
