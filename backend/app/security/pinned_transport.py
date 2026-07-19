@@ -7,7 +7,22 @@ from typing import Any
 import httpcore
 import httpx
 
+from .deadline import DeadlineExpired, TimeoutBudget
 from .outbound_url import ValidatedOutboundURL
+
+
+def _bounded_timeout(
+    budget: TimeoutBudget | None,
+    requested: float | None,
+    *,
+    timeout_error: type[Exception],
+) -> float | None:
+    if budget is None:
+        return requested
+    try:
+        return budget.phase_timeout(requested)
+    except DeadlineExpired:
+        raise timeout_error("outbound deadline expired") from None
 
 
 class _PinnedNetworkBackend(httpcore.NetworkBackend):
@@ -15,9 +30,12 @@ class _PinnedNetworkBackend(httpcore.NetworkBackend):
         self,
         validated: ValidatedOutboundURL,
         delegate: httpcore.NetworkBackend,
+        *,
+        budget: TimeoutBudget | None = None,
     ) -> None:
         self._validated = validated
         self._delegate = delegate
+        self._budget = budget
 
     def connect_tcp(
         self,
@@ -32,11 +50,16 @@ class _PinnedNetworkBackend(httpcore.NetworkBackend):
 
         last_error: BaseException | None = None
         for approved_ip in self._validated.resolved_ips:
+            bounded_timeout = _bounded_timeout(
+                self._budget,
+                timeout,
+                timeout_error=httpcore.ConnectTimeout,
+            )
             try:
                 return self._delegate.connect_tcp(
                     str(approved_ip),
                     port,
-                    timeout=timeout,
+                    timeout=bounded_timeout,
                     local_address=local_address,
                     socket_options=socket_options,
                 )
@@ -61,9 +84,12 @@ class _PinnedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
         self,
         validated: ValidatedOutboundURL,
         delegate: httpcore.AsyncNetworkBackend,
+        *,
+        budget: TimeoutBudget | None = None,
     ) -> None:
         self._validated = validated
         self._delegate = delegate
+        self._budget = budget
 
     async def connect_tcp(
         self,
@@ -78,11 +104,16 @@ class _PinnedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
 
         last_error: BaseException | None = None
         for approved_ip in self._validated.resolved_ips:
+            bounded_timeout = _bounded_timeout(
+                self._budget,
+                timeout,
+                timeout_error=httpcore.ConnectTimeout,
+            )
             try:
                 return await self._delegate.connect_tcp(
                     str(approved_ip),
                     port,
-                    timeout=timeout,
+                    timeout=bounded_timeout,
                     local_address=local_address,
                     socket_options=socket_options,
                 )
@@ -105,12 +136,23 @@ class _PinnedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
 class _SanitizedNetworkStream(httpcore.NetworkStream):
     """Prevent delegate exception details from reaching httpcore trace logs."""
 
-    def __init__(self, delegate: httpcore.NetworkStream) -> None:
+    def __init__(
+        self,
+        delegate: httpcore.NetworkStream,
+        *,
+        budget: TimeoutBudget | None = None,
+    ) -> None:
         self._delegate = delegate
+        self._budget = budget
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         try:
-            return self._delegate.read(max_bytes, timeout=timeout)
+            bounded_timeout = _bounded_timeout(
+                self._budget,
+                timeout,
+                timeout_error=httpcore.ReadTimeout,
+            )
+            return self._delegate.read(max_bytes, timeout=bounded_timeout)
         except httpcore.ReadTimeout:
             raise httpcore.ReadTimeout("outbound read timed out") from None
         except Exception:
@@ -118,7 +160,12 @@ class _SanitizedNetworkStream(httpcore.NetworkStream):
 
     def write(self, buffer: bytes, timeout: float | None = None) -> None:
         try:
-            self._delegate.write(buffer, timeout=timeout)
+            bounded_timeout = _bounded_timeout(
+                self._budget,
+                timeout,
+                timeout_error=httpcore.WriteTimeout,
+            )
+            self._delegate.write(buffer, timeout=bounded_timeout)
         except httpcore.WriteTimeout:
             raise httpcore.WriteTimeout("outbound write timed out") from None
         except Exception:
@@ -137,29 +184,47 @@ class _SanitizedNetworkStream(httpcore.NetworkStream):
         timeout: float | None = None,
     ) -> httpcore.NetworkStream:
         try:
+            bounded_timeout = _bounded_timeout(
+                self._budget,
+                timeout,
+                timeout_error=httpcore.ConnectTimeout,
+            )
             stream = self._delegate.start_tls(
                 ssl_context,
                 server_hostname=server_hostname,
-                timeout=timeout,
+                timeout=bounded_timeout,
             )
         except httpcore.ConnectTimeout:
             raise httpcore.ConnectTimeout("outbound TLS timed out") from None
         except Exception:
             raise httpcore.ConnectError("outbound TLS failed") from None
-        return _SanitizedNetworkStream(stream)
+        return _SanitizedNetworkStream(stream, budget=self._budget)
 
 
 class _SanitizedAsyncNetworkStream(httpcore.AsyncNetworkStream):
     """Prevent delegate exception details from reaching httpcore trace logs."""
 
-    def __init__(self, delegate: httpcore.AsyncNetworkStream) -> None:
+    def __init__(
+        self,
+        delegate: httpcore.AsyncNetworkStream,
+        *,
+        budget: TimeoutBudget | None = None,
+    ) -> None:
         self._delegate = delegate
+        self._budget = budget
 
     async def read(
         self, max_bytes: int, timeout: float | None = None
     ) -> bytes:
         try:
-            return await self._delegate.read(max_bytes, timeout=timeout)
+            bounded_timeout = _bounded_timeout(
+                self._budget,
+                timeout,
+                timeout_error=httpcore.ReadTimeout,
+            )
+            return await self._delegate.read(
+                max_bytes, timeout=bounded_timeout
+            )
         except httpcore.ReadTimeout:
             raise httpcore.ReadTimeout("outbound read timed out") from None
         except Exception:
@@ -169,7 +234,12 @@ class _SanitizedAsyncNetworkStream(httpcore.AsyncNetworkStream):
         self, buffer: bytes, timeout: float | None = None
     ) -> None:
         try:
-            await self._delegate.write(buffer, timeout=timeout)
+            bounded_timeout = _bounded_timeout(
+                self._budget,
+                timeout,
+                timeout_error=httpcore.WriteTimeout,
+            )
+            await self._delegate.write(buffer, timeout=bounded_timeout)
         except httpcore.WriteTimeout:
             raise httpcore.WriteTimeout("outbound write timed out") from None
         except Exception:
@@ -188,21 +258,32 @@ class _SanitizedAsyncNetworkStream(httpcore.AsyncNetworkStream):
         timeout: float | None = None,
     ) -> httpcore.AsyncNetworkStream:
         try:
+            bounded_timeout = _bounded_timeout(
+                self._budget,
+                timeout,
+                timeout_error=httpcore.ConnectTimeout,
+            )
             stream = await self._delegate.start_tls(
                 ssl_context,
                 server_hostname=server_hostname,
-                timeout=timeout,
+                timeout=bounded_timeout,
             )
         except httpcore.ConnectTimeout:
             raise httpcore.ConnectTimeout("outbound TLS timed out") from None
         except Exception:
             raise httpcore.ConnectError("outbound TLS failed") from None
-        return _SanitizedAsyncNetworkStream(stream)
+        return _SanitizedAsyncNetworkStream(stream, budget=self._budget)
 
 
 class _SanitizedNetworkBackend(httpcore.NetworkBackend):
-    def __init__(self, delegate: httpcore.NetworkBackend) -> None:
+    def __init__(
+        self,
+        delegate: httpcore.NetworkBackend,
+        *,
+        budget: TimeoutBudget | None = None,
+    ) -> None:
         self._delegate = delegate
+        self._budget = budget
 
     def connect_tcp(
         self,
@@ -213,10 +294,15 @@ class _SanitizedNetworkBackend(httpcore.NetworkBackend):
         socket_options: Any = None,
     ) -> httpcore.NetworkStream:
         try:
+            bounded_timeout = _bounded_timeout(
+                self._budget,
+                timeout,
+                timeout_error=httpcore.ConnectTimeout,
+            )
             stream = self._delegate.connect_tcp(
                 host,
                 port,
-                timeout=timeout,
+                timeout=bounded_timeout,
                 local_address=local_address,
                 socket_options=socket_options,
             )
@@ -224,7 +310,7 @@ class _SanitizedNetworkBackend(httpcore.NetworkBackend):
             raise httpcore.ConnectTimeout("outbound connect timed out") from None
         except Exception:
             raise httpcore.ConnectError("outbound connect failed") from None
-        return _SanitizedNetworkStream(stream)
+        return _SanitizedNetworkStream(stream, budget=self._budget)
 
     def connect_unix_socket(
         self,
@@ -239,8 +325,14 @@ class _SanitizedNetworkBackend(httpcore.NetworkBackend):
 
 
 class _SanitizedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
-    def __init__(self, delegate: httpcore.AsyncNetworkBackend) -> None:
+    def __init__(
+        self,
+        delegate: httpcore.AsyncNetworkBackend,
+        *,
+        budget: TimeoutBudget | None = None,
+    ) -> None:
         self._delegate = delegate
+        self._budget = budget
 
     async def connect_tcp(
         self,
@@ -251,10 +343,15 @@ class _SanitizedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
         socket_options: Any = None,
     ) -> httpcore.AsyncNetworkStream:
         try:
+            bounded_timeout = _bounded_timeout(
+                self._budget,
+                timeout,
+                timeout_error=httpcore.ConnectTimeout,
+            )
             stream = await self._delegate.connect_tcp(
                 host,
                 port,
-                timeout=timeout,
+                timeout=bounded_timeout,
                 local_address=local_address,
                 socket_options=socket_options,
             )
@@ -262,7 +359,7 @@ class _SanitizedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
             raise httpcore.ConnectTimeout("outbound connect timed out") from None
         except Exception:
             raise httpcore.ConnectError("outbound connect failed") from None
-        return _SanitizedAsyncNetworkStream(stream)
+        return _SanitizedAsyncNetworkStream(stream, budget=self._budget)
 
     async def connect_unix_socket(
         self,
@@ -304,6 +401,8 @@ class PinnedSyncTransport(httpx.BaseTransport):
         self,
         validated: ValidatedOutboundURL,
         network_backend: httpcore.NetworkBackend | None = None,
+        *,
+        budget: TimeoutBudget | None = None,
     ) -> None:
         delegate = (
             httpcore.SyncBackend()
@@ -315,7 +414,8 @@ class PinnedSyncTransport(httpx.BaseTransport):
             ssl_context=ssl.create_default_context(),
             retries=0,
             network_backend=_SanitizedNetworkBackend(
-                _PinnedNetworkBackend(validated, delegate)
+                _PinnedNetworkBackend(validated, delegate, budget=budget),
+                budget=budget,
             ),
         )
 
@@ -354,6 +454,8 @@ class PinnedAsyncTransport(httpx.AsyncBaseTransport):
         self,
         validated: ValidatedOutboundURL,
         network_backend: httpcore.AsyncNetworkBackend | None = None,
+        *,
+        budget: TimeoutBudget | None = None,
     ) -> None:
         delegate = (
             httpcore.AnyIOBackend()
@@ -365,7 +467,8 @@ class PinnedAsyncTransport(httpx.AsyncBaseTransport):
             ssl_context=ssl.create_default_context(),
             retries=0,
             network_backend=_SanitizedAsyncNetworkBackend(
-                _PinnedAsyncNetworkBackend(validated, delegate)
+                _PinnedAsyncNetworkBackend(validated, delegate, budget=budget),
+                budget=budget,
             ),
         )
 

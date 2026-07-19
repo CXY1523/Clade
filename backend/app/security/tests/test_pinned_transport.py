@@ -12,8 +12,20 @@ import httpx
 import pytest
 
 import app.security.pinned_transport as pinned_transport
+from app.security.deadline import DeadlineBudget
 from app.security.outbound_url import ValidatedOutboundURL
 from app.security.pinned_transport import PinnedAsyncTransport, PinnedSyncTransport
+
+
+class ManualClock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 class RecordingStream(httpcore.NetworkStream):
@@ -31,10 +43,14 @@ class RecordingStream(httpcore.NetworkStream):
         self.write_error = write_error
         self.tls_error = tls_error
         self.request_bytes = bytearray()
+        self.read_timeouts: list[float | None] = []
+        self.write_timeouts: list[float | None] = []
+        self.tls_timeouts: list[float | None] = []
         self.tls_server_names: list[str | None] = []
         self.close_count = 0
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        self.read_timeouts.append(timeout)
         if self.read_error is not None:
             raise self.read_error
         chunk = bytes(self._response[:max_bytes])
@@ -42,6 +58,7 @@ class RecordingStream(httpcore.NetworkStream):
         return chunk
 
     def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self.write_timeouts.append(timeout)
         self.request_bytes.extend(buffer)
         if self.write_error is not None:
             raise self.write_error
@@ -55,6 +72,7 @@ class RecordingStream(httpcore.NetworkStream):
         server_hostname: str | None = None,
         timeout: float | None = None,
     ) -> httpcore.NetworkStream:
+        self.tls_timeouts.append(timeout)
         self.tls_server_names.append(server_hostname)
         if self.tls_error is not None:
             raise self.tls_error
@@ -103,6 +121,39 @@ class RecordingBackend(httpcore.NetworkBackend):
         return None
 
 
+class AdvancingSyncBackend(RecordingBackend):
+    def __init__(
+        self,
+        stream: RecordingStream,
+        *,
+        clock: ManualClock,
+        advances: list[float],
+        connect_errors: list[Exception] | None = None,
+    ) -> None:
+        super().__init__(stream, connect_errors=connect_errors)
+        self.clock = clock
+        self.advances = list(advances)
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.NetworkStream:
+        try:
+            return super().connect_tcp(
+                host,
+                port,
+                timeout=timeout,
+                local_address=local_address,
+                socket_options=socket_options,
+            )
+        finally:
+            self.clock.advance(self.advances.pop(0))
+
+
 class RecordingAsyncStream(httpcore.AsyncNetworkStream):
     def __init__(
         self,
@@ -118,12 +169,16 @@ class RecordingAsyncStream(httpcore.AsyncNetworkStream):
         self.write_error = write_error
         self.tls_error = tls_error
         self.request_bytes = bytearray()
+        self.read_timeouts: list[float | None] = []
+        self.write_timeouts: list[float | None] = []
+        self.tls_timeouts: list[float | None] = []
         self.tls_server_names: list[str | None] = []
         self.close_count = 0
 
     async def read(
         self, max_bytes: int, timeout: float | None = None
     ) -> bytes:
+        self.read_timeouts.append(timeout)
         if self.read_error is not None:
             raise self.read_error
         chunk = bytes(self._response[:max_bytes])
@@ -133,6 +188,7 @@ class RecordingAsyncStream(httpcore.AsyncNetworkStream):
     async def write(
         self, buffer: bytes, timeout: float | None = None
     ) -> None:
+        self.write_timeouts.append(timeout)
         self.request_bytes.extend(buffer)
         if self.write_error is not None:
             raise self.write_error
@@ -146,6 +202,7 @@ class RecordingAsyncStream(httpcore.AsyncNetworkStream):
         server_hostname: str | None = None,
         timeout: float | None = None,
     ) -> httpcore.AsyncNetworkStream:
+        self.tls_timeouts.append(timeout)
         self.tls_server_names.append(server_hostname)
         if self.tls_error is not None:
             raise self.tls_error
@@ -192,6 +249,39 @@ class RecordingAsyncBackend(httpcore.AsyncNetworkBackend):
 
     async def sleep(self, seconds: float) -> None:
         return None
+
+
+class AdvancingAsyncBackend(RecordingAsyncBackend):
+    def __init__(
+        self,
+        stream: RecordingAsyncStream,
+        *,
+        clock: ManualClock,
+        advances: list[float],
+        connect_errors: list[Exception] | None = None,
+    ) -> None:
+        super().__init__(stream, connect_errors=connect_errors)
+        self.clock = clock
+        self.advances = list(advances)
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        try:
+            return await super().connect_tcp(
+                host,
+                port,
+                timeout=timeout,
+                local_address=local_address,
+                socket_options=socket_options,
+            )
+        finally:
+            self.clock.advance(self.advances.pop(0))
 
 
 class RecordingResponseStream:
@@ -289,6 +379,133 @@ def test_sync_transport_tries_only_approved_ips_in_order() -> None:
         "93.184.216.34",
         "8.8.8.8",
     ]
+
+
+def test_sync_approved_ips_share_one_connect_budget() -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(5.0, clock=clock)
+    backend = AdvancingSyncBackend(
+        RecordingStream(),
+        clock=clock,
+        advances=[4.0, 0.0],
+        connect_errors=[httpcore.ConnectError("first IP failed")],
+    )
+    transport = PinnedSyncTransport(
+        _validated("93.184.216.34", "192.0.2.2"),
+        backend,
+        budget=budget,
+    )
+
+    response = transport.handle_request(_request())
+    _close_response_and_transport(response, transport)
+
+    assert [call[2] for call in backend.connect_calls] == [
+        pytest.approx(5.0),
+        pytest.approx(1.0),
+    ]
+
+
+def test_sync_budget_clamps_connect_tls_write_and_read() -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(10.0, clock=clock)
+    stream = RecordingStream()
+    backend = RecordingBackend(stream)
+    transport = PinnedSyncTransport(
+        _validated("93.184.216.34"), backend, budget=budget
+    )
+    network_backend = transport._pool._network_backend
+    tls_stream: httpcore.NetworkStream | None = None
+
+    try:
+        network_stream = network_backend.connect_tcp(
+            "public.example", 443, timeout=30.0
+        )
+        clock.advance(2.0)
+        tls_stream = network_stream.start_tls(
+            ssl.create_default_context(),
+            server_hostname="public.example",
+            timeout=30.0,
+        )
+        clock.advance(3.0)
+        tls_stream.write(b"request", timeout=30.0)
+        clock.advance(4.0)
+        tls_stream.read(1, timeout=30.0)
+    finally:
+        if tls_stream is not None:
+            tls_stream.close()
+        transport.close()
+
+    assert [call[2] for call in backend.connect_calls] == [pytest.approx(10.0)]
+    assert stream.tls_timeouts == [pytest.approx(8.0)]
+    assert stream.write_timeouts == [pytest.approx(5.0)]
+    assert stream.read_timeouts == [pytest.approx(1.0)]
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_type", "expected_message"),
+    [
+        ("connect", httpcore.ConnectTimeout, "outbound connect timed out"),
+        ("tls", httpcore.ConnectTimeout, "outbound TLS timed out"),
+        ("write", httpcore.WriteTimeout, "outbound write timed out"),
+        ("read", httpcore.ReadTimeout, "outbound read timed out"),
+    ],
+)
+def test_sync_budget_expiry_maps_to_sanitized_phase_timeout(
+    stage: str,
+    expected_type: type[Exception],
+    expected_message: str,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(5.0, clock=clock)
+    stream = RecordingStream()
+    backend = RecordingBackend(stream)
+    transport = PinnedSyncTransport(
+        _validated("93.184.216.34"), backend, budget=budget
+    )
+    network_backend = transport._pool._network_backend
+    network_stream: httpcore.NetworkStream | None = None
+
+    try:
+        if stage == "connect":
+            clock.advance(5.0)
+        else:
+            network_stream = network_backend.connect_tcp(
+                "public.example", 443, timeout=30.0
+            )
+            clock.advance(5.0)
+
+        with pytest.raises(expected_type) as exc_info:
+            if stage == "connect":
+                network_backend.connect_tcp(
+                    "public.example", 443, timeout=30.0
+                )
+            elif stage == "tls":
+                assert network_stream is not None
+                network_stream.start_tls(
+                    ssl.create_default_context(),
+                    server_hostname="public.example",
+                    timeout=30.0,
+                )
+            elif stage == "write":
+                assert network_stream is not None
+                network_stream.write(b"request", timeout=30.0)
+            else:
+                assert network_stream is not None
+                network_stream.read(1, timeout=30.0)
+    finally:
+        if network_stream is not None:
+            network_stream.close()
+        transport.close()
+
+    assert str(exc_info.value) == expected_message
+    if stage == "connect":
+        assert backend.connect_calls == []
+    elif stage == "tls":
+        assert stream.tls_timeouts == []
+    elif stage == "write":
+        assert stream.write_timeouts == []
+    else:
+        assert stream.read_timeouts == []
 
 
 @pytest.mark.parametrize(
@@ -504,6 +721,137 @@ async def test_async_transport_tries_only_approved_ips_in_order() -> None:
         "93.184.216.34",
         "8.8.8.8",
     ]
+
+
+@pytest.mark.asyncio
+async def test_async_does_not_try_next_ip_after_budget_expires() -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(5.0, clock=clock)
+    backend = AdvancingAsyncBackend(
+        RecordingAsyncStream(),
+        clock=clock,
+        advances=[5.0],
+        connect_errors=[httpcore.ConnectError("first IP failed")],
+    )
+    transport = PinnedAsyncTransport(
+        _validated("93.184.216.34", "192.0.2.2"),
+        backend,
+        budget=budget,
+    )
+
+    try:
+        with pytest.raises(httpcore.ConnectTimeout) as exc_info:
+            await transport.handle_async_request(_request())
+    finally:
+        await transport.aclose()
+
+    assert str(exc_info.value) == "outbound connect timed out"
+    assert [call[0] for call in backend.connect_calls] == ["93.184.216.34"]
+
+
+@pytest.mark.asyncio
+async def test_async_budget_clamps_connect_tls_write_and_read() -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(10.0, clock=clock)
+    stream = RecordingAsyncStream()
+    backend = RecordingAsyncBackend(stream)
+    transport = PinnedAsyncTransport(
+        _validated("93.184.216.34"), backend, budget=budget
+    )
+    network_backend = transport._pool._network_backend
+    tls_stream: httpcore.AsyncNetworkStream | None = None
+
+    try:
+        network_stream = await network_backend.connect_tcp(
+            "public.example", 443, timeout=30.0
+        )
+        clock.advance(2.0)
+        tls_stream = await network_stream.start_tls(
+            ssl.create_default_context(),
+            server_hostname="public.example",
+            timeout=30.0,
+        )
+        clock.advance(3.0)
+        await tls_stream.write(b"request", timeout=30.0)
+        clock.advance(4.0)
+        await tls_stream.read(1, timeout=30.0)
+    finally:
+        if tls_stream is not None:
+            await tls_stream.aclose()
+        await transport.aclose()
+
+    assert [call[2] for call in backend.connect_calls] == [pytest.approx(10.0)]
+    assert stream.tls_timeouts == [pytest.approx(8.0)]
+    assert stream.write_timeouts == [pytest.approx(5.0)]
+    assert stream.read_timeouts == [pytest.approx(1.0)]
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_type", "expected_message"),
+    [
+        ("connect", httpcore.ConnectTimeout, "outbound connect timed out"),
+        ("tls", httpcore.ConnectTimeout, "outbound TLS timed out"),
+        ("write", httpcore.WriteTimeout, "outbound write timed out"),
+        ("read", httpcore.ReadTimeout, "outbound read timed out"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_async_budget_expiry_maps_to_sanitized_phase_timeout(
+    stage: str,
+    expected_type: type[Exception],
+    expected_message: str,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(5.0, clock=clock)
+    stream = RecordingAsyncStream()
+    backend = RecordingAsyncBackend(stream)
+    transport = PinnedAsyncTransport(
+        _validated("93.184.216.34"), backend, budget=budget
+    )
+    network_backend = transport._pool._network_backend
+    network_stream: httpcore.AsyncNetworkStream | None = None
+
+    try:
+        if stage == "connect":
+            clock.advance(5.0)
+        else:
+            network_stream = await network_backend.connect_tcp(
+                "public.example", 443, timeout=30.0
+            )
+            clock.advance(5.0)
+
+        with pytest.raises(expected_type) as exc_info:
+            if stage == "connect":
+                await network_backend.connect_tcp(
+                    "public.example", 443, timeout=30.0
+                )
+            elif stage == "tls":
+                assert network_stream is not None
+                await network_stream.start_tls(
+                    ssl.create_default_context(),
+                    server_hostname="public.example",
+                    timeout=30.0,
+                )
+            elif stage == "write":
+                assert network_stream is not None
+                await network_stream.write(b"request", timeout=30.0)
+            else:
+                assert network_stream is not None
+                await network_stream.read(1, timeout=30.0)
+    finally:
+        if network_stream is not None:
+            await network_stream.aclose()
+        await transport.aclose()
+
+    assert str(exc_info.value) == expected_message
+    if stage == "connect":
+        assert backend.connect_calls == []
+    elif stage == "tls":
+        assert stream.tls_timeouts == []
+    elif stage == "write":
+        assert stream.write_timeouts == []
+    else:
+        assert stream.read_timeouts == []
 
 
 @pytest.mark.asyncio
