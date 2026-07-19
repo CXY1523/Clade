@@ -179,8 +179,7 @@ class RecordingSafeRuntimeClient:
         headers: dict[str, str],
         json_body: dict[str, Any],
         allow_local: bool,
-        read_timeout: float,
-        budget: DeadlineBudget | None = None,
+        budget: DeadlineBudget,
         max_bytes: int,
     ) -> dict[str, Any]:
         self._record(
@@ -190,7 +189,6 @@ class RecordingSafeRuntimeClient:
             headers=headers,
             json_body=json_body,
             allow_local=allow_local,
-            read_timeout=read_timeout,
             budget=budget,
             max_bytes=max_bytes,
         )
@@ -206,8 +204,7 @@ class RecordingSafeRuntimeClient:
         headers: dict[str, str],
         json_body: dict[str, Any],
         allow_local: bool,
-        read_timeout: float,
-        budget: DeadlineBudget | None = None,
+        budget: DeadlineBudget,
         max_bytes: int,
     ) -> dict[str, Any]:
         self._record(
@@ -217,7 +214,6 @@ class RecordingSafeRuntimeClient:
             headers=headers,
             json_body=json_body,
             allow_local=allow_local,
-            read_timeout=read_timeout,
             budget=budget,
             max_bytes=max_bytes,
         )
@@ -292,8 +288,7 @@ class AdvancingRuntimeClient(RecordingSafeRuntimeClient):
         headers: dict[str, str],
         json_body: dict[str, Any],
         allow_local: bool,
-        read_timeout: float,
-        budget: DeadlineBudget | None = None,
+        budget: DeadlineBudget,
         max_bytes: int,
     ) -> dict[str, Any]:
         self._record(
@@ -303,7 +298,6 @@ class AdvancingRuntimeClient(RecordingSafeRuntimeClient):
             headers=headers,
             json_body=json_body,
             allow_local=allow_local,
-            read_timeout=read_timeout,
             budget=budget,
             max_bytes=max_bytes,
         )
@@ -454,7 +448,8 @@ def _assert_json_call(
     assert call["base_url"] == base_url
     assert call["request_target"] == request_target
     assert call["provider_type"] == provider_type
-    assert call["read_timeout"] == timeout
+    assert isinstance(call["budget"], DeadlineBudget)
+    assert 0 < call["budget"].remaining() <= timeout
     assert call["max_bytes"] == AI_JSON_MAX_BYTES
     assert call["allow_local"] is allow_local
 

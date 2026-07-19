@@ -11,7 +11,11 @@ from typing import Any, Callable
 import httpx
 import pytest
 
-from app.security import EMBEDDING_JSON_MAX_BYTES, OutboundRequestError
+from app.security import (
+    EMBEDDING_JSON_MAX_BYTES,
+    DeadlineBudget,
+    OutboundRequestError,
+)
 from app.services.system import embedding as embedding_module
 from app.services.system.embedding import EmbeddingService
 
@@ -164,6 +168,36 @@ class RecordingSafeRuntimeClient:
         return result
 
 
+class ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class AdvancingSafeRuntimeClient(RecordingSafeRuntimeClient):
+    def __init__(
+        self,
+        clock: ManualClock,
+        outcomes: list[tuple[float, dict[str, Any] | BaseException]],
+    ) -> None:
+        super().__init__([])
+        self._clock = clock
+        self._outcomes = outcomes
+
+    def post_json(self, base_url: str, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append({"base_url": base_url, **kwargs})
+        advance, outcome = self._outcomes.pop(0)
+        self._clock.advance(advance)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
 def remote_service(client: RecordingSafeRuntimeClient) -> EmbeddingService:
     return EmbeddingService(
         base_url="https://embedding.example/v1/",
@@ -195,6 +229,127 @@ def _timeout_errors(count: int = 3) -> list[OutboundRequestError]:
     ]
 
 
+def test_embedding_chunk_retries_share_one_total_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(6.0, clock=clock)
+    client = AdvancingSafeRuntimeClient(
+        clock,
+        outcomes=[
+            (
+                4.0,
+                OutboundRequestError(
+                    "outbound_timeout", 504, "外部服务请求超时"
+                ),
+            ),
+            (
+                2.0,
+                OutboundRequestError(
+                    "outbound_timeout", 504, "外部服务请求超时"
+                ),
+            ),
+        ],
+    )
+    service = remote_service(client)
+    monkeypatch.setattr(
+        embedding_module.time,
+        "sleep",
+        lambda seconds: clock.advance(seconds),
+    )
+
+    result = service._request_embedding_chunk_result(
+        ["oak"], require_real=False, budget=budget
+    )
+
+    assert result.items[0].source == "remote_fallback_fake"
+    assert result.items[0].cacheable is False
+    assert len(client.calls) == 2
+    assert all(call["budget"] is budget for call in client.calls)
+
+
+def test_embedding_expired_budget_never_starts_another_retry() -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(3.0, clock=clock)
+    client = AdvancingSafeRuntimeClient(
+        clock,
+        outcomes=[
+            (
+                3.0,
+                OutboundRequestError(
+                    "outbound_timeout", 504, "外部服务请求超时"
+                ),
+            ),
+        ],
+    )
+    service = remote_service(client)
+
+    with pytest.raises(RuntimeError, match="外部服务请求超时"):
+        service._request_embedding_chunk_result(
+            ["oak"], require_real=True, budget=budget
+        )
+
+    assert len(client.calls) == 1
+
+
+def test_embedding_backoff_cannot_start_retry_at_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(4.0, clock=clock)
+    client = AdvancingSafeRuntimeClient(
+        clock,
+        outcomes=[
+            (
+                3.0,
+                OutboundRequestError(
+                    "outbound_timeout", 504, "外部服务请求超时"
+                ),
+            ),
+        ],
+    )
+    service = remote_service(client)
+    monkeypatch.setattr(
+        embedding_module.time,
+        "sleep",
+        lambda seconds: clock.advance(seconds),
+    )
+
+    result = service._request_embedding_chunk_result(
+        ["oak"], require_real=False, budget=budget
+    )
+
+    assert result.items[0].source == "remote_fallback_fake"
+    assert result.items[0].cacheable is False
+    assert len(client.calls) == 1
+
+
+def test_embedding_chunk_budget_starts_before_config_and_payload_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_started_at = embedding_module.time.monotonic()
+    clock = ManualClock()
+    clock.now = expected_started_at
+    client = RecordingSafeRuntimeClient(
+        [{"data": [{"index": 0, "embedding": [1.0]}]}]
+    )
+    service = remote_service(client)
+    real_snapshot = service._runtime_config_snapshot
+
+    def advancing_snapshot() -> Any:
+        clock.advance(4.0)
+        return real_snapshot()
+
+    monkeypatch.setattr(embedding_module.time, "monotonic", clock)
+    monkeypatch.setattr(service, "_runtime_config_snapshot", advancing_snapshot)
+
+    assert service._request_embedding_chunk(["oak"], True) == [[1.0]]
+
+    budget = client.calls[0]["budget"]
+    assert isinstance(budget, DeadlineBudget)
+    assert budget.deadline == expected_started_at + 23.0
+
+
 def test_embedding_request_uses_safe_client_and_preserves_payload() -> None:
     client = RecordingSafeRuntimeClient(
         [{"data": [{"index": 1, "embedding": [2.0]}, {"index": 0, "embedding": [1.0]}]}]
@@ -202,15 +357,17 @@ def test_embedding_request_uses_safe_client_and_preserves_payload() -> None:
 
     assert remote_service(client)._request_embedding_chunk(["x" * 2001, "oak"], True) == [[1.0], [2.0]]
 
-    assert client.calls == [{
+    call = client.calls[0]
+    assert isinstance(call["budget"], DeadlineBudget)
+    assert 0 < call["budget"].remaining() <= 23
+    assert {key: value for key, value in call.items() if key != "budget"} == {
         "base_url": "https://embedding.example/v1/",
         "request_target": "/embeddings",
         "headers": {"Authorization": "Bearer secret-key"},
         "json_body": {"model": "text-embedding-3-small", "input": ["x" * 2000 + "...", "oak"]},
         "allow_local": True,
-        "read_timeout": 23,
         "max_bytes": EMBEDDING_JSON_MAX_BYTES,
-    }]
+    }
 
 
 @pytest.mark.parametrize("payload", [
@@ -341,14 +498,18 @@ def test_chunk_snapshots_complete_provider_config_across_retries(
     assert service._request_embedding_chunk(["first"], True) == [[1.0]]
     assert service._request_embedding_chunk(["second"], True) == [[2.0]]
 
-    assert client.calls == [
+    assert client.calls[0]["budget"] is client.calls[1]["budget"]
+    assert client.calls[2]["budget"] is not client.calls[0]["budget"]
+    assert [
+        {key: value for key, value in call.items() if key != "budget"}
+        for call in client.calls
+    ] == [
         {
             "base_url": "https://provider-a.example/v1",
             "request_target": "/embeddings",
             "headers": {"Authorization": "Bearer key-a"},
             "json_body": {"model": "model-a", "input": ["first"]},
             "allow_local": True,
-            "read_timeout": 11,
             "max_bytes": EMBEDDING_JSON_MAX_BYTES,
         },
         {
@@ -357,7 +518,6 @@ def test_chunk_snapshots_complete_provider_config_across_retries(
             "headers": {"Authorization": "Bearer key-a"},
             "json_body": {"model": "model-a", "input": ["first"]},
             "allow_local": True,
-            "read_timeout": 11,
             "max_bytes": EMBEDDING_JSON_MAX_BYTES,
         },
         {
@@ -366,7 +526,6 @@ def test_chunk_snapshots_complete_provider_config_across_retries(
             "headers": {"Authorization": "Bearer key-b"},
             "json_body": {"model": "model-b", "input": ["second"]},
             "allow_local": False,
-            "read_timeout": 29,
             "max_bytes": EMBEDDING_JSON_MAX_BYTES,
         },
     ]

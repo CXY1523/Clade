@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import threading
 from collections.abc import Mapping
@@ -460,17 +461,16 @@ async def _invoke(
     headers: Mapping[str, str] | None = None,
     json_body: Mapping[str, Any] | None = None,
     allow_local: bool = False,
-    read_timeout: float | None = 7.5,
     budget: DeadlineBudget | None = None,
     max_bytes: int = AI_JSON_MAX_BYTES,
 ) -> dict[str, Any]:
+    effective_budget = budget or DeadlineBudget.from_timeout(7.5)
     kwargs = {
         "request_target": request_target,
         "headers": {} if headers is None else headers,
         "json_body": {"request": True} if json_body is None else json_body,
         "allow_local": allow_local,
-        "read_timeout": read_timeout,
-        "budget": budget,
+        "budget": effective_budget,
         "max_bytes": max_bytes,
     }
     if mode == "sync":
@@ -498,7 +498,6 @@ async def test_normal_budget_spans_dns_connect_and_complete_body(
             mode,
             client,
             budget=budget,
-            read_timeout=None,
         )
 
     assert exc_info.value.code == "outbound_timeout"
@@ -530,7 +529,7 @@ async def test_normal_budget_spans_json_parse(
     monkeypatch.setattr(runtime_http, "_parse_json_object", advancing_parse)
 
     with pytest.raises(OutboundRequestError) as exc_info:
-        await _invoke(mode, client, budget=budget, read_timeout=None)
+        await _invoke(mode, client, budget=budget)
 
     assert exc_info.value.code == "outbound_timeout"
     assert stream.close_count == 1
@@ -575,7 +574,7 @@ async def test_normal_budget_spans_cleanup(
     client, _, _ = _runtime_client(mode, stream, policy=policy)
 
     with pytest.raises(OutboundRequestError) as exc_info:
-        await _invoke(mode, client, budget=budget, read_timeout=None)
+        await _invoke(mode, client, budget=budget)
 
     assert exc_info.value.code == "outbound_timeout"
     assert stream.close_count == 1
@@ -602,7 +601,6 @@ def test_sync_blocking_dns_timeout_is_bounded_by_normal_budget() -> None:
                 headers={"Authorization": "Bearer test-sentinel"},
                 json_body={"model": "test", "messages": []},
                 allow_local=False,
-                read_timeout=None,
                 budget=DeadlineBudget.from_timeout(0.02),
                 max_bytes=1024,
             )
@@ -642,7 +640,6 @@ async def test_async_blocking_dns_timeout_does_not_block_other_task() -> None:
                 headers={"Authorization": "Bearer test-sentinel"},
                 json_body={"model": "test", "messages": []},
                 allow_local=False,
-                read_timeout=None,
                 budget=DeadlineBudget.from_timeout(0.02),
                 max_bytes=1024,
             )
@@ -656,7 +653,7 @@ async def test_async_blocking_dns_timeout_does_not_block_other_task() -> None:
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
 @pytest.mark.asyncio
-async def test_caller_budget_wins_over_transitional_read_timeout(
+async def test_expired_caller_budget_stops_before_network(
     mode: Mode,
 ) -> None:
     clock = ManualClock()
@@ -666,12 +663,7 @@ async def test_caller_budget_wins_over_transitional_read_timeout(
     client, policy, backend = _runtime_client(mode, stream)
 
     with pytest.raises(OutboundRequestError) as exc_info:
-        await _invoke(
-            mode,
-            client,
-            budget=budget,
-            read_timeout=60.0,
-        )
+        await _invoke(mode, client, budget=budget)
 
     assert exc_info.value.code == "outbound_timeout"
     assert policy.calls == []
@@ -944,6 +936,13 @@ def test_public_runtime_contract_is_exported() -> None:
         "SafeRuntimeClient",
     ):
         assert getattr(security, name) is getattr(runtime_http, name)
+
+
+def test_normal_json_api_requires_caller_budget() -> None:
+    for method in (SafeRuntimeClient.post_json, SafeRuntimeClient.apost_json):
+        parameters = inspect.signature(method).parameters
+        assert "read_timeout" not in parameters
+        assert parameters["budget"].default is inspect.Parameter.empty
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
@@ -1500,7 +1499,7 @@ async def test_client_cleans_headers_and_disables_env_and_redirects(
             "aCcEpT-eNcOdInG": "gzip",
             "Authorization": "Bearer caller-header-secret",
         },
-        read_timeout=9.25,
+        budget=DeadlineBudget.from_timeout(9.25),
     )
 
     assert result == {"ok": True}

@@ -390,20 +390,6 @@ class SafeRuntimeClient:
         self._async_network_backend = async_network_backend
         self._timeouts = timeouts
 
-    @staticmethod
-    def _normal_budget(
-        budget: DeadlineBudget | None,
-        read_timeout: float | None,
-    ) -> DeadlineBudget:
-        if budget is not None:
-            return budget
-        if read_timeout is None:
-            raise _invalid_url()
-        try:
-            return DeadlineBudget.from_timeout(read_timeout)
-        except ValueError:
-            raise _invalid_url() from None
-
     def _httpx_timeout(self, budget: DeadlineBudget) -> httpx.Timeout:
         return httpx.Timeout(
             connect=budget.phase_timeout(self._timeouts.connect),
@@ -420,11 +406,10 @@ class SafeRuntimeClient:
         headers: Mapping[str, str],
         json_body: Mapping[str, Any],
         allow_local: bool,
-        read_timeout: float | None = None,
-        budget: DeadlineBudget | None = None,
+        budget: DeadlineBudget,
         max_bytes: int = AI_JSON_MAX_BYTES,
     ) -> dict[str, Any]:
-        effective_budget = self._normal_budget(budget, read_timeout)
+        effective_budget = budget
         try:
             return self._runner.run(
                 lambda: self._post_json_impl(
@@ -560,11 +545,10 @@ class SafeRuntimeClient:
         headers: Mapping[str, str],
         json_body: Mapping[str, Any],
         allow_local: bool,
-        read_timeout: float | None = None,
-        budget: DeadlineBudget | None = None,
+        budget: DeadlineBudget,
         max_bytes: int = AI_JSON_MAX_BYTES,
     ) -> dict[str, Any]:
-        effective_budget = self._normal_budget(budget, read_timeout)
+        effective_budget = budget
         token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(True)
         try:
             validated = await self._runner.arun(

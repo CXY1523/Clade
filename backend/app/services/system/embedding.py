@@ -45,6 +45,8 @@ from ...core.config import get_settings
 from ...security import (
     EMBEDDING_JSON_MAX_BYTES,
     RETRYABLE_OUTBOUND_CODES,
+    DeadlineBudget,
+    DeadlineExpired,
     OutboundRequestError,
     SafeRuntimeClient,
     canonicalize_outbound_base_url,
@@ -612,9 +614,15 @@ class EmbeddingService:
         require_real: bool,
         max_retries: int = 3,
         runtime_config: _EmbeddingRuntimeConfig | None = None,
+        budget: DeadlineBudget | None = None,
     ) -> _EmbeddingGenerationResult:
         """Request one embedding chunk through the guarded runtime client."""
+        started_at = time.monotonic()
         config = runtime_config or self._runtime_config_snapshot()
+        effective_budget = budget or DeadlineBudget.from_timeout(
+            config.timeout,
+            started_at=started_at,
+        )
         headers = {"Authorization": f"Bearer {config.api_key}"}
         max_text_length = 2000
         truncated_texts = [
@@ -623,7 +631,36 @@ class EmbeddingService:
         ]
         body = {"model": config.model, "input": truncated_texts}
 
+        def timeout_error() -> OutboundRequestError:
+            return OutboundRequestError(
+                "outbound_timeout",
+                504,
+                "外部服务请求超时",
+            )
+
+        def availability_terminal(
+            exc: OutboundRequestError,
+        ) -> _EmbeddingGenerationResult:
+            if require_real or not config.allow_fake_embeddings:
+                raise RuntimeError(exc.public_message) from None
+            logger.warning("[Embedding] availability exhausted; using fake vectors")
+            vectors = [self._fake_embed(text) for text in batch_texts]
+            with self._stats_lock:
+                self._stats["fake_embeds"] += len(batch_texts)
+            return _EmbeddingGenerationResult(tuple(
+                _GeneratedEmbedding(
+                    vector=vector,
+                    cacheable=False,
+                    source=_CACHE_SOURCE_REMOTE_FALLBACK_FAKE,
+                )
+                for vector in vectors
+            ))
+
         for attempt in range(max_retries):
+            try:
+                effective_budget.phase_timeout()
+            except DeadlineExpired:
+                return availability_terminal(timeout_error())
             try:
                 data = self._runtime_client.post_json(
                     config.api_base_url,
@@ -631,7 +668,7 @@ class EmbeddingService:
                     headers=headers,
                     json_body=body,
                     allow_local=config.allow_local_ai_endpoints,
-                    read_timeout=config.timeout,
+                    budget=effective_budget,
                     max_bytes=EMBEDDING_JSON_MAX_BYTES,
                 )
                 batch_vectors = self._parse_embedding_response(data, len(batch_texts))
@@ -649,28 +686,22 @@ class EmbeddingService:
                 if exc.code not in RETRYABLE_OUTBOUND_CODES:
                     logger.warning("[Embedding] blocked error_code=%s", exc.code)
                     raise RuntimeError(exc.public_message) from None
+                remaining = effective_budget.remaining()
+                if remaining <= 0:
+                    return availability_terminal(timeout_error())
                 if attempt == max_retries - 1:
-                    if require_real or not config.allow_fake_embeddings:
-                        raise RuntimeError(exc.public_message) from None
-                    logger.warning("[Embedding] availability exhausted; using fake vectors")
-                    vectors = [self._fake_embed(text) for text in batch_texts]
-                    with self._stats_lock:
-                        self._stats["fake_embeds"] += len(batch_texts)
-                    return _EmbeddingGenerationResult(tuple(
-                        _GeneratedEmbedding(
-                            vector=vector,
-                            cacheable=False,
-                            source=_CACHE_SOURCE_REMOTE_FALLBACK_FAKE,
-                        )
-                        for vector in vectors
-                    ))
+                    return availability_terminal(exc)
                 logger.warning(
                     "[Embedding] retryable error_code=%s retry=%s/%s",
                     exc.code,
                     attempt + 1,
                     max_retries,
                 )
-                time.sleep(2 ** attempt)
+                time.sleep(min(2 ** attempt, remaining))
+                try:
+                    effective_budget.phase_timeout()
+                except DeadlineExpired:
+                    return availability_terminal(timeout_error())
             except Exception:
                 logger.error("[Embedding] unexpected request failure")
                 raise RuntimeError("Embedding API 调用失败") from None

@@ -711,7 +711,6 @@ class ModelRouter:
                 headers=req["headers"],
                 json_body=req["body"],
                 allow_local=allow_local,
-                read_timeout=req["timeout"],
                 budget=effective_budget,
                 max_bytes=AI_JSON_MAX_BYTES,
             )
@@ -801,7 +800,6 @@ class ModelRouter:
                         headers=headers,
                         json_body=req["body"],
                         allow_local=allow_local,
-                        read_timeout=timeout,
                         budget=effective_budget,
                         max_bytes=AI_JSON_MAX_BYTES,
                     )
@@ -1334,7 +1332,6 @@ class ModelRouter:
                 headers=headers,
                 json_body=body,
                 allow_local=allow_local,
-                read_timeout=timeout,
                 budget=effective_budget,
                 max_bytes=AI_JSON_MAX_BYTES,
             )
@@ -1508,7 +1505,6 @@ class ModelRouter:
                 headers=headers,
                 json_body=body,
                 allow_local=allow_local,
-                read_timeout=timeout_value,
                 budget=effective_budget,
                 max_bytes=AI_JSON_MAX_BYTES,
             )
@@ -1691,7 +1687,6 @@ class ModelRouter:
                 headers=headers,
                 json_body=body,
                 allow_local=allow_local,
-                read_timeout=timeout_value,
                 budget=effective_budget,
                 max_bytes=AI_JSON_MAX_BYTES,
             )
