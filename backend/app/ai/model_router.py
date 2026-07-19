@@ -2554,7 +2554,6 @@ async def staggered_gather(
     interval: float = 2.0,
     max_concurrent: int = 10,  # 【提升】默认并发从 3 提升到 10
     task_name: str = "任务",
-    task_timeout: float = 90.0,  # 【新增】单任务超时
     event_callback: Callable[[str, str, str], None] | None = None,  # 【新增】心跳回调
 ) -> list:
     """
@@ -2565,7 +2564,6 @@ async def staggered_gather(
         interval: 每个任务启动的间隔秒数
         max_concurrent: 最大同时执行的任务数
         task_name: 任务名称（用于日志）
-        task_timeout: 单个任务的超时时间（秒）
         event_callback: 事件回调函数，签名 (event_type, message, category)
     
     Returns:
@@ -2602,19 +2600,12 @@ async def staggered_gather(
             logger.debug(f"[间隔并行] {task_name} {idx + 1}/{len(coroutines)} 开始执行")
             emit_event("ai_parallel_task_start", f"🚀 {task_name} {idx + 1}/{len(coroutines)} 开始", "AI")
             try:
-                # 【关键修复】为每个任务添加超时保护
-                result = await asyncio.wait_for(coro, timeout=task_timeout)
+                result = await coro
                 results[idx] = result
                 completed_count += 1
                 elapsed = time.time() - start_time
                 logger.debug(f"[间隔并行] {task_name} {idx + 1}/{len(coroutines)} 完成 (耗时{elapsed:.1f}s)")
                 emit_event("ai_parallel_task_complete", f"✅ {task_name} {idx + 1}/{len(coroutines)} 完成 ({completed_count}/{len(coroutines)})", "AI")
-            except asyncio.TimeoutError:
-                elapsed = time.time() - start_time
-                logger.error(f"[间隔并行] ⏱️ {task_name} {idx + 1}/{len(coroutines)} 超时 (超过{task_timeout}s，实际{elapsed:.1f}s)")
-                results[idx] = TimeoutError(f"{task_name} {idx + 1} 超时")
-                completed_count += 1
-                emit_event("ai_parallel_task_timeout", f"⏱️ {task_name} {idx + 1}/{len(coroutines)} 超时 ({completed_count}/{len(coroutines)})", "AI")
             except Exception as e:
                 elapsed = time.time() - start_time
                 logger.warning(f"[间隔并行] {task_name} {idx + 1}/{len(coroutines)} 失败 (耗时{elapsed:.1f}s): {e}")
@@ -2630,7 +2621,7 @@ async def staggered_gather(
     
     # 发送开始事件
     emit_event("ai_parallel_batch_start", f"🔄 开始 {len(coroutines)} 个{task_name}（并发{max_concurrent}）", "AI")
-    logger.info(f"[间隔并行] 开始执行 {len(coroutines)} 个{task_name}（间隔{interval}s，最大并发{max_concurrent}，单任务超时{task_timeout}s）")
+    logger.info(f"[间隔并行] 开始执行 {len(coroutines)} 个{task_name}（间隔{interval}s，最大并发{max_concurrent}）")
     
     # 【新增】心跳任务：定期发送进度
     heartbeat_task = None

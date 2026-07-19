@@ -2211,12 +2211,11 @@ class SpeciationService:
                 capability="speciation",
                 payload=payload,
                 task_name="单物种分化",
-                timeout=90,
                 heartbeat_interval=2.0,
                 event_callback=heartbeat_callback if stream_callback else None,
             )
         except asyncio.TimeoutError:
-            logger.error("[分化] 单个请求超时（90秒）")
+            logger.error("[分化] 单个请求超时")
             return {}
         except Exception as e:
             logger.error(f"[分化] 请求异常: {e}")
@@ -6643,7 +6642,6 @@ class SpeciationService:
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 task_name=f"内共生[{host.common_name}+{symbiont.common_name}]",
-                timeout=45
             )
             
             # 【修复】正确解析响应
