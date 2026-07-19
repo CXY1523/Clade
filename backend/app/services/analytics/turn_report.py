@@ -1212,7 +1212,19 @@ class TurnReportService:
         try:
             if self.report_builder is not None:
                 self._emit_event("info", "🤖 调用 AI 生成回合叙事...", "报告")
-                
+
+                stream_terminal_failed = False
+
+                def forward_report_event(
+                    event_type: str,
+                    message: str,
+                    category: str,
+                ) -> None:
+                    nonlocal stream_terminal_failed
+                    if event_type in {"ai_stream_interrupted", "ai_stream_error"}:
+                        stream_terminal_failed = True
+                    self._emit_event(event_type, message, category)
+
                 narrative = await self.report_builder.build_turn_narrative_async(
                     species=species_snapshots,
                     pressures=pressures or [],
@@ -1223,11 +1235,12 @@ class TurnReportService:
                     migration_events=migration_events,
                     branching_events=branching_events,
                     stream_callback=stream_callback,
-                    event_callback=self._emit_event,
+                    event_callback=forward_report_event,
                 )
-                
+
                 if narrative and len(narrative) > 50:
-                    self._emit_event("info", "✅ AI 叙事生成完成", "报告")
+                    if not stream_terminal_failed:
+                        self._emit_event("info", "✅ AI 叙事生成完成", "报告")
                 else:
                     self._emit_event("warning", "⚠️ AI 叙事过短，使用简单模式", "报告")
                     narrative = ""

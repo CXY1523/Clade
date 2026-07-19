@@ -135,6 +135,7 @@ async def test_v2_displays_partial_stream_but_returns_complete_fallback() -> Non
 class EventEmittingReportBuilder:
     def __init__(self) -> None:
         self.event_callback: Callable[[str, str, str], None] | None = None
+        self.fallback = "完整规则备用报告：" + "z" * 60
 
     async def build_turn_narrative_async(self, **kwargs: Any) -> str:
         self.event_callback = kwargs.get("event_callback")
@@ -144,7 +145,7 @@ class EventEmittingReportBuilder:
             "回合报告 interrupted",
             "AI",
         )
-        return "完整报告：" + "z" * 60
+        return self.fallback
 
 
 @pytest.mark.asyncio
@@ -177,11 +178,59 @@ async def test_turn_report_service_bridges_builder_events(monkeypatch, tmp_path)
         all_species=[],
     )
 
-    assert report.narrative.startswith("完整报告：")
+    assert report.narrative == builder.fallback
     assert builder.event_callback is not None
     assert [event for event in events if event[0] == "ai_stream_interrupted"] == [
         ("ai_stream_interrupted", "回合报告 interrupted", "AI")
     ]
+    assert all(event_type != "ai_stream_complete" for event_type, _, _ in events)
+    assert all(message != "✅ AI 叙事生成完成" for _, message, _ in events)
+
+
+class SuccessfulReportBuilder:
+    def __init__(self, terminal_event: str | None) -> None:
+        self.terminal_event = terminal_event
+        self.narrative = "完整 AI 报告：" + "a" * 60
+
+    async def build_turn_narrative_async(self, **kwargs: Any) -> str:
+        if self.terminal_event is not None:
+            event_callback = kwargs.get("event_callback")
+            assert event_callback is not None
+            event_callback(self.terminal_event, "回合报告 complete", "AI")
+        return self.narrative
+
+
+@pytest.mark.parametrize("terminal_event", [None, "ai_stream_complete"])
+@pytest.mark.asyncio
+async def test_turn_report_service_keeps_normal_ai_completion(
+    terminal_event: str | None,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = SimpleNamespace(
+        ui_config_path=tmp_path / "missing-settings.json",
+        enable_turn_report_llm=True,
+    )
+    monkeypatch.setattr("app.services.analytics.turn_report.get_settings", lambda: settings)
+    builder = SuccessfulReportBuilder(terminal_event)
+    events: list[tuple[str, str, str]] = []
+    service = TurnReportService(
+        report_builder=builder,
+        environment_repository=object(),
+        trophic_service=object(),
+        emit_event_fn=lambda *event: events.append(event),
+    )
+
+    report = await service.build_report(
+        turn_index=4,
+        mortality_results=[],
+        pressures=[],
+        branching_events=[],
+        all_species=[],
+    )
+
+    assert report.narrative == builder.narrative
+    assert ("info", "✅ AI 叙事生成完成", "报告") in events
 
 
 @pytest.mark.parametrize(
