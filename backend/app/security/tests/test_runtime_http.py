@@ -1815,22 +1815,20 @@ def _open_runtime_line_stream(
     allow_local: bool = False,
     max_bytes: Any = STREAM_MAX_BYTES,
     max_event_bytes: Any = STREAM_EVENT_MAX_BYTES,
-    idle_timeout: float | None = None,
-    total_timeout: float | None = None,
     budget: StreamBudget | None = None,
 ) -> Any:
+    effective_budget = budget or StreamBudget.from_timeouts(
+        120.0, hard_timeout=600.0
+    )
     kwargs: dict[str, Any] = {
         "request_target": request_target,
         "headers": {} if headers is None else headers,
         "json_body": {"request": True} if json_body is None else json_body,
         "allow_local": allow_local,
+        "budget": effective_budget,
         "max_bytes": max_bytes,
         "max_event_bytes": max_event_bytes,
-        "idle_timeout": idle_timeout,
-        "total_timeout": total_timeout,
     }
-    if budget is not None:
-        kwargs["budget"] = budget
     return client.astream_lines(
         base_url,
         **kwargs,
@@ -2123,7 +2121,7 @@ async def test_stream_rejects_response_headers_before_application_iteration(
 
 
 @pytest.mark.asyncio
-async def test_stream_idle_timeout_uses_runtime_default_and_closes_once() -> None:
+async def test_stream_idle_timeout_uses_caller_budget_and_closes_once() -> None:
     class BlockAfterFirstBodyStream(RecordingAsyncStream):
         def __init__(self) -> None:
             super().__init__(
@@ -2150,7 +2148,10 @@ async def test_stream_idle_timeout_uses_runtime_default_and_closes_once() -> Non
         stream,
         timeouts=RuntimeTimeouts(stream_idle=0.5, stream_total=2.0),
     )
-    iterator = _open_runtime_line_stream(client)
+    iterator = _open_runtime_line_stream(
+        client,
+        budget=StreamBudget.from_timeouts(0.5, hard_timeout=2.0),
+    )
 
     assert await anext(iterator) == "ready"
     with pytest.raises(OutboundRequestError) as exc_info:
@@ -2190,8 +2191,7 @@ async def test_stream_total_deadline_spans_lines_from_one_coalesced_chunk(
     client, _, _ = _runtime_client("async", stream)
     iterator = _open_runtime_line_stream(
         client,
-        idle_timeout=1.0,
-        total_timeout=0.5,
+        budget=StreamBudget.from_timeouts(1.0, hard_timeout=0.5),
     )
 
     assert await anext(iterator) == "first"
@@ -2435,30 +2435,6 @@ async def test_stream_invalid_limit_types_are_rejected_before_network(
     assert stream.close_count == 0
 
 
-@pytest.mark.parametrize("timeout_name", ["idle_timeout", "total_timeout"])
-@pytest.mark.parametrize(
-    "invalid_timeout",
-    [True, "0.1", 0.0, -1.0, float("nan"), float("inf"), float("-inf")],
-    ids=["bool", "string", "zero", "negative", "nan", "inf", "neg-inf"],
-)
-@pytest.mark.asyncio
-async def test_stream_invalid_timeouts_are_rejected_before_network(
-    timeout_name: str,
-    invalid_timeout: Any,
-) -> None:
-    stream = RecordingAsyncStream()
-    client, policy, backend = _runtime_client("async", stream)
-    kwargs = {timeout_name: invalid_timeout}
-
-    with pytest.raises(OutboundRequestError) as exc_info:
-        await _collect_runtime_lines(client, **kwargs)
-
-    assert exc_info.value.code == "outbound_url_invalid"
-    assert policy.calls == []
-    assert backend.connect_calls == []
-    assert stream.close_count == 0
-
-
 @pytest.mark.parametrize(
     ("idle_timeout", "total_timeout"),
     [(1.0, 3.0), (3.0, 1.0)],
@@ -2476,8 +2452,9 @@ async def test_stream_timeouts_cover_response_headers(
         await asyncio.wait_for(
             _collect_runtime_lines(
                 client,
-                idle_timeout=idle_timeout,
-                total_timeout=total_timeout,
+                budget=StreamBudget.from_timeouts(
+                    idle_timeout, hard_timeout=total_timeout
+                ),
             ),
             timeout=2.5,
         )

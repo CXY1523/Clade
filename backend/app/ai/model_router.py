@@ -6,8 +6,9 @@ import logging
 import random
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any, AsyncGenerator, Callable
+from typing import Any, AsyncGenerator, AsyncIterator, Callable
 from urllib.parse import quote, urlencode
 
 from ..security import (
@@ -20,6 +21,7 @@ from ..security import (
     OutboundRequestError,
     SafeRuntimeClient,
 )
+from ..security.deadline import StreamBudget
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +56,32 @@ def _ensure_deadline(
         ) from None
 
 
-def _budget_phase_timeout(budget: DeadlineBudget) -> float:
+def _budget_phase_timeout(budget: DeadlineBudget | StreamBudget) -> float:
     try:
         return budget.phase_timeout()
     except DeadlineExpired:
         raise OutboundRequestError(
             "outbound_timeout", 504, _PUBLIC_OUTBOUND_TIMEOUT
+        ) from None
+
+
+def _ensure_stream_budget(
+    supplied: StreamBudget | None,
+    *,
+    idle_timeout: float,
+    started_at: float,
+) -> StreamBudget:
+    if supplied is not None:
+        return supplied
+    try:
+        return StreamBudget.from_timeouts(
+            idle_timeout,
+            hard_timeout=600.0,
+            started_at=started_at,
+        )
+    except ValueError:
+        raise OutboundRequestError(
+            "outbound_url_invalid", 400, "澶栭儴鏈嶅姟鍦板潃鏃犳晥"
         ) from None
 
 
@@ -111,13 +133,23 @@ class _AsyncRequestLifecycle:
         self.request_id = self.router._begin_request_stats(self.capability)
         self.router._queued_requests += 1
 
-    async def acquire(self, budget: DeadlineBudget) -> None:
+    async def acquire(self, budget: DeadlineBudget | StreamBudget) -> None:
         self.acquired_semaphore = await self.router._acquire_with_budget(budget)
         if self.queued:
             self.router._queued_requests -= 1
             self.queued = False
         self.router._active_requests += 1
         self.active = True
+
+    @asynccontextmanager
+    async def slot(
+        self, budget: DeadlineBudget | StreamBudget
+    ) -> AsyncIterator[None]:
+        await self.acquire(budget)
+        try:
+            yield
+        finally:
+            self.release_attempt()
 
     def release_attempt(self) -> None:
         if self.active:
@@ -358,7 +390,7 @@ class ModelRouter:
         return True
 
     async def _acquire_with_budget(
-        self, budget: DeadlineBudget
+        self, budget: DeadlineBudget | StreamBudget
     ) -> asyncio.Semaphore:
         semaphore = self._semaphore
         try:
@@ -901,15 +933,147 @@ class ModelRouter:
         event.update(extra)
         return event
 
-    def _stream_error_event(self, capability: str, message: str) -> dict[str, Any]:
-        return {
+    def _stream_error_event(
+        self, capability: str, message: str, **extra: Any
+    ) -> dict[str, Any]:
+        event = {
             "type": "error",
             "message": message,
             "capability": capability,
             "timestamp": time.time(),
         }
+        event.update(extra)
+        return event
 
-    async def astream(self, capability: str, payload: dict[str, Any]) -> AsyncGenerator[Any, None]:
+    @staticmethod
+    def _finish_stream_event(
+        lifecycle: _AsyncRequestLifecycle, event: Any
+    ) -> None:
+        if not isinstance(event, dict):
+            return
+        if event.get("type") == "status":
+            state = event.get("state")
+            if state == "completed":
+                lifecycle.finish("success")
+            elif state == "interrupted":
+                lifecycle.finish("timeout")
+        elif event.get("type") == "error":
+            lifecycle.finish(
+                "timeout" if event.get("code") == "outbound_timeout" else "error"
+            )
+
+    async def _publish_stream_events(
+        self,
+        capability: str,
+        source: AsyncIterator[Any],
+        *,
+        budget: StreamBudget,
+        lifecycle: _AsyncRequestLifecycle,
+    ) -> AsyncGenerator[Any, None]:
+        iterator = source.__aiter__()
+        primary_cancel: asyncio.CancelledError | None = None
+        generator_closing = False
+        try:
+            while True:
+                try:
+                    event = await iterator.__anext__()
+                except StopAsyncIteration:
+                    return
+                self._finish_stream_event(lifecycle, event)
+                yield event
+        except asyncio.CancelledError as exc:
+            primary_cancel = exc
+            lifecycle.finish("cancelled")
+            raise
+        except GeneratorExit:
+            generator_closing = True
+            lifecycle.finish("cancelled")
+            raise
+        except OutboundRequestError as exc:
+            lifecycle.finish(
+                "timeout" if exc.code == "outbound_timeout" else "error"
+            )
+            if exc.code == "outbound_timeout" and budget.content_started:
+                yield self._stream_status_event(
+                    capability,
+                    "interrupted",
+                    reason=exc.code,
+                    partial=True,
+                )
+            else:
+                yield self._stream_error_event(
+                    capability, exc.public_message, code=exc.code
+                )
+            return
+        except Exception:
+            lifecycle.finish("error")
+            yield self._stream_error_event(capability, _STREAM_RESPONSE_ERROR)
+            return
+        finally:
+            if not lifecycle.stats_finished:
+                lifecycle.finish("cancelled")
+            try:
+                await iterator.aclose()
+            except asyncio.CancelledError:
+                if primary_cancel is None and not generator_closing:
+                    raise
+            except OutboundRequestError as exc:
+                logger.warning(
+                    "[ModelRouter] Stream source close failed %s code=%s",
+                    capability,
+                    exc.code,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[ModelRouter] Stream source close failed %s type=%s",
+                    capability,
+                    type(exc).__name__,
+                )
+            finally:
+                lifecycle.close()
+
+    async def astream(
+        self,
+        capability: str,
+        payload: dict[str, Any],
+        *,
+        budget: StreamBudget | None = None,
+    ) -> AsyncGenerator[Any, None]:
+        """Async streaming invocation with one logical budget and outcome."""
+        started_at = time.monotonic()
+        override = self.overrides.get(capability, {})
+        effective_budget = _ensure_stream_budget(
+            budget,
+            idle_timeout=override.get("timeout") or self.timeout,
+            started_at=started_at,
+        )
+        lifecycle = _AsyncRequestLifecycle(self, capability, started_at)
+        source = self._astream_impl(
+            capability,
+            payload,
+            budget=effective_budget,
+            lifecycle=lifecycle,
+        )
+        publisher = self._publish_stream_events(
+            capability,
+            source,
+            budget=effective_budget,
+            lifecycle=lifecycle,
+        )
+        try:
+            async for event in publisher:
+                yield event
+        finally:
+            await publisher.aclose()
+
+    async def _astream_impl(
+        self,
+        capability: str,
+        payload: dict[str, Any],
+        *,
+        budget: StreamBudget,
+        lifecycle: _AsyncRequestLifecycle,
+    ) -> AsyncGenerator[Any, None]:
         """Async streaming invocation. Yields status/error dicts and plain chunks."""
         allow_local = self.allow_local_ai_endpoints
         req = self._prepare_request(capability, payload)
@@ -931,7 +1095,7 @@ class ModelRouter:
 
         yield self._stream_status_event(capability, "connecting")
 
-        async with self._semaphore:
+        async with lifecycle.slot(budget):
             logger.info(
                 "[ModelRouter] Async stream %s start (type=%s)",
                 capability,
@@ -948,10 +1112,9 @@ class ModelRouter:
                     headers=headers,
                     json_body=req["body"],
                     allow_local=allow_local,
+                    budget=budget,
                     max_bytes=STREAM_MAX_BYTES,
                     max_event_bytes=STREAM_EVENT_MAX_BYTES,
-                    idle_timeout=120.0,
-                    total_timeout=None,
                 )
                 iterator = lines.__aiter__()
                 try:
@@ -1021,6 +1184,7 @@ class ModelRouter:
                                     for part in content_parts:
                                         text = part.get("text", "")
                                         if text:
+                                            budget.mark_content()
                                             if first_chunk:
                                                 yield self._stream_status_event(
                                                     capability, "receiving"
@@ -1083,6 +1247,7 @@ class ModelRouter:
                                 return
                             text = delta.get("text", "")
                             if text:
+                                budget.mark_content()
                                 if first_chunk:
                                     yield self._stream_status_event(
                                         capability, "receiving"
@@ -1132,6 +1297,7 @@ class ModelRouter:
                             )
                             return
                         if content:
+                            budget.mark_content()
                             if first_chunk:
                                 yield self._stream_status_event(
                                     capability, "receiving"
@@ -1149,7 +1315,17 @@ class ModelRouter:
                     capability,
                     exc.code,
                 )
-                yield self._stream_error_event(capability, exc.public_message)
+                if exc.code == "outbound_timeout" and budget.content_started:
+                    yield self._stream_status_event(
+                        capability,
+                        "interrupted",
+                        reason=exc.code,
+                        partial=True,
+                    )
+                else:
+                    yield self._stream_error_event(
+                        capability, exc.public_message, code=exc.code
+                    )
                 return
             except Exception as exc:
                 logger.error(
@@ -1721,6 +1897,45 @@ class ModelRouter:
         capability: str,
         messages: list[dict[str, str]],
         response_format: dict[str, Any] | None = None,
+        *,
+        budget: StreamBudget | None = None,
+    ) -> AsyncGenerator[Any, None]:
+        """Async direct stream call with one logical budget and outcome."""
+        started_at = time.monotonic()
+        override = self.overrides.get(capability, {})
+        effective_budget = _ensure_stream_budget(
+            budget,
+            idle_timeout=override.get("timeout") or self.timeout,
+            started_at=started_at,
+        )
+        lifecycle = _AsyncRequestLifecycle(self, capability, started_at)
+        source = self._astream_capability_impl(
+            capability,
+            messages,
+            response_format,
+            budget=effective_budget,
+            lifecycle=lifecycle,
+        )
+        publisher = self._publish_stream_events(
+            capability,
+            source,
+            budget=effective_budget,
+            lifecycle=lifecycle,
+        )
+        try:
+            async for event in publisher:
+                yield event
+        finally:
+            await publisher.aclose()
+
+    async def _astream_capability_impl(
+        self,
+        capability: str,
+        messages: list[dict[str, str]],
+        response_format: dict[str, Any] | None = None,
+        *,
+        budget: StreamBudget,
+        lifecycle: _AsyncRequestLifecycle,
     ) -> AsyncGenerator[Any, None]:
         """Async direct stream call yielding status events and chunks."""
         allow_local = self.allow_local_ai_endpoints
@@ -1856,7 +2071,7 @@ class ModelRouter:
 
         yield self._stream_status_event(capability, "connecting")
 
-        async with self._semaphore:
+        async with lifecycle.slot(budget):
             iterator: Any = None
             primary_cancel: asyncio.CancelledError | None = None
             try:
@@ -1866,10 +2081,9 @@ class ModelRouter:
                     headers=headers,
                     json_body=body,
                     allow_local=allow_local,
+                    budget=budget,
                     max_bytes=STREAM_MAX_BYTES,
                     max_event_bytes=STREAM_EVENT_MAX_BYTES,
-                    idle_timeout=120.0,
-                    total_timeout=None,
                 )
                 iterator = lines.__aiter__()
                 try:
@@ -1952,6 +2166,7 @@ class ModelRouter:
                                         if not isinstance(text, str):
                                             raise TypeError
                                         if text:
+                                            budget.mark_content()
                                             if first_chunk:
                                                 yield self._stream_status_event(
                                                     capability, "receiving"
@@ -2019,6 +2234,7 @@ class ModelRouter:
                                 )
                                 return
                             if text:
+                                budget.mark_content()
                                 if first_chunk:
                                     yield self._stream_status_event(
                                         capability, "receiving"
@@ -2069,6 +2285,7 @@ class ModelRouter:
                             )
                             return
                         if content:
+                            budget.mark_content()
                             if first_chunk:
                                 yield self._stream_status_event(
                                     capability, "receiving"
@@ -2086,7 +2303,17 @@ class ModelRouter:
                     capability,
                     exc.code,
                 )
-                yield self._stream_error_event(capability, exc.public_message)
+                if exc.code == "outbound_timeout" and budget.content_started:
+                    yield self._stream_status_event(
+                        capability,
+                        "interrupted",
+                        reason=exc.code,
+                        partial=True,
+                    )
+                else:
+                    yield self._stream_error_event(
+                        capability, exc.public_message, code=exc.code
+                    )
                 return
             except Exception as exc:
                 logger.error(

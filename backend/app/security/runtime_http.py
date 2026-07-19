@@ -687,28 +687,11 @@ class SafeRuntimeClient:
         headers: Mapping[str, str],
         json_body: Mapping[str, Any],
         allow_local: bool,
+        budget: StreamBudget,
         max_bytes: int = STREAM_MAX_BYTES,
         max_event_bytes: int = STREAM_EVENT_MAX_BYTES,
-        idle_timeout: float | None = None,
-        total_timeout: float | None = None,
-        budget: StreamBudget | None = None,
     ) -> AsyncIterator[str]:
         effective_budget = budget
-        if effective_budget is None:
-            idle_limit = _validated_stream_timeout(
-                self._timeouts.stream_idle
-                if idle_timeout is None
-                else idle_timeout,
-            )
-            total_limit = _validated_stream_timeout(
-                self._timeouts.stream_total
-                if total_timeout is None
-                else total_timeout,
-            )
-            effective_budget = StreamBudget.from_timeouts(
-                idle_limit,
-                hard_timeout=total_limit,
-            )
         token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(True)
         try:
             validated = await self._runner.arun(

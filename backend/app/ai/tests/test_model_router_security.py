@@ -31,6 +31,7 @@ from app.security import (
     STREAM_MAX_BYTES,
     OutboundRequestError,
 )
+from app.security.deadline import StreamBudget
 
 
 PUBLIC_BLOCKED = "That network address is not allowed"
@@ -114,12 +115,12 @@ class RecordingAsyncLines(AsyncIterator[str]):
         return self
 
     async def __anext__(self) -> str:
-        if self._error is not None and not self._raised_error:
-            self._raised_error = True
-            raise self._error
         try:
             return next(self._lines)
         except StopIteration:
+            if self._error is not None and not self._raised_error:
+                self._raised_error = True
+                raise self._error
             if self._block_on_exhaustion:
                 self.next_started.set()
                 await self.next_release.wait()
@@ -233,10 +234,9 @@ class RecordingSafeRuntimeClient:
         headers: dict[str, str],
         json_body: dict[str, Any],
         allow_local: bool,
+        budget: StreamBudget,
         max_bytes: int,
         max_event_bytes: int,
-        idle_timeout: float | None = None,
-        total_timeout: float | None = None,
     ) -> AsyncIterator[str]:
         self._record(
             "astream_lines",
@@ -245,10 +245,9 @@ class RecordingSafeRuntimeClient:
             headers=headers,
             json_body=json_body,
             allow_local=allow_local,
+            budget=budget,
             max_bytes=max_bytes,
             max_event_bytes=max_event_bytes,
-            idle_timeout=idle_timeout,
-            total_timeout=total_timeout,
         )
         self.stream_iterator = RecordingAsyncLines(
             self.stream_lines,
@@ -1181,6 +1180,159 @@ async def _collect_stream(router: ModelRouter) -> list[Any]:
     return [event async for event in router.astream("generate", {"name": "elm"})]
 
 
+async def _collect_router_stream(
+    router: ModelRouter,
+    entry: str,
+    *,
+    budget: StreamBudget | None = None,
+) -> list[Any]:
+    if entry == "template":
+        stream = router.astream("generate", {"name": "elm"}, budget=budget)
+    else:
+        stream = router.astream_capability(
+            "generate", _messages(), budget=budget
+        )
+    return [event async for event in stream]
+
+
+@pytest.mark.parametrize("entry", ["template", "capability"])
+def test_partial_timeout_emits_interrupted_without_completed(entry: str) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    runtime_client.stream_lines = [
+        'data: {"choices":[{"delta":{"content":"partial"}}]}'
+    ]
+    runtime_client.stream_error = OutboundRequestError(
+        "outbound_timeout", 504, PUBLIC_TIMEOUT
+    )
+    router = _remote_router(runtime_client)
+
+    events = asyncio.run(_collect_router_stream(router, entry))
+
+    assert "partial" in events
+    terminals = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and event.get("state") in {"completed", "interrupted"}
+    ]
+    assert terminals == [
+        {
+            "type": "status",
+            "state": "interrupted",
+            "capability": "generate",
+            "reason": "outbound_timeout",
+            "partial": True,
+            "timestamp": terminals[0]["timestamp"],
+        }
+    ]
+    diagnostics = router.get_diagnostics()
+    assert diagnostics["total_requests"] == 1
+    assert diagnostics["total_timeouts"] == 1
+    assert diagnostics["request_stats"]["generate"]["timeout"] == 1
+    assert diagnostics["request_stats"]["generate"]["success"] == 0
+
+
+@pytest.mark.parametrize("entry", ["template", "capability"])
+def test_timeout_before_content_emits_one_fixed_error(entry: str) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    runtime_client.stream_error = OutboundRequestError(
+        "outbound_timeout", 504, PUBLIC_TIMEOUT
+    )
+    router = _remote_router(runtime_client)
+
+    events = asyncio.run(_collect_router_stream(router, entry))
+
+    errors = [
+        event
+        for event in events
+        if isinstance(event, dict) and event.get("type") == "error"
+    ]
+    assert [(event["code"], event["message"]) for event in errors] == [
+        ("outbound_timeout", PUBLIC_TIMEOUT)
+    ]
+    assert not any(
+        isinstance(event, dict)
+        and event.get("state") in {"completed", "interrupted"}
+        for event in events
+    )
+    diagnostics = router.get_diagnostics()
+    assert diagnostics["total_requests"] == 1
+    assert diagnostics["total_timeouts"] == 1
+    assert diagnostics["request_stats"]["generate"]["timeout"] == 1
+
+
+@pytest.mark.parametrize("entry", ["template", "capability"])
+def test_stream_entry_passes_one_caller_budget_by_identity(entry: str) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    runtime_client.stream_lines = ["data: [DONE]"]
+    router = _remote_router(runtime_client)
+    budget = StreamBudget.from_timeouts(23.0, hard_timeout=600.0)
+
+    events = asyncio.run(_collect_router_stream(router, entry, budget=budget))
+
+    assert events[-1]["state"] == "completed"
+    assert runtime_client.calls[0]["budget"] is budget
+    diagnostics = router.get_diagnostics()
+    assert diagnostics["request_stats"]["generate"]["success"] == 1
+
+
+@pytest.mark.parametrize("entry", ["template", "capability"])
+def test_stream_queue_uses_caller_budget_before_network(entry: str) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    router = _remote_router(runtime_client)
+    clock = ManualClock()
+    budget = StreamBudget.from_timeouts(
+        1.0, hard_timeout=600.0, clock=clock
+    )
+    clock.advance(1.1)
+
+    events = asyncio.run(_collect_router_stream(router, entry, budget=budget))
+
+    assert [
+        event.get("state")
+        for event in events
+        if isinstance(event, dict) and event.get("type") == "status"
+    ] == ["connecting"]
+    assert [
+        (event["code"], event["message"])
+        for event in events
+        if isinstance(event, dict) and event.get("type") == "error"
+    ] == [("outbound_timeout", PUBLIC_TIMEOUT)]
+    assert runtime_client.calls == []
+    diagnostics = router.get_diagnostics()
+    assert diagnostics["request_stats"]["generate"]["timeout"] == 1
+
+
+@pytest.mark.parametrize("entry", ["template", "capability"])
+def test_stream_releases_the_exact_acquired_semaphore(entry: str) -> None:
+    async def scenario() -> None:
+        runtime_client = RecordingSafeRuntimeClient()
+        runtime_client.stream_lines = [": heartbeat"]
+        runtime_client.stream_block_on_exhaustion = True
+        router = _remote_router(runtime_client)
+        router.set_concurrency_limit(1)
+        acquired_semaphore = router._semaphore
+        task = asyncio.create_task(_collect_router_stream(router, entry))
+
+        while runtime_client.stream_iterator is None:
+            await asyncio.sleep(0)
+        await runtime_client.stream_iterator.next_started.wait()
+        assert acquired_semaphore._value == 0
+
+        router.set_concurrency_limit(2)
+        replacement_semaphore = router._semaphore
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert acquired_semaphore._value == 1
+        assert replacement_semaphore._value == 2
+        diagnostics = router.get_diagnostics()
+        assert diagnostics["request_stats"]["generate"]["cancelled"] == 1
+
+    asyncio.run(scenario())
+
+
 def test_astream_uses_safe_lines_and_preserves_status_heartbeat_and_chunks() -> None:
     runtime_client = RecordingSafeRuntimeClient()
     runtime_client.stream_lines = [
@@ -1237,11 +1389,14 @@ def test_astream_uses_safe_lines_and_preserves_status_heartbeat_and_chunks() -> 
             "stream": True,
         },
         "allow_local": False,
+        "budget": call["budget"],
         "max_bytes": STREAM_MAX_BYTES,
         "max_event_bytes": STREAM_EVENT_MAX_BYTES,
-        "idle_timeout": 120.0,
-        "total_timeout": None,
     }
+    budget = call["budget"]
+    assert isinstance(budget, StreamBudget)
+    assert budget.idle_timeout == 23
+    assert 0 < budget.hard_deadline - budget.clock() <= 600
 
 
 def test_astream_uses_business_start_local_policy_snapshot() -> None:
@@ -1350,6 +1505,10 @@ def test_astream_cancellation_survives_inner_close_error(
         with pytest.raises(asyncio.CancelledError):
             await task
         assert runtime_client.stream_iterator.close_count == 1
+        diagnostics = router.get_diagnostics()
+        assert diagnostics["total_cancellations"] == 1
+        assert diagnostics["total_timeouts"] == 0
+        assert diagnostics["request_stats"]["generate"]["cancelled"] == 1
 
     with caplog.at_level(logging.DEBUG):
         asyncio.run(scenario())
@@ -1442,6 +1601,10 @@ def test_astream_outer_aclose_swallows_inner_close_error(
         await stream.aclose()
         assert runtime_client.stream_iterator is not None
         assert runtime_client.stream_iterator.close_count == 1
+        diagnostics = router.get_diagnostics()
+        assert diagnostics["total_cancellations"] == 1
+        assert diagnostics["total_timeouts"] == 0
+        assert diagnostics["request_stats"]["generate"]["cancelled"] == 1
 
     with caplog.at_level(logging.DEBUG):
         asyncio.run(scenario())
@@ -2113,8 +2276,9 @@ def test_legacy_stream_preserves_provider_formats_status_and_heartbeat(
     assert call["allow_local"] is False
     assert call["max_bytes"] == STREAM_MAX_BYTES
     assert call["max_event_bytes"] == STREAM_EVENT_MAX_BYTES
-    assert call["idle_timeout"] == 120.0
-    assert call["total_timeout"] is None
+    assert isinstance(call["budget"], StreamBudget)
+    assert call["budget"].idle_timeout == 17
+    assert 0 < call["budget"].hard_deadline - call["budget"].clock() <= 600
     assert runtime_client.stream_iterator is not None
     assert runtime_client.stream_iterator.iter_count == 1
     assert runtime_client.stream_iterator.close_count == 1
@@ -2248,6 +2412,10 @@ def test_legacy_stream_cancellation_preserves_outer_cancel_and_closes_once(
             await task
         assert exc_info.value.args == ("OUTER-CANCEL",)
         assert runtime_client.stream_iterator.close_count == 1
+        diagnostics = router.get_diagnostics()
+        assert diagnostics["total_cancellations"] == 1
+        assert diagnostics["total_timeouts"] == 0
+        assert diagnostics["request_stats"]["generate"]["cancelled"] == 1
 
     with caplog.at_level(logging.DEBUG):
         asyncio.run(scenario())
@@ -2269,6 +2437,10 @@ def test_legacy_stream_early_close_swallows_inner_close_error(
         await stream.aclose()
         assert runtime_client.stream_iterator is not None
         assert runtime_client.stream_iterator.close_count == 1
+        diagnostics = router.get_diagnostics()
+        assert diagnostics["total_cancellations"] == 1
+        assert diagnostics["total_timeouts"] == 0
+        assert diagnostics["request_stats"]["generate"]["cancelled"] == 1
 
     with caplog.at_level(logging.DEBUG):
         asyncio.run(scenario())
@@ -2421,6 +2593,10 @@ def test_seven_network_entries_each_call_one_expected_safe_transport() -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     expected = dict(NETWORK_ENTRY_TRANSPORTS)
+    implementation_method = {
+        "astream": "_astream_impl",
+        "astream_capability": "_astream_capability_impl",
+    }
     safe_names = {"post_json", "apost_json", "astream_lines"}
     actual_safe_callers: dict[str, list[str]] = {}
     for method_name, method in methods.items():
@@ -2435,10 +2611,14 @@ def test_seven_network_entries_each_call_one_expected_safe_transport() -> None:
             actual_safe_callers[method_name] = calls
 
     assert len(expected) == 7
-    assert set(actual_safe_callers) == set(expected)
+    expected_callers = {
+        implementation_method.get(entry_name, entry_name): transport
+        for entry_name, transport in NETWORK_ENTRY_TRANSPORTS
+    }
+    assert set(actual_safe_callers) == set(expected_callers)
     assert actual_safe_callers == {
         entry_name: [transport]
-        for entry_name, transport in NETWORK_ENTRY_TRANSPORTS
+        for entry_name, transport in expected_callers.items()
     }
 
 
