@@ -80,7 +80,7 @@ The examples below use small local fakes. Implement them in the named test file 
 - Produces: `BoundedDaemonRunner.run(operation, *, timeout)`, `await BoundedDaemonRunner.arun(operation, *, timeout)`, and one process-wide `DEFAULT_BOUNDED_RUNNER` with four shared slots.
 - Preserves: `SafeProbeClient` public API and exact 10/15-second contracts.
 
-- [ ] **Step 1: Write failing ordinary budget tests**
+- [x] **Step 1: Write failing ordinary budget tests**
 
 ```python
 # backend/app/security/tests/test_deadline.py
@@ -124,7 +124,7 @@ def test_wall_clock_changes_do_not_affect_monotonic_budget(monkeypatch) -> None:
     assert budget.remaining() == pytest.approx(6.0)
 ```
 
-- [ ] **Step 2: Write failing sync/async runner tests**
+- [x] **Step 2: Write failing sync/async runner tests**
 
 ```python
 # backend/app/security/tests/test_bounded_runner.py
@@ -169,7 +169,7 @@ async def test_async_wait_times_out_without_blocking_event_loop() -> None:
     release.set()
 ```
 
-- [ ] **Step 3: Run the new tests and verify RED**
+- [x] **Step 3: Run the new tests and verify RED**
 
 Run from `backend`:
 
@@ -179,7 +179,7 @@ Run from `backend`:
 
 Expected: collection fails because `app.security.deadline` and `app.security.bounded_runner` do not exist.
 
-- [ ] **Step 4: Implement `DeadlineBudget`**
+- [x] **Step 4: Implement `DeadlineBudget`**
 
 ```python
 # backend/app/security/deadline.py
@@ -242,7 +242,7 @@ class DeadlineBudget:
         return remaining if limit is None else min(remaining, limit)
 ```
 
-- [ ] **Step 5: Extract and extend the runner**
+- [x] **Step 5: Extract and extend the runner**
 
 Move the existing `_BoundedDaemonRunner` implementation from `safe_http.py` into `bounded_runner.py`, rename it `BoundedDaemonRunner`, preserve `max_workers <= 4`, `max_active`, daemon threads, slot retention, and exception propagation. Add an async API that starts the same bounded worker and completes an event-loop future with `loop.call_soon_threadsafe`; it must not call `asyncio.to_thread()` merely to wait for the result.
 
@@ -308,11 +308,11 @@ DEFAULT_BOUNDED_RUNNER = BoundedDaemonRunner(max_workers=4)
 
 Production probe, normal JSON, and streaming DNS call sites all use this singleton unless a test injects a runner. Do not create separate four-slot defaults per client module.
 
-- [ ] **Step 6: Migrate `SafeProbeClient` without changing behavior**
+- [x] **Step 6: Migrate `SafeProbeClient` without changing behavior**
 
 Import `DEFAULT_BOUNDED_RUNNER`, define a local `_Runner` protocol for `run()` if needed by existing test fakes, bind `_DEFAULT_RUNNER = DEFAULT_BOUNDED_RUNNER`, and delete the duplicate queue/thread implementation from `safe_http.py`. Update `test_safe_http.py` imports to the shared class; do not alter probe return shapes or fixed timeouts.
 
-- [ ] **Step 7: Run focused tests and verify GREEN**
+- [x] **Step 7: Run focused tests and verify GREEN**
 
 ```powershell
 & $PYTHON -m pytest app/security/tests/test_deadline.py app/security/tests/test_bounded_runner.py app/security/tests/test_safe_http.py -q
@@ -320,7 +320,7 @@ Import `DEFAULT_BOUNDED_RUNNER`, define a local `_Runner` protocol for `run()` i
 
 Expected: all selected tests pass; deadline tests use no wall-clock sleeps except millisecond runner bounds.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```powershell
 git add backend/app/security/deadline.py backend/app/security/bounded_runner.py backend/app/security/safe_http.py backend/app/security/__init__.py backend/app/security/tests/test_deadline.py backend/app/security/tests/test_bounded_runner.py backend/app/security/tests/test_safe_http.py
@@ -340,7 +340,7 @@ git commit -m "feat(security): add reusable request deadlines"
 - Produces: optional `budget: TimeoutBudget | None` on `PinnedSyncTransport` and `PinnedAsyncTransport`.
 - Preserves: approved-IP order, original Host/SNI/certificate hostname, Unix-socket rejection, sanitized errors, and exactly-once close.
 
-- [ ] **Step 1: Write failing sync and async multi-IP budget tests**
+- [x] **Step 1: Write failing sync and async multi-IP budget tests**
 
 Add a recording delegate whose first connection advances a `ManualClock` and fails. Assert the second approved IP receives only the remaining time, not the original connect timeout.
 
@@ -381,7 +381,7 @@ async def test_async_does_not_try_next_ip_after_budget_expires() -> None:
     assert len(backend.connect_calls) == 1
 ```
 
-- [ ] **Step 2: Run the two tests and verify RED**
+- [x] **Step 2: Run the two tests and verify RED**
 
 ```powershell
 & $PYTHON -m pytest app/security/tests/test_pinned_transport.py -q -k "share_one_connect_budget or after_budget_expires"
@@ -389,7 +389,7 @@ async def test_async_does_not_try_next_ip_after_budget_expires() -> None:
 
 Expected: constructor rejects `budget` or both IPs receive the original timeout.
 
-- [ ] **Step 3: Thread the budget through backends and streams**
+- [x] **Step 3: Thread the budget through backends and streams**
 
 Add `budget` to `_PinnedNetworkBackend`, `_PinnedAsyncNetworkBackend`, `_SanitizedNetworkBackend`, `_SanitizedAsyncNetworkBackend`, `_SanitizedNetworkStream`, and `_SanitizedAsyncNetworkStream`. Clamp immediately before every connect, TLS, read, and write:
 
@@ -410,7 +410,7 @@ def _bounded_timeout(
 
 Use `httpcore.ConnectTimeout` for connect/TLS, `httpcore.ReadTimeout` for reads, and `httpcore.WriteTimeout` for writes. Recalculate inside the approved-IP loop before every delegate call.
 
-- [ ] **Step 4: Pass the budget from both transport constructors**
+- [x] **Step 4: Pass the budget from both transport constructors**
 
 ```python
 class PinnedSyncTransport(httpx.BaseTransport):
@@ -439,7 +439,7 @@ class PinnedSyncTransport(httpx.BaseTransport):
 
 Mirror the keyword-only parameter on `PinnedAsyncTransport`. Keep all existing call sites valid by defaulting to `None` in this task.
 
-- [ ] **Step 5: Run complete transport tests**
+- [x] **Step 5: Run complete transport tests**
 
 ```powershell
 & $PYTHON -m pytest app/security/tests/test_pinned_transport.py app/security/tests/test_safe_http.py -q
@@ -447,7 +447,7 @@ Mirror the keyword-only parameter on `PinnedAsyncTransport`. Keep all existing c
 
 Expected: all pass, including existing Host/SNI, error sanitization, Unix rejection, and cleanup tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add backend/app/security/pinned_transport.py backend/app/security/tests/test_pinned_transport.py
@@ -468,7 +468,7 @@ git commit -m "fix(security): clamp pinned transport to request deadlines"
 - Transitional input: `budget: DeadlineBudget | None = None` plus existing `read_timeout`; exactly one effective budget is built.
 - Produces: sync/async JSON calls whose DNS, request, body, parse, and close are bounded by the caller's deadline.
 
-- [ ] **Step 1: Add failing end-to-end runtime tests**
+- [x] **Step 1: Add failing end-to-end runtime tests**
 
 Cover sync blocking DNS, async blocking DNS without event-loop starvation, body reads spanning multiple phase timeouts, cancellation, and close counts.
 
@@ -530,7 +530,7 @@ async def test_async_blocking_dns_timeout_does_not_block_other_task() -> None:
         release.set()
 ```
 
-- [ ] **Step 2: Run the new cases and verify RED**
+- [x] **Step 2: Run the new cases and verify RED**
 
 ```powershell
 & $PYTHON -m pytest app/security/tests/test_runtime_http.py -q -k "normal_budget or blocking_dns_timeout"
@@ -538,7 +538,7 @@ async def test_async_blocking_dns_timeout_does_not_block_other_task() -> None:
 
 Expected: DNS runs inline or the new `budget` keyword is rejected.
 
-- [ ] **Step 3: Add budget resolution and runner injection**
+- [x] **Step 3: Add budget resolution and runner injection**
 
 ```python
 class SafeRuntimeClient:
@@ -574,7 +574,7 @@ class SafeRuntimeClient:
 
 The `read_timeout` fallback is migration-only and is removed in Task 5 after all production callers pass budgets.
 
-- [ ] **Step 4: Bound the synchronous operation as one worker**
+- [x] **Step 4: Bound the synchronous operation as one worker**
 
 Move the existing sync request body to `_post_json_impl(base_url, request_target, headers, json_body, allow_local, max_bytes, budget)`. Set and reset the HTTP log-suppression context inside the worker, validate the URL there, create `PinnedSyncTransport(validated, self._sync_network_backend, budget=budget)`, and use `budget.phase_timeout()`/phase caps for HTTPX values. Call it through:
 
@@ -598,7 +598,7 @@ except (DeadlineExpired, TimeoutError, httpx.TimeoutException, httpcore.TimeoutE
 
 Only the low-level guarded HTTP operation belongs in the worker. Cache writes, router statistics, and success events remain on the caller thread after a result is returned.
 
-- [ ] **Step 5: Bound async DNS and the complete async request**
+- [x] **Step 5: Bound async DNS and the complete async request**
 
 Run `OutboundURLPolicy.validate()` through `await self._runner.arun(lambda: self._policy.validate(base_url, allow_local=allow_local), timeout=effective_budget.phase_timeout())`, then wrap client creation, request, bounded read, parse, and cleanup in the current budget:
 
@@ -618,7 +618,7 @@ async with asyncio.timeout(effective_budget.phase_timeout()):
 
 Catch and re-raise `asyncio.CancelledError` before timeout/error mapping. Preserve existing fixed errors and log suppression.
 
-- [ ] **Step 6: Run the complete runtime security suite**
+- [x] **Step 6: Run the complete runtime security suite**
 
 ```powershell
 & $PYTHON -m pytest app/security/tests/test_deadline.py app/security/tests/test_bounded_runner.py app/security/tests/test_pinned_transport.py app/security/tests/test_runtime_http.py app/security/tests/test_safe_http.py -q
@@ -626,7 +626,7 @@ Catch and re-raise `asyncio.CancelledError` before timeout/error mapping. Preser
 
 Expected: all selected tests pass with no public-network access.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add backend/app/security/runtime_http.py backend/app/security/__init__.py backend/app/security/tests/test_runtime_http.py
@@ -647,7 +647,7 @@ git commit -m "fix(security): enforce end-to-end runtime deadlines"
 - Produces: `_acquire_with_budget(budget) -> None` and one logical timeout statistic per request.
 - Produces: `total_cancellations` plus per-capability `cancelled`; cancellation never increments `total_timeouts`.
 
-- [ ] **Step 1: Add failing queue and retry tests**
+- [x] **Step 1: Add failing queue and retry tests**
 
 ```python
 @pytest.mark.asyncio
@@ -685,7 +685,7 @@ Add a parameterized test across `invoke`, `call_capability`, `acall_capability`,
 
 Extend the existing semaphore/safe-call/backoff cancellation tests to assert `total_timeouts == 0`, `total_cancellations == 1`, and the capability's `cancelled == 1` after cleanup.
 
-- [ ] **Step 2: Run the new router tests and verify RED**
+- [x] **Step 2: Run the new router tests and verify RED**
 
 ```powershell
 & $PYTHON -m pytest app/ai/tests/test_model_router_security.py -q -k "inside_total_budget or share_one_budget or same_budget_object"
@@ -693,7 +693,7 @@ Extend the existing semaphore/safe-call/backoff cancellation tests to assert `to
 
 Expected: queue wait has no timeout, retries receive fresh read timeouts, or signatures reject `budget`.
 
-- [ ] **Step 3: Create budgets at logical entry**
+- [x] **Step 3: Create budgets at logical entry**
 
 Record `started_at = time.monotonic()` before `_prepare_request()`/`resolve()`. Use the prepared/configured timeout without resetting the start:
 
@@ -716,7 +716,7 @@ def _ensure_deadline(
 
 Pass the budget to every normal runtime-client call. Keep optional keyword-only parameters so existing direct callers remain source compatible.
 
-- [ ] **Step 4: Put semaphore waiting inside the budget**
+- [x] **Step 4: Put semaphore waiting inside the budget**
 
 ```python
 async def _acquire_with_budget(
@@ -735,7 +735,7 @@ async def _acquire_with_budget(
 
 Replace `async with self._semaphore` in `ainvoke`, `acall_capability`, and `chat` with acquire/`finally: release()`. Update queued/active counters exactly once on every queue timeout, success, error, and cancellation.
 
-- [ ] **Step 5: Make retry and backoff consume the same budget**
+- [x] **Step 5: Make retry and backoff consume the same budget**
 
 Pass `budget=effective_budget` on every attempt. Before retry sleep:
 
@@ -753,7 +753,7 @@ except (DeadlineExpired, TimeoutError, asyncio.TimeoutError):
 
 Do not start another resolver/connection after expiry. Add one idempotent `_finish_request_stats(capability, outcome, elapsed)` helper where `outcome` is `success | timeout | error | cancelled`; it updates the matching per-capability counter and the global timeout/cancellation counter at most once. Use it for every async normal exit so repeated timed-out attempts do not inflate request totals and cancellation remains separate.
 
-- [ ] **Step 6: Run router and runtime tests**
+- [x] **Step 6: Run router and runtime tests**
 
 ```powershell
 & $PYTHON -m pytest app/ai/tests/test_model_router_security.py app/security/tests/test_runtime_http.py -q
@@ -761,7 +761,7 @@ Do not start another resolver/connection after expiry. Add one idempotent `_fini
 
 Expected: all pass; the existing seven-entry routing/security cases remain unchanged except recorded calls now carry a budget.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add backend/app/ai/model_router.py backend/app/ai/tests/test_model_router_security.py
@@ -784,7 +784,7 @@ git commit -m "fix(ai): share deadlines across queue and retries"
 - Produces: optional private `budget: DeadlineBudget | None = None` on `_request_embedding_chunk_result()` for deterministic tests.
 - Finalizes: `post_json`/`apost_json` require `budget`; legacy `read_timeout` is removed.
 
-- [ ] **Step 1: Write failing retry-budget tests**
+- [x] **Step 1: Write failing retry-budget tests**
 
 ```python
 def test_embedding_chunk_retries_share_one_total_budget(monkeypatch) -> None:
@@ -824,7 +824,7 @@ def test_embedding_expired_budget_never_starts_another_retry() -> None:
     assert len(client.calls) == 1
 ```
 
-- [ ] **Step 2: Run the new Embedding cases and verify RED**
+- [x] **Step 2: Run the new Embedding cases and verify RED**
 
 ```powershell
 & $PYTHON -m pytest app/services/system/tests/test_embedding_security.py -q -k "share_one_total_budget or never_starts_another_retry"
@@ -832,7 +832,7 @@ def test_embedding_expired_budget_never_starts_another_retry() -> None:
 
 Expected: the private method rejects `budget` and each attempt passes a fresh read timeout.
 
-- [ ] **Step 3: Implement one chunk budget**
+- [x] **Step 3: Implement one chunk budget**
 
 Capture `started_at = time.monotonic()` as the first executable line of `_request_embedding_chunk_result()`. Take the frozen runtime-config snapshot, then create `DeadlineBudget.from_timeout(config.timeout, started_at=started_at)` so payload preparation before the first attempt is included.
 
@@ -894,11 +894,11 @@ for attempt in range(max_retries):
 
 After sleeping, call `effective_budget.phase_timeout()` before the next attempt. If it raises `DeadlineExpired`, route the fixed timeout through the same `require_real`/allowed-fake terminal branch shown above; never let it start another call or escape as a different public error. Preserve the frozen runtime config and fake-vector rules from Phase 2C.
 
-- [ ] **Step 4: Remove the transitional runtime API**
+- [x] **Step 4: Remove the transitional runtime API**
 
 Delete `read_timeout` from `post_json`/`apost_json`, require `budget`, and update all runtime-client fakes/recorders to record the same budget object. Run `rg -n "read_timeout=" backend/app` and ensure only unrelated diagnostic/probe configuration remains.
 
-- [ ] **Step 5: Run Embedding, router, and runtime tests**
+- [x] **Step 5: Run Embedding, router, and runtime tests**
 
 ```powershell
 & $PYTHON -m pytest app/services/system/tests/test_embedding_security.py app/ai/tests/test_model_router_security.py app/security/tests/test_runtime_http.py -q
@@ -906,7 +906,7 @@ Delete `read_timeout` from `post_json`/`apost_json`, require `budget`, and updat
 
 Expected: all pass; remote fallback fake vectors remain non-cacheable and safety/response errors never fall back.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add backend/app/services/system/embedding.py backend/app/services/system/tests/test_embedding_security.py backend/app/security/runtime_http.py backend/app/security/tests/test_runtime_http.py backend/app/ai/tests/test_model_router_security.py
@@ -928,7 +928,7 @@ git commit -m "fix(embedding): share timeout across chunk retries"
 - Produces: `StreamBudget.remaining()`, `phase_timeout(limit=None)`, `mark_content()`, and `content_started`.
 - Transitional stream input: optional `budget: StreamBudget`; old idle/total arguments remain only until Task 7 migrates the router.
 
-- [ ] **Step 1: Write failing `StreamBudget` tests**
+- [x] **Step 1: Write failing `StreamBudget` tests**
 
 ```python
 def test_stream_initial_idle_includes_queue_and_statuses_do_not_refresh() -> None:
@@ -964,7 +964,7 @@ def test_stream_hard_deadline_never_resets() -> None:
         budget.phase_timeout()
 ```
 
-- [ ] **Step 2: Run budget tests and verify RED**
+- [x] **Step 2: Run budget tests and verify RED**
 
 ```powershell
 & $PYTHON -m pytest app/security/tests/test_deadline.py -q -k "stream_ or real_content"
@@ -972,7 +972,7 @@ def test_stream_hard_deadline_never_resets() -> None:
 
 Expected: `StreamBudget` is missing.
 
-- [ ] **Step 3: Implement `StreamBudget`**
+- [x] **Step 3: Implement `StreamBudget`**
 
 ```python
 @dataclass
@@ -1023,7 +1023,7 @@ class StreamBudget:
         return remaining if limit is None else min(remaining, limit)
 ```
 
-- [ ] **Step 4: Write failing guarded-stream tests**
+- [x] **Step 4: Write failing guarded-stream tests**
 
 Add tests showing blocking DNS and response headers consume the initial idle window, empty/SSE-control lines do not refresh it unless the caller calls `mark_content()`, local consumer delay does not start a new idle window until reading resumes, and hard deadline closes once.
 
@@ -1053,13 +1053,13 @@ async def test_stream_protocol_lines_cannot_refresh_idle_budget() -> None:
     assert stream.close_count == 1
 ```
 
-- [ ] **Step 5: Replace the stream's independent deadlines with `StreamBudget`**
+- [x] **Step 5: Replace the stream's independent deadlines with `StreamBudget`**
 
 Use the shared bounded runner for DNS; pass the stream budget into `PinnedAsyncTransport`; call `budget.phase_timeout()` before response headers and every raw `__anext__()`. `SafeRuntimeClient` never calls `mark_content()` because it cannot distinguish provider content from protocol lines. The router owns that action in Task 7.
 
 Keep `asyncio.CancelledError` propagation and generator cleanup. Map `DeadlineExpired`, built-in `TimeoutError`, HTTPX/httpcore timeouts to fixed `outbound_timeout`.
 
-- [ ] **Step 6: Run deadline and runtime-stream tests**
+- [x] **Step 6: Run deadline and runtime-stream tests**
 
 ```powershell
 & $PYTHON -m pytest app/security/tests/test_deadline.py app/security/tests/test_runtime_http.py -q
@@ -1067,7 +1067,7 @@ Keep `asyncio.CancelledError` propagation and generator cleanup. Map `DeadlineEx
 
 Expected: all pass, including existing byte/event limits, log-context restoration, cross-task continuation, early close, cancellation, and error redaction.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add backend/app/security/deadline.py backend/app/security/tests/test_deadline.py backend/app/security/runtime_http.py backend/app/security/tests/test_runtime_http.py
@@ -1091,7 +1091,7 @@ git commit -m "fix(security): enforce stream idle and hard budgets"
 - Produces: one logical request statistic: completed is success, any outbound deadline is timeout, other terminal error is error, and cancellation/early close is cancelled.
 - Preserves: cancellation propagation, provider parsing, no stream retry, redacted error events, and cleanup.
 
-- [ ] **Step 1: Write failing tests for both stream entry points**
+- [x] **Step 1: Write failing tests for both stream entry points**
 
 Parameterize over `astream` and `astream_capability`:
 
@@ -1141,7 +1141,7 @@ def test_timeout_before_content_emits_one_error() -> None:
     )
 ```
 
-- [ ] **Step 2: Run new stream-router tests and verify RED**
+- [x] **Step 2: Run new stream-router tests and verify RED**
 
 ```powershell
 & $PYTHON -m pytest app/ai/tests/test_model_router_security.py -q -k "partial_timeout or timeout_before_content"
@@ -1149,11 +1149,11 @@ def test_timeout_before_content_emits_one_error() -> None:
 
 Expected: current router emits a generic error after partial output and hard-codes 120/600 in its call.
 
-- [ ] **Step 3: Create the stream budget before queueing**
+- [x] **Step 3: Create the stream budget before queueing**
 
 Record `started_at` before request preparation. Resolve idle timeout from capability override or global router timeout and create `StreamBudget.from_timeouts(idle, hard_timeout=600.0, started_at=started_at)` unless supplied. Acquire/release the router semaphore with `budget.phase_timeout()` just like Task 4.
 
-- [ ] **Step 4: Refresh only on parsed, non-empty model content**
+- [x] **Step 4: Refresh only on parsed, non-empty model content**
 
 Immediately before yielding each real content string in every OpenAI, Anthropic, and Google parsing branch:
 
@@ -1168,7 +1168,7 @@ if content:
 
 Do not call `mark_content()` for response headers, local status events, SSE comments, empty data, malformed fragments, or upstream error objects.
 
-- [ ] **Step 5: Emit mutually exclusive terminal states**
+- [x] **Step 5: Emit mutually exclusive terminal states**
 
 ```python
 except OutboundRequestError as exc:
@@ -1190,11 +1190,11 @@ Only the normal end-of-stream path emits `completed`. Re-raise `asyncio.Cancelle
 
 At logical stream entry, initialize the same request-stat record used by normal async calls. Reuse Task 4's idempotent `_finish_request_stats()` on every terminal path: `completed -> success`, timeout before content or `interrupted -> timeout`, protocol/upstream error -> error, and `CancelledError`/`GeneratorExit` -> cancelled. Finalize the statistic immediately before yielding a terminal event so a consumer that closes after receiving it cannot relabel that outcome. Extend the existing stream cancellation and early-`aclose()` tests to assert cancellation increments once and timeout remains zero.
 
-- [ ] **Step 6: Remove transitional stream timeout arguments**
+- [x] **Step 6: Remove transitional stream timeout arguments**
 
 Require `budget` on `SafeRuntimeClient.astream_lines`, remove `idle_timeout`/`total_timeout`, and update router recording fakes to assert identity with the supplied `StreamBudget`.
 
-- [ ] **Step 7: Run router and guarded-stream suites**
+- [x] **Step 7: Run router and guarded-stream suites**
 
 ```powershell
 & $PYTHON -m pytest app/ai/tests/test_model_router_security.py app/security/tests/test_runtime_http.py -q
@@ -1202,7 +1202,7 @@ Require `budget` on `SafeRuntimeClient.astream_lines`, remove `idle_timeout`/`to
 
 Expected: all pass; no stream retries and cancellation/close tests remain green.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```powershell
 git add backend/app/ai/model_router.py backend/app/ai/tests/test_model_router_security.py backend/app/security/runtime_http.py backend/app/security/tests/test_runtime_http.py
@@ -1227,7 +1227,7 @@ git commit -m "fix(ai): publish explicit stream interruption states"
 - Produces: one `invoke_with_heartbeat()` definition using `router.ainvoke()` and one `acall_with_heartbeat()` using `router.acall_capability()`.
 - Preserves: heartbeats and event callback shapes; removes wrapper `timeout` and `staggered_gather.task_timeout`.
 
-- [ ] **Step 1: Write failing helper tests**
+- [x] **Step 1: Write failing helper tests**
 
 ```python
 @pytest.mark.asyncio
@@ -1255,7 +1255,7 @@ def test_streaming_helper_defines_invoke_wrapper_once() -> None:
 
 Also add a cancellation test proving the heartbeat task is closed and `CancelledError` propagates.
 
-- [ ] **Step 2: Run helper tests and verify RED**
+- [x] **Step 2: Run helper tests and verify RED**
 
 ```powershell
 & $PYTHON -m pytest app/ai/tests/test_streaming_helper.py -q
@@ -1263,15 +1263,15 @@ Also add a cancellation test proving the heartbeat task is closed and `Cancelled
 
 Expected: the active duplicate wrapper uses `asyncio.to_thread(router.invoke)` and the source contains two definitions.
 
-- [ ] **Step 3: Keep heartbeats, remove request ownership**
+- [x] **Step 3: Keep heartbeats, remove request ownership**
 
 Delete the duplicate wrapper. `invoke_with_heartbeat` calls `await router.ainvoke(capability, payload)` directly; `acall_with_heartbeat` calls `await router.acall_capability(capability, messages, response_format)` directly. Remove their `timeout` parameters and outer `asyncio.wait_for`; preserve start/heartbeat/complete/error events and cleanup. Catch `asyncio.CancelledError` separately, emit `ai_request_cancelled`, then re-raise.
 
-- [ ] **Step 4: Remove the batch utility's competing timer**
+- [x] **Step 4: Remove the batch utility's competing timer**
 
 Delete `task_timeout` from `staggered_gather()` and replace `await asyncio.wait_for(coro, timeout=task_timeout)` with `await coro`. Keep concurrency, stagger delay, progress events, exception capture, and heartbeat behavior. Remove the `ai_parallel_task_timeout` branch; child logical requests now report their own bounded result.
 
-- [ ] **Step 5: Migrate all ordinary wrapper call sites**
+- [x] **Step 5: Migrate all ordinary wrapper call sites**
 
 Remove `timeout=30/45/60/90` arguments from critical, focus, hybridization, speciation, and endosymbiosis calls. Do not alter their capability names, payloads, callbacks, fallbacks, or batch concurrency values.
 
@@ -1283,7 +1283,7 @@ rg -n "invoke_with_heartbeat|acall_with_heartbeat|task_timeout" backend/app
 
 Expected: no call passes `timeout=` or `task_timeout=`; each helper has one definition.
 
-- [ ] **Step 6: Run helper, router, and affected service tests**
+- [x] **Step 6: Run helper, router, and affected service tests**
 
 ```powershell
 & $PYTHON -m pytest app/ai/tests/test_streaming_helper.py app/ai/tests/test_model_router_security.py app/services/analytics app/services/species -q
@@ -1291,7 +1291,7 @@ Expected: no call passes `timeout=` or `task_timeout=`; each helper has one defi
 
 Expected: all selected tests pass. If this broad selection exposes an unrelated GPU-only test, record the existing skip rather than weakening the new tests.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add backend/app/ai/streaming_helper.py backend/app/ai/model_router.py backend/app/ai/tests/test_streaming_helper.py backend/app/services/analytics/critical_analyzer.py backend/app/services/analytics/focus_processor.py backend/app/services/species/hybridization.py backend/app/services/species/speciation.py
@@ -1318,7 +1318,7 @@ git commit -m "refactor(ai): remove duplicate heartbeat timeouts"
 - Produces: `stream_invoke_with_heartbeat(router, capability, payload, task_name="AI处理", heartbeat_interval=2.0, event_callback=None, chunk_callback=None) -> StreamOutcome`.
 - Preserves: already-delivered chunks and heartbeat events; complete-only JSON parsing/final persistence.
 
-- [ ] **Step 1: Write failing helper outcome tests**
+- [x] **Step 1: Write failing helper outcome tests**
 
 ```python
 @pytest.mark.asyncio
@@ -1362,7 +1362,7 @@ async def test_complete_stream_returns_complete_outcome() -> None:
     )
 ```
 
-- [ ] **Step 2: Run helper outcome tests and verify RED**
+- [x] **Step 2: Run helper outcome tests and verify RED**
 
 ```powershell
 & $PYTHON -m pytest app/ai/tests/test_streaming_helper.py -q -k "outcome or partial_stream"
@@ -1370,7 +1370,7 @@ async def test_complete_stream_returns_complete_outcome() -> None:
 
 Expected: helpers return strings/dicts and currently treat partial content as success.
 
-- [ ] **Step 3: Implement `StreamOutcome` and one collector**
+- [x] **Step 3: Implement `StreamOutcome` and one collector**
 
 ```python
 @dataclass(frozen=True)
@@ -1411,21 +1411,21 @@ async def _collect_stream(
 
 The public helpers only create the correct router iterator, heartbeat/event callbacks, and delegate to `_collect_stream`. They do not own idle or total timers and do not parse JSON.
 
-- [ ] **Step 4: Migrate the batch speciation caller**
+- [x] **Step 4: Migrate the batch speciation caller**
 
 Remove `idle_timeout=90`. If `batch_result` is a `StreamOutcome` and `completed` is true, parse `batch_result.content` as JSON and require a dict. Otherwise set `{"_timeout": True, "_use_fallback": True}` for timeout interruption or the existing error fallback. Never include the partial content or raw error in the saved fallback object.
 
-- [ ] **Step 5: Migrate both report builders**
+- [x] **Step 5: Migrate both report builders**
 
 Replace direct router loops and their 20/30/60-second timers with the appropriate helper and `chunk_callback=stream_callback`. Use AI narrative only when `outcome.completed` and the complete stripped content passes the existing minimum-length rule. When incomplete, keep already sent callback text visible but build and return the existing complete structured fallback report.
 
 For `report_builder_v2.py`, remove the incorrect `item.get("status")` handling; the helper is the single consumer of router `state` events.
 
-- [ ] **Step 6: Add focused business regression tests**
+- [x] **Step 6: Add focused business regression tests**
 
 Test each report builder with a helper/router that yields a 100-character partial narrative then `interrupted`. Assert the chunk callback received it, the returned V1 report contains `**环境压力**`, the returned V2 report contains `## 🕐 第`, and neither returned report contains the partial narrative. Test speciation with partial JSON and assert the result is exactly `{"_timeout": True, "_use_fallback": True}` before any allowed `_endo_overrides` merge; monkeypatch `json.loads` for that partial string to fail the test if it is called.
 
-- [ ] **Step 7: Run helper and affected business tests**
+- [x] **Step 7: Run helper and affected business tests**
 
 ```powershell
 & $PYTHON -m pytest app/ai/tests/test_streaming_helper.py app/services/analytics/tests/test_report_builder_streaming.py app/services/species/tests/test_speciation_streaming.py -q
@@ -1433,7 +1433,7 @@ Test each report builder with a helper/router that yields a 100-character partia
 
 Expected: all selected tests pass; partial content is display-only.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```powershell
 git add backend/app/ai/streaming_helper.py backend/app/ai/tests/test_streaming_helper.py backend/app/services/analytics/report_builder.py backend/app/services/analytics/report_builder_v2.py backend/app/services/species/speciation.py backend/app/services/analytics/tests/__init__.py backend/app/services/analytics/tests/test_report_builder_streaming.py backend/app/services/species/tests/test_speciation_streaming.py
@@ -1456,7 +1456,7 @@ git commit -m "fix(ai): reject incomplete streamed business results"
 - Produces: warning connection state and exact user text `AI 生成中断，已使用备用结果`.
 - Preserves: already displayed stream text and does not increment AI successful completion.
 
-- [ ] **Step 1: Write the failing overlay test**
+- [x] **Step 1: Write the failing overlay test**
 
 Mock `connectToEventStream` and capture its callback:
 
@@ -1478,7 +1478,7 @@ it("shows interrupted stream as fallback warning without successful completion",
 
 The test mock returns an object with `close: vi.fn()` cast as `EventSource`, and resets the captured callback after each test.
 
-- [ ] **Step 2: Run the UI test and verify RED**
+- [x] **Step 2: Run the UI test and verify RED**
 
 ```powershell
 npm run test:run -- src/components/TurnProgressOverlay.test.tsx
@@ -1486,7 +1486,7 @@ npm run test:run -- src/components/TurnProgressOverlay.test.tsx
 
 Expected: no interruption handler or warning text exists.
 
-- [ ] **Step 3: Implement the interruption branch**
+- [x] **Step 3: Implement the interruption branch**
 
 Place it beside existing stream completion/error handling:
 
@@ -1510,11 +1510,11 @@ if (event.type === "ai_stream_interrupted") {
 
 Do not clear `streamingText`; do not increment `completed`; do not schedule a return to `receiving`.
 
-- [ ] **Step 4: Clarify existing setting copy and docs**
+- [x] **Step 4: Clarify existing setting copy and docs**
 
 Performance copy must say: ordinary calls use an end-to-end total timeout; streamed calls use it as the maximum wait for new AI content and always stop after 10 minutes. Update connectivity docs with queue/DNS/retry inclusion, 600-second stream hard limit, partial-display/complete-fallback behavior, and cancellation distinction. Do not add a new setting or expose internal URLs/errors.
 
-- [ ] **Step 5: Run focused and full frontend gates**
+- [x] **Step 5: Run focused and full frontend gates**
 
 ```powershell
 npm run test:run -- src/components/TurnProgressOverlay.test.tsx src/components/SettingsDrawer/sections/PerformanceSection.test.tsx
@@ -1526,7 +1526,7 @@ npm run build
 
 Expected: Vitest passes, ESLint stays within `--max-warnings=162`, TypeScript exits 0, and the production build succeeds.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add frontend/src/components/TurnProgressOverlay.tsx frontend/src/components/TurnProgressOverlay.test.tsx frontend/src/components/SettingsDrawer/sections/PerformanceSection.tsx docs/api-guides/modules/config-ui/api-connectivity.md docs/api-guides/modules/config-ui/ui-config.md
@@ -1543,7 +1543,7 @@ git commit -m "feat(ui): explain interrupted AI stream fallback"
 **Interfaces:**
 - Produces: reviewed Phase 3B commits pushed to the existing fork branch and reflected in PR #15 without changing Draft status.
 
-- [ ] **Step 1: Run the complete focused Phase 3B backend gate**
+- [x] **Step 1: Run the complete focused Phase 3B backend gate**
 
 ```powershell
 & $PYTHON -m pytest app/security/tests/test_deadline.py app/security/tests/test_bounded_runner.py app/security/tests/test_safe_http.py app/security/tests/test_pinned_transport.py app/security/tests/test_runtime_http.py app/ai/tests/test_model_router_security.py app/ai/tests/test_streaming_helper.py app/services/system/tests/test_embedding_security.py app/services/analytics/tests/test_report_builder_streaming.py app/services/species/tests/test_speciation_streaming.py -q
@@ -1551,7 +1551,7 @@ git commit -m "feat(ui): explain interrupted AI stream fallback"
 
 Expected: all pass; no real network; no secret sentinel in output.
 
-- [ ] **Step 2: Run the complete backend suite**
+- [x] **Step 2: Run the complete backend suite**
 
 ```powershell
 & $PYTHON -m pytest -q
@@ -1559,7 +1559,7 @@ Expected: all pass; no real network; no secret sentinel in output.
 
 Expected: zero failures and no increase from the existing skip baseline.
 
-- [ ] **Step 3: Re-run complete frontend gates**
+- [x] **Step 3: Re-run complete frontend gates**
 
 ```powershell
 npm run test:run
@@ -1570,7 +1570,7 @@ npm run build
 
 Expected: zero test/build/type failures and no increase over 162 allowed lint warnings.
 
-- [ ] **Step 4: Audit timeout ownership and security invariants**
+- [x] **Step 4: Audit timeout ownership and security invariants**
 
 ```powershell
 rg -n "read_timeout=|idle_timeout=|total_timeout=|asyncio\.wait_for|asyncio\.timeout|task_timeout|chunk_timeout" backend/app
@@ -1581,7 +1581,7 @@ git status --short
 
 Review every hit. Confirm remaining waits are the new deadline enforcement or unrelated business orchestration, no competing AI timeout remains, stream heartbeats cannot refresh idle windows, and logs/events never expose credentials, full Google query targets, bodies, or upstream exception text.
 
-- [ ] **Step 5: Review exact Phase 3B diff**
+- [x] **Step 5: Review exact Phase 3B diff**
 
 ```powershell
 git diff c48983a..HEAD --stat
@@ -1590,7 +1590,17 @@ git diff c48983a..HEAD
 
 Expected: only Phase 3B time-budget, stream outcome, tests, UI copy, and docs changes. No database, save, gameplay, dependency, provider-selection, retry-count, or PR-state change.
 
-- [ ] **Step 6: Mark executed plan checkboxes and commit verification evidence**
+**Final verification evidence (2026-07-19, HEAD `7010889`):**
+
+- Phase 3B focused backend gate: `575 passed`, `1` pre-existing warning.
+- Complete backend suite: `1278 passed`, `2 skipped`, `45 warnings`; skip and warning baselines did not increase.
+- Complete frontend gate: `85 passed`; ESLint `0 errors / 162 warnings`; TypeScript and production build exited `0`. The final backend-only fix changed no frontend files.
+- Direct runtime/router/Embedding compatibility gate: `469 passed`; exact final-boundary regressions: `17 passed`.
+- Timeout/security audit: no competing AI wrapper remained; the ten internal-budget stages were verified; dynamic raw-exception leak checks were all false; credential, Google query-target, request-body, and upstream-exception sinks were not found.
+- Exact diff review: no database, save format, gameplay formula, dependency, provider-selection, retry-count, backoff-formula, or PR-state change.
+- Final independent review: `0 Critical`, `0 Important`; publication approved with non-blocking Minor notes recorded in the SDD ledger/report.
+
+- [x] **Step 6: Mark executed plan checkboxes and commit verification evidence**
 
 Only after Steps 1-5 pass, change completed `- [ ]` markers to `- [x]`, record exact pass/skip/warning counts in the final verification task, then:
 
