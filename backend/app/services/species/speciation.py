@@ -1933,8 +1933,9 @@ class SpeciationService:
             stream_callback: 流式回调（用于心跳）
             entries: 原始entries列表，用于判断是否为植物批次
         """
-        from ...ai.streaming_helper import stream_invoke_with_heartbeat
+        from ...ai.streaming_helper import StreamOutcome, stream_invoke_with_heartbeat
         import asyncio
+        import json
         
         # === 【新增】内共生并发检测 ===
         endosymbiosis_tasks = []
@@ -1994,7 +1995,6 @@ class SpeciationService:
                 capability=prompt_name,
                 payload=payload,
                 task_name=f"分化[{batch_type}×{batch_size}]",
-                idle_timeout=90,  # 智能空闲超时：90秒无输出才超时
                 heartbeat_interval=2.0,
                 event_callback=heartbeat_callback if stream_callback else None,
             )
@@ -2010,17 +2010,42 @@ class SpeciationService:
         
         # 处理 Batch 结果
         final_content = {}
-        if isinstance(batch_result, dict):
-            # 正常的 invoke_with_heartbeat 返回包含 content 的 dict
-            final_content = batch_result.get("content", {}) if "content" in batch_result else batch_result
+        if isinstance(batch_result, StreamOutcome):
+            if batch_result.completed:
+                try:
+                    parsed_content = json.loads(batch_result.content)
+                except (TypeError, ValueError):
+                    logger.warning("[分化批量] AI返回内容不是有效JSON，将使用规则fallback")
+                    final_content = {
+                        "_error": "invalid_response",
+                        "_use_fallback": True,
+                    }
+                else:
+                    if isinstance(parsed_content, dict):
+                        final_content = parsed_content
+                    else:
+                        logger.warning("[分化批量] AI返回内容不是JSON对象，将使用规则fallback")
+                        final_content = {
+                            "_error": "invalid_response",
+                            "_use_fallback": True,
+                        }
+            elif batch_result.reason == "outbound_timeout":
+                logger.warning("[分化批量] AI流式请求中断，将使用规则fallback")
+                final_content = {"_timeout": True, "_use_fallback": True}
+            else:
+                logger.warning("[分化批量] AI流式请求失败，将使用规则fallback")
+                final_content = {"_error": "stream_error", "_use_fallback": True}
         elif isinstance(batch_result, Exception):
             # Batch 失败处理
             if isinstance(batch_result, asyncio.TimeoutError):
-                logger.warning("[分化批量] AI请求空闲超时（90秒无输出），将使用规则fallback")
+                logger.warning("[分化批量] AI请求超时，将使用规则fallback")
                 final_content = {"_timeout": True, "_use_fallback": True}
             else:
-                logger.error(f"[分化批量] 请求异常: {batch_result}，将使用规则fallback")
-                final_content = {"_error": str(batch_result), "_use_fallback": True}
+                logger.error(
+                    "[分化批量] 请求异常 (%s)，将使用规则fallback",
+                    type(batch_result).__name__,
+                )
+                final_content = {"_error": "stream_error", "_use_fallback": True}
         
         if not isinstance(final_content, dict):
             final_content = {}

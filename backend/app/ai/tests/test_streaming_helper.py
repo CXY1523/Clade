@@ -9,7 +9,186 @@ import pytest
 
 from app.ai import streaming_helper
 from app.ai.model_router import staggered_gather
-from app.ai.streaming_helper import acall_with_heartbeat, invoke_with_heartbeat
+from app.ai.streaming_helper import (
+    acall_with_heartbeat,
+    invoke_with_heartbeat,
+    stream_call_with_heartbeat,
+    stream_invoke_with_heartbeat,
+)
+
+
+class StreamRouter:
+    def __init__(self, items: list[Any]) -> None:
+        self.items = items
+
+    async def astream(self, capability: str, payload: dict[str, Any]):
+        for item in self.items:
+            yield item
+
+    async def astream_capability(
+        self,
+        capability: str,
+        messages: list[dict[str, str]],
+        response_format: dict[str, Any] | None = None,
+    ):
+        for item in self.items:
+            yield item
+
+
+@pytest.mark.asyncio
+async def test_partial_stream_returns_incomplete_outcome_and_keeps_chunks() -> None:
+    router = StreamRouter(
+        [
+            {"type": "status", "state": "receiving"},
+            '{"species":',
+            {
+                "type": "status",
+                "state": "interrupted",
+                "reason": "outbound_timeout",
+                "partial": True,
+            },
+        ]
+    )
+    shown: list[str] = []
+    events: list[str] = []
+
+    outcome = await stream_invoke_with_heartbeat(
+        router,
+        "speciation",
+        {},
+        chunk_callback=lambda chunk: shown.append(chunk),
+        event_callback=lambda event, *_: events.append(event),
+    )
+
+    assert outcome == streaming_helper.StreamOutcome(
+        content='{"species":', completed=False, reason="outbound_timeout"
+    )
+    assert shown == ['{"species":']
+    assert "ai_stream_interrupted" in events
+    assert "ai_stream_complete" not in events
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_returns_complete_outcome() -> None:
+    router = StreamRouter(
+        [
+            {"type": "status", "state": "receiving"},
+            '{"ok":true}',
+            {"type": "status", "state": "completed"},
+        ]
+    )
+
+    outcome = await stream_invoke_with_heartbeat(router, "generate", {})
+
+    assert outcome == streaming_helper.StreamOutcome(
+        content='{"ok":true}', completed=True, reason=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_stream_returns_complete_outcome_and_keeps_chunks() -> None:
+    router = StreamRouter(
+        [
+            {"type": "status", "state": "connected"},
+            "complete narrative",
+            {"type": "status", "state": "completed"},
+        ]
+    )
+    shown: list[str] = []
+
+    outcome = await stream_call_with_heartbeat(
+        router,
+        "turn_report",
+        [{"role": "user", "content": "Write a report"}],
+        chunk_callback=lambda chunk: shown.append(chunk),
+    )
+
+    assert outcome == streaming_helper.StreamOutcome(
+        content="complete narrative", completed=True, reason=None
+    )
+    assert shown == ["complete narrative"]
+
+
+@pytest.mark.asyncio
+async def test_stream_collector_closes_router_iterator_after_terminal_event() -> None:
+    class ClosingRouter(StreamRouter):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.closed = False
+
+        async def astream(self, capability: str, payload: dict[str, Any]):
+            try:
+                yield "done"
+                yield {"type": "status", "state": "completed"}
+                yield "must not be collected"
+            finally:
+                self.closed = True
+
+    router = ClosingRouter()
+
+    outcome = await stream_invoke_with_heartbeat(router, "generate", {})
+
+    assert outcome.content == "done"
+    assert router.closed is True
+
+
+@pytest.mark.asyncio
+async def test_stream_chunk_callback_awaits_any_awaitable() -> None:
+    router = StreamRouter(
+        ["chunk", {"type": "status", "state": "completed"}]
+    )
+    callback_future: asyncio.Future[None] | None = None
+
+    def callback(chunk: str) -> asyncio.Future[None]:
+        nonlocal callback_future
+        callback_future = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(callback_future.set_result, None)
+        return callback_future
+
+    await stream_invoke_with_heartbeat(
+        router,
+        "generate",
+        {},
+        chunk_callback=callback,
+    )
+
+    assert callback_future is not None
+    assert callback_future.done()
+
+
+@pytest.mark.asyncio
+async def test_stream_close_error_does_not_replace_terminal_outcome() -> None:
+    class CloseErrorIterator:
+        def __init__(self) -> None:
+            self.items = iter(
+                ["done", {"type": "status", "state": "completed"}]
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.items)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+        async def aclose(self) -> None:
+            raise RuntimeError("secondary close failure")
+
+    class CloseErrorRouter(StreamRouter):
+        def astream(self, capability: str, payload: dict[str, Any]):
+            return CloseErrorIterator()
+
+    outcome = await stream_invoke_with_heartbeat(
+        CloseErrorRouter([]),
+        "generate",
+        {},
+    )
+
+    assert outcome == streaming_helper.StreamOutcome(
+        content="done", completed=True, reason=None
+    )
 
 
 class RecordingRouter:
