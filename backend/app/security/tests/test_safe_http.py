@@ -13,6 +13,7 @@ from typing import Any
 import httpcore
 import pytest
 
+from app.security.bounded_runner import BoundedDaemonRunner
 from app.security.outbound_url import (
     OutboundRequestError,
     OutboundURLPolicy,
@@ -25,7 +26,6 @@ from app.security.safe_http import (
     MODEL_LIST_TIMEOUTS,
     ProbeTimeouts,
     SafeProbeClient,
-    _BoundedDaemonRunner,
 )
 
 
@@ -516,7 +516,7 @@ def test_probe_status_closes_without_consuming_response_body() -> None:
 
 def test_total_deadline_includes_dns_and_body_read() -> None:
     tiny = ProbeTimeouts(1.0, 1.0, 1.0, 1.0, 0.03)
-    dns_runner = _BoundedDaemonRunner(max_workers=4)
+    dns_runner = BoundedDaemonRunner(max_workers=4)
     dns_policy = OutboundURLPolicy(
         resolver=FakeResolver(
             {"public.example": ["93.184.216.34"]},
@@ -539,7 +539,7 @@ def test_total_deadline_includes_dns_and_body_read() -> None:
         )
     dns_elapsed = time.monotonic() - started
 
-    body_runner = _BoundedDaemonRunner(max_workers=4)
+    body_runner = BoundedDaemonRunner(max_workers=4)
     body = b'{"ok":true}'
     body_stream = CannedHTTPStream(
         _response_headers(content_length=len(body)),
@@ -571,7 +571,7 @@ def test_total_deadline_includes_dns_and_body_read() -> None:
 
 
 def test_bounded_runner_never_starts_more_than_four_blocked_workers() -> None:
-    runner = _BoundedDaemonRunner(max_workers=4)
+    runner = BoundedDaemonRunner(max_workers=4)
     release = threading.Event()
     barrier = threading.Barrier(7)
     errors: list[str] = []

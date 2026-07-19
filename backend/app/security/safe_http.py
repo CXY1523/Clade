@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-import queue
 import threading
-import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeVar, cast
@@ -12,6 +10,7 @@ from typing import Any, Literal, Protocol, TypeVar, cast
 import httpcore
 import httpx
 
+from .bounded_runner import DEFAULT_BOUNDED_RUNNER
 from .outbound_url import (
     OutboundRequestError,
     OutboundURLPolicy,
@@ -89,66 +88,7 @@ class _Runner(Protocol):
     def run(self, operation: Callable[[], T], *, timeout: float) -> T: ...
 
 
-class _BoundedDaemonRunner:
-    """Run blocking operations under a bounded daemon-thread total deadline."""
-
-    def __init__(self, max_workers: int = 4) -> None:
-        if max_workers <= 0 or max_workers > 4:
-            raise ValueError("max_workers must be between 1 and 4")
-        self._slots = threading.BoundedSemaphore(max_workers)
-        self._state_lock = threading.Lock()
-        self._active = 0
-        self._max_active = 0
-
-    @property
-    def max_active(self) -> int:
-        with self._state_lock:
-            return self._max_active
-
-    def run(self, operation: Callable[[], T], *, timeout: float) -> T:
-        deadline = time.monotonic() + max(timeout, 0.0)
-        if not self._slots.acquire(timeout=max(deadline - time.monotonic(), 0.0)):
-            raise TimeoutError
-
-        result: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
-
-        def worker() -> None:
-            with self._state_lock:
-                self._active += 1
-                self._max_active = max(self._max_active, self._active)
-            try:
-                try:
-                    result.put((True, operation()))
-                except BaseException as exc:
-                    result.put((False, exc))
-            finally:
-                with self._state_lock:
-                    self._active -= 1
-                self._slots.release()
-
-        thread = threading.Thread(
-            target=worker,
-            name="clade-safe-http",
-            daemon=True,
-        )
-        try:
-            thread.start()
-        except BaseException:
-            self._slots.release()
-            raise
-
-        try:
-            succeeded, value = result.get(
-                timeout=max(deadline - time.monotonic(), 0.0)
-            )
-        except queue.Empty:
-            raise TimeoutError from None
-        if succeeded:
-            return cast(T, value)
-        raise cast(BaseException, value)
-
-
-_DEFAULT_RUNNER = _BoundedDaemonRunner(max_workers=4)
+_DEFAULT_RUNNER = DEFAULT_BOUNDED_RUNNER
 
 
 class SafeProbeClient:
