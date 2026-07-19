@@ -2387,6 +2387,122 @@ async def test_stream_cancel_propagates_and_closes_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_outer_cancellation_survives_failing_cleanup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cancel_sentinel = "stream-outer-cancel-primary"
+    cleanup_sentinel = "stream-cancel-cleanup-secret"
+    stream = RecordingAsyncStream(
+        body=b"never",
+        block_body=True,
+        close_error=OSError(cleanup_sentinel),
+    )
+    client, _, _ = _runtime_client("async", stream)
+    task = asyncio.create_task(_collect_runtime_lines(client))
+
+    await asyncio.wait_for(stream.body_read_started.wait(), timeout=1.0)
+    task.cancel(cancel_sentinel)
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await task
+
+    assert exc_info.value.args == (cancel_sentinel,)
+    assert stream.close_count == 1
+    assert cleanup_sentinel not in repr(exc_info.value)
+    assert cleanup_sentinel not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_stream_outer_cancellation_survives_cleanup_cancellation() -> None:
+    stream = RecordingAsyncStream(
+        body=b"never",
+        block_body=True,
+        close_error=cast(Any, asyncio.CancelledError("inner-cleanup-cancel")),
+    )
+    client, _, _ = _runtime_client("async", stream)
+    task = asyncio.create_task(_collect_runtime_lines(client))
+
+    await asyncio.wait_for(stream.body_read_started.wait(), timeout=1.0)
+    task.cancel("outer-cancel")
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await task
+
+    assert exc_info.value.args == ("outer-cancel",)
+    assert stream.close_count == 1
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_code"),
+    [
+        ("timeout", "outbound_timeout"),
+        ("read", "outbound_connect_failed"),
+        ("protocol", "outbound_bad_response"),
+    ],
+    ids=["timeout", "read", "protocol"],
+)
+@pytest.mark.asyncio
+async def test_stream_primary_error_survives_failing_cleanup(
+    failure_kind: str,
+    expected_code: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_sentinel = f"stream-{expected_code}-cleanup-secret"
+    if failure_kind == "protocol":
+        stream = RecordingAsyncStream(
+            close_error=OSError(cleanup_sentinel),
+        )
+
+        def raise_protocol_error(
+            response: httpx.Response, max_bytes: int
+        ) -> None:
+            del response, max_bytes
+            raise httpcore.ProtocolError("primary-protocol-error")
+
+        monkeypatch.setattr(
+            runtime_http, "_check_response_headers", raise_protocol_error
+        )
+    else:
+        primary_error: BaseException = (
+            httpcore.ReadTimeout("primary-timeout")
+            if failure_kind == "timeout"
+            else httpcore.ReadError("primary-read-error")
+        )
+        stream = RecordingAsyncStream(
+            read_error=cast(Any, primary_error),
+            close_error=OSError(cleanup_sentinel),
+        )
+    client, _, _ = _runtime_client("async", stream)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(client)
+
+    assert exc_info.value.code == expected_code
+    assert stream.close_count == 1
+    assert cleanup_sentinel not in repr(exc_info.value)
+    assert cleanup_sentinel not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_stream_cleanup_failure_without_primary_keeps_fixed_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cleanup_sentinel = "stream-standalone-cleanup-secret"
+    stream = RecordingAsyncStream(
+        body=b"complete\n",
+        close_error=OSError(cleanup_sentinel),
+    )
+    client, _, _ = _runtime_client("async", stream)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(client)
+
+    assert exc_info.value.code == "outbound_connect_failed"
+    assert stream.close_count == 1
+    assert cleanup_sentinel not in repr(exc_info.value)
+    assert cleanup_sentinel not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_stream_base_exception_propagates_unchanged_and_closes_once(
 ) -> None:
     class FatalStreamSignal(BaseException):

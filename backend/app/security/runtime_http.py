@@ -206,6 +206,21 @@ _CLEANUP_DISPLACED = object()
 _CLEANUP_DISPLACED_ATTRIBUTE = "_clade_cleanup_displaced"
 
 
+def _traceback_references_read_stream(
+    error: BaseException,
+    marker: _ReadInvocationMarker,
+) -> bool:
+    traceback = error.__traceback__
+    while traceback is not None:
+        if any(
+            id(value) in marker.stream_identities
+            for value in traceback.tb_frame.f_locals.values()
+        ):
+            return True
+        traceback = traceback.tb_next
+    return False
+
+
 def _cleanup_displaced_primary(
     cleanup_error: httpcore.NetworkError,
     marker: _ReadInvocationMarker,
@@ -218,15 +233,11 @@ def _cleanup_displaced_primary(
     candidate = delegate_cleanup_error.__context__
     if candidate is None:
         return None
-    traceback = candidate.__traceback__
-    while traceback is not None:
-        if any(
-            id(value) in marker.stream_identities
-            for value in traceback.tb_frame.f_locals.values()
-        ):
-            return candidate
-        traceback = traceback.tb_next
-    return None
+    return (
+        candidate
+        if _traceback_references_read_stream(candidate, marker)
+        else None
+    )
 
 
 def _is_sanitized_close_error(error: BaseException) -> bool:
@@ -255,6 +266,14 @@ def _displaced_read_error(
         if isinstance(captured_error, httpcore.NetworkError)
         else None
     )
+    if primary_error is None and isinstance(
+        captured_error, asyncio.CancelledError
+    ):
+        candidate = captured_error.__context__
+        if candidate is not None and _traceback_references_read_stream(
+            candidate, marker
+        ):
+            primary_error = candidate
     if primary_error is None and not _is_sanitized_close_error(captured_error):
         return None
     escaped_error = captured_error if primary_error is None else primary_error
@@ -719,6 +738,8 @@ class SafeRuntimeClient:
                 budget=effective_budget,
             )
             client: httpx.AsyncClient | None = None
+            primary_error: BaseException | None = None
+            response_cleanup_failed = False
             try:
                 client = httpx.AsyncClient(
                     transport=transport,
@@ -743,102 +764,172 @@ class SafeRuntimeClient:
                 )
                 response: httpx.Response | None = None
                 try:
-                    async with asyncio.timeout(effective_budget.phase_timeout()):
-                        response = await response_context.__aenter__()
-                    effective_budget.phase_timeout()
-                    _check_response_headers(response, max_bytes)
-                    iterator = response.aiter_raw().__aiter__()
-                    line_buffer = bytearray()
-                    total_bytes = 0
-
-                    while True:
-                        try:
-                            async with asyncio.timeout(
-                                effective_budget.phase_timeout()
-                            ):
-                                chunk = await iterator.__anext__()
-                        except StopAsyncIteration:
-                            break
-                        effective_budget.phase_timeout()
-
-                        total_bytes += len(chunk)
-                        if total_bytes > max_bytes:
-                            raise _response_too_large()
-
-                        offset = 0
-                        while offset < len(chunk):
-                            newline = chunk.find(b"\n", offset)
-                            segment_end = len(chunk) if newline < 0 else newline
-                            segment_length = segment_end - offset
-                            accumulator_room = (
-                                max_event_bytes + 1 - len(line_buffer)
-                            )
-                            copy_length = min(segment_length, accumulator_room)
-                            if copy_length:
-                                line_buffer.extend(
-                                    chunk[offset : offset + copy_length]
-                                )
-                            if (
-                                segment_length > accumulator_room
-                                or len(line_buffer) > max_event_bytes
-                            ):
-                                raise _response_too_large()
-                            if newline < 0:
-                                break
-
-                            raw_line = bytes(line_buffer)
-                            line_buffer.clear()
-                            if raw_line.endswith(b"\r"):
-                                raw_line = raw_line[:-1]
+                    try:
+                        async with asyncio.timeout(
                             effective_budget.phase_timeout()
-                            line = raw_line.decode("utf-8", errors="strict")
-                            _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
-                            token = None
-                            try:
-                                yield line
-                            finally:
-                                token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(True)
-                            offset = newline + 1
-
-                    if line_buffer:
-                        if len(line_buffer) > max_event_bytes:
-                            raise _response_too_large()
-                        raw_line = bytes(line_buffer)
-                        if raw_line.endswith(b"\r"):
-                            raw_line = raw_line[:-1]
+                        ):
+                            response = await response_context.__aenter__()
                         effective_budget.phase_timeout()
-                        line = raw_line.decode("utf-8", errors="strict")
-                        _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
-                        token = None
+                        _check_response_headers(response, max_bytes)
+                        iterator = response.aiter_raw().__aiter__()
+                        marker = _ReadInvocationMarker(response)
                         try:
-                            yield line
-                        finally:
-                            token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(True)
+                            line_buffer = bytearray()
+                            total_bytes = 0
+
+                            while True:
+                                try:
+                                    async with asyncio.timeout(
+                                        effective_budget.phase_timeout()
+                                    ):
+                                        chunk = await iterator.__anext__()
+                                except StopAsyncIteration:
+                                    break
+                                effective_budget.phase_timeout()
+
+                                total_bytes += len(chunk)
+                                if total_bytes > max_bytes:
+                                    raise _response_too_large()
+
+                                offset = 0
+                                while offset < len(chunk):
+                                    newline = chunk.find(b"\n", offset)
+                                    segment_end = (
+                                        len(chunk) if newline < 0 else newline
+                                    )
+                                    segment_length = segment_end - offset
+                                    accumulator_room = (
+                                        max_event_bytes + 1 - len(line_buffer)
+                                    )
+                                    copy_length = min(
+                                        segment_length, accumulator_room
+                                    )
+                                    if copy_length:
+                                        line_buffer.extend(
+                                            chunk[offset : offset + copy_length]
+                                        )
+                                    if (
+                                        segment_length > accumulator_room
+                                        or len(line_buffer) > max_event_bytes
+                                    ):
+                                        raise _response_too_large()
+                                    if newline < 0:
+                                        break
+
+                                    raw_line = bytes(line_buffer)
+                                    line_buffer.clear()
+                                    if raw_line.endswith(b"\r"):
+                                        raw_line = raw_line[:-1]
+                                    effective_budget.phase_timeout()
+                                    line = raw_line.decode(
+                                        "utf-8", errors="strict"
+                                    )
+                                    _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
+                                    token = None
+                                    try:
+                                        yield line
+                                    finally:
+                                        token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(
+                                            True
+                                        )
+                                    offset = newline + 1
+
+                            if line_buffer:
+                                if len(line_buffer) > max_event_bytes:
+                                    raise _response_too_large()
+                                raw_line = bytes(line_buffer)
+                                if raw_line.endswith(b"\r"):
+                                    raw_line = raw_line[:-1]
+                                effective_budget.phase_timeout()
+                                line = raw_line.decode(
+                                    "utf-8", errors="strict"
+                                )
+                                _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
+                                token = None
+                                try:
+                                    yield line
+                                finally:
+                                    token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(
+                                        True
+                                    )
+                        except BaseException as exc:
+                            displaced_error = _displaced_read_error(exc, marker)
+                            if displaced_error is None:
+                                del marker
+                                raise
+                            del marker
+                            raise displaced_error from None
+                        else:
+                            del marker
+                    except BaseException as exc:
+                        if response is None:
+                            raise
+                        if response.is_closed:
+                            response_cleanup_failed = True
+                        else:
+                            try:
+                                await response_context.__aexit__(
+                                    type(exc), exc, exc.__traceback__
+                                )
+                            except BaseException:
+                                response_cleanup_failed = True
+                        raise
+                    else:
+                        try:
+                            await response_context.__aexit__(None, None, None)
+                        except BaseException:
+                            response_cleanup_failed = True
+                            raise
+                except BaseException as exc:
+                    primary_error = exc
+                    raise
                 finally:
-                    if response is not None:
-                        await response_context.__aexit__(None, None, None)
-            finally:
+                    if not response_cleanup_failed:
+                        try:
+                            if client is None:
+                                await transport.aclose()
+                            else:
+                                await client.aclose()
+                        except BaseException:
+                            if primary_error is None:
+                                raise
+            except BaseException:
                 if client is None:
-                    await transport.aclose()
-                else:
-                    await client.aclose()
-        except OutboundRequestError:
+                    try:
+                        await transport.aclose()
+                    except BaseException:
+                        pass
+                raise
+        except OutboundRequestError as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise
         except (
             DeadlineExpired,
             TimeoutError,
             httpx.TimeoutException,
             httpcore.TimeoutException,
-        ):
+        ) as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _timeout() from None
-        except (httpx.DecodingError, httpx.ProtocolError, httpcore.ProtocolError):
+        except (
+            httpx.DecodingError,
+            httpx.ProtocolError,
+            httpcore.ProtocolError,
+        ) as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _bad_response() from None
-        except (httpx.RequestError, httpcore.NetworkError, OSError):
+        except (httpx.RequestError, httpcore.NetworkError, OSError) as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _connect_failed() from None
-        except Exception:
+        except Exception as exc:
+            _clear_displaced_cleanup_artifacts(exc)
             raise _bad_response() from None
+        except BaseException as exc:
+            _clear_displaced_cleanup_artifacts(exc)
+            raise
         finally:
             if token is not None:
                 _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)

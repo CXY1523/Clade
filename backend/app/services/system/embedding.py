@@ -672,6 +672,10 @@ class EmbeddingService:
                     max_bytes=EMBEDDING_JSON_MAX_BYTES,
                 )
                 batch_vectors = self._parse_embedding_response(data, len(batch_texts))
+                try:
+                    effective_budget.phase_timeout()
+                except DeadlineExpired:
+                    raise timeout_error() from None
                 with self._stats_lock:
                     self._stats["api_calls"] += 1
                 return _EmbeddingGenerationResult(tuple(

@@ -730,7 +730,9 @@ class ModelRouter:
         if req["is_local"]:
             logger.debug(f"[ModelRouter] Local mode: {req['result']}")
             return req["result"]
-            
+
+        self._begin_request_stats(capability)
+        stats_finished = False
         try:
             effective_budget = _ensure_deadline(
                 budget, timeout=req["timeout"], started_at=started_at
@@ -750,13 +752,14 @@ class ModelRouter:
                 data, req.get("provider_type", PROVIDER_TYPE_OPENAI)
             )
             parsed_content = self._parse_content(content)
-            
-            return {
-                **req["meta"],
-                "content": parsed_content,
-                "raw": data,
-            }
+            _budget_phase_timeout(effective_budget)
         except _PrimaryResponseError:
+            stats_finished = self._finish_request_stats(
+                capability,
+                "error",
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
             logger.warning(
                 "[ModelRouter] Sync invoke invalid response %s code=invalid_response_shape",
                 capability,
@@ -766,6 +769,12 @@ class ModelRouter:
                 "error": _PRIMARY_RESPONSE_ERROR,
             }
         except OutboundRequestError as exc:
+            stats_finished = self._finish_request_stats(
+                capability,
+                "timeout" if exc.code == "outbound_timeout" else "error",
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
             logger.warning(
                 "[ModelRouter] Sync invoke failed %s code=%s",
                 capability,
@@ -774,6 +783,18 @@ class ModelRouter:
             return {
                 **req["meta"],
                 "error": exc.public_message,
+            }
+        else:
+            self._finish_request_stats(
+                capability,
+                "success",
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
+            return {
+                **req["meta"],
+                "content": parsed_content,
+                "raw": data,
             }
 
     async def ainvoke(
@@ -838,6 +859,7 @@ class ModelRouter:
                     provider_latency = time.monotonic() - provider_call_start
                     content = self._extract_primary_content(data, provider_type)
                     parsed_content = self._parse_content(content)
+                    _budget_phase_timeout(effective_budget)
                 except _PrimaryResponseError:
                     lifecycle.finish("error")
                     logger.warning(
@@ -1121,6 +1143,7 @@ class ModelRouter:
                     first_line = await iterator.__anext__()
                 except StopAsyncIteration:
                     yield self._stream_status_event(capability, "connected")
+                    _budget_phase_timeout(budget)
                     yield self._stream_status_event(capability, "completed")
                     return
 
@@ -1186,6 +1209,7 @@ class ModelRouter:
                                         if not isinstance(text, str):
                                             raise TypeError
                                         if text:
+                                            _budget_phase_timeout(budget)
                                             budget.mark_content()
                                             if first_chunk:
                                                 yield self._stream_status_event(
@@ -1255,6 +1279,7 @@ class ModelRouter:
                                 )
                                 return
                             if text:
+                                _budget_phase_timeout(budget)
                                 budget.mark_content()
                                 if first_chunk:
                                     yield self._stream_status_event(
@@ -1307,6 +1332,7 @@ class ModelRouter:
                             )
                             return
                         if content:
+                            _budget_phase_timeout(budget)
                             budget.mark_content()
                             if first_chunk:
                                 yield self._stream_status_event(
@@ -1315,6 +1341,7 @@ class ModelRouter:
                                 first_chunk = False
                             yield content
 
+                _budget_phase_timeout(budget)
                 yield self._stream_status_event(capability, "completed")
             except asyncio.CancelledError as exc:
                 primary_cancel = exc
@@ -1507,6 +1534,8 @@ class ModelRouter:
             api_key=api_key,
             stream=False,
         )
+        self._begin_request_stats(capability)
+        stats_finished = False
         try:
             effective_budget = _ensure_deadline(
                 budget, timeout=timeout, started_at=started_at
@@ -1521,16 +1550,39 @@ class ModelRouter:
                 budget=effective_budget,
                 max_bytes=AI_JSON_MAX_BYTES,
             )
+            result = self._extract_capability_content(
+                data, provider_type, capability
+            )
+            _budget_phase_timeout(effective_budget)
         except OutboundRequestError as exc:
+            stats_finished = self._finish_request_stats(
+                capability,
+                "timeout" if exc.code == "outbound_timeout" else "error",
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
             logger.warning(
                 "[ModelRouter] Capability call failed %s code=%s",
                 capability,
                 exc.code,
             )
             raise RuntimeError(exc.public_message) from None
-        
-        # 根据 provider_type 解析响应
-        return self._extract_capability_content(data, provider_type, capability)
+        except Exception:
+            self._finish_request_stats(
+                capability,
+                "error",
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
+            raise
+        else:
+            self._finish_request_stats(
+                capability,
+                "success",
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
+            return result
 
     async def acall_capability(
         self,
@@ -1697,6 +1749,7 @@ class ModelRouter:
             result = self._extract_capability_content(
                 data, provider_type, capability
             )
+            _budget_phase_timeout(effective_budget)
         except OutboundRequestError as exc:
             outcome = "timeout" if exc.code == "outbound_timeout" else "error"
             lifecycle.finish(outcome)
@@ -1879,6 +1932,7 @@ class ModelRouter:
             result = self._extract_capability_content(
                 data, provider_type, capability
             )
+            _budget_phase_timeout(effective_budget)
         except OutboundRequestError as exc:
             outcome = "timeout" if exc.code == "outbound_timeout" else "error"
             lifecycle.finish(outcome)
@@ -2100,6 +2154,7 @@ class ModelRouter:
                     first_line = await iterator.__anext__()
                 except StopAsyncIteration:
                     yield self._stream_status_event(capability, "connected")
+                    _budget_phase_timeout(budget)
                     yield self._stream_status_event(capability, "completed")
                     return
 
@@ -2176,6 +2231,7 @@ class ModelRouter:
                                         if not isinstance(text, str):
                                             raise TypeError
                                         if text:
+                                            _budget_phase_timeout(budget)
                                             budget.mark_content()
                                             if first_chunk:
                                                 yield self._stream_status_event(
@@ -2244,6 +2300,7 @@ class ModelRouter:
                                 )
                                 return
                             if text:
+                                _budget_phase_timeout(budget)
                                 budget.mark_content()
                                 if first_chunk:
                                     yield self._stream_status_event(
@@ -2295,6 +2352,7 @@ class ModelRouter:
                             )
                             return
                         if content:
+                            _budget_phase_timeout(budget)
                             budget.mark_content()
                             if first_chunk:
                                 yield self._stream_status_event(
@@ -2303,6 +2361,7 @@ class ModelRouter:
                                 first_chunk = False
                             yield content
 
+                _budget_phase_timeout(budget)
                 yield self._stream_status_event(capability, "completed")
             except asyncio.CancelledError as exc:
                 primary_cancel = exc

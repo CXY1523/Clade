@@ -684,6 +684,101 @@ def test_normal_entries_pass_same_budget_object_to_runtime(entry_name: str) -> N
     "entry_name",
     ["invoke", "ainvoke", "call_capability", "acall_capability", "chat"],
 )
+def test_normal_entry_parsing_cannot_finish_after_total_budget(
+    entry_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(1.0, clock=clock)
+    runtime_client = RecordingSafeRuntimeClient()
+    response = {"choices": [{"message": {"content": "oak"}}]}
+    runtime_client.sync_results = [response]
+    runtime_client.async_results = [response]
+    router = _remote_router(
+        runtime_client, max_retries=1, allow_local=False
+    )
+    router.configure_load_balance(True)
+    router.set_provider_pool(
+        "generate",
+        [
+            ProviderPoolConfig(
+                provider_id="selected-provider",
+                base_url="https://pool.example/v1",
+                api_key="pool-key",
+                model="pool-model",
+            )
+        ],
+    )
+    monkeypatch.setattr(model_router_module.time, "monotonic", clock)
+
+    if entry_name in {"invoke", "ainvoke"}:
+        real_parser = router._parse_content
+
+        def advancing_parser(content: str) -> Any:
+            result = real_parser(content)
+            clock.advance(1.0)
+            return result
+
+        monkeypatch.setattr(router, "_parse_content", advancing_parser)
+    else:
+        real_extractor = router._extract_capability_content
+
+        def advancing_extractor(
+            data: dict[str, Any], provider_type: str, capability: str
+        ) -> str:
+            result = real_extractor(data, provider_type, capability)
+            clock.advance(1.0)
+            return result
+
+        monkeypatch.setattr(
+            router, "_extract_capability_content", advancing_extractor
+        )
+
+    if entry_name == "invoke":
+        result = router.invoke("generate", {"name": "oak"}, budget=budget)
+        assert result["error"] == PUBLIC_TIMEOUT
+        assert "content" not in result and "raw" not in result
+    elif entry_name == "ainvoke":
+        result = asyncio.run(
+            router.ainvoke("generate", {"name": "oak"}, budget=budget)
+        )
+        assert result["error"] == PUBLIC_TIMEOUT
+        assert "content" not in result and "raw" not in result
+    elif entry_name == "call_capability":
+        with pytest.raises(RuntimeError, match=PUBLIC_TIMEOUT):
+            router.call_capability("generate", _messages(), budget=budget)
+    elif entry_name == "acall_capability":
+        with pytest.raises(RuntimeError, match=PUBLIC_TIMEOUT):
+            asyncio.run(
+                router.acall_capability(
+                    "generate", _messages(), budget=budget
+                )
+            )
+    else:
+        with pytest.raises(RuntimeError, match=PUBLIC_TIMEOUT):
+            asyncio.run(
+                router.chat(
+                    "Name a tree", capability="generate", budget=budget
+                )
+            )
+
+    assert len(runtime_client.calls) == 1
+    assert runtime_client.calls[0]["budget"] is budget
+    diagnostics = router.get_diagnostics()
+    stats = diagnostics["request_stats"]["generate"]
+    assert diagnostics["total_requests"] == 1
+    assert diagnostics["total_timeouts"] == 1
+    assert stats["total"] == 1
+    assert stats["timeout"] == 1
+    assert stats["success"] == 0
+    assert stats["error"] == 0
+    assert router._provider_latencies == {}
+
+
+@pytest.mark.parametrize(
+    "entry_name",
+    ["invoke", "ainvoke", "call_capability", "acall_capability", "chat"],
+)
 def test_normal_entry_preparation_is_inside_total_budget(
     entry_name: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -1230,6 +1325,65 @@ def test_partial_timeout_emits_interrupted_without_completed(entry: str) -> None
     assert diagnostics["total_timeouts"] == 1
     assert diagnostics["request_stats"]["generate"]["timeout"] == 1
     assert diagnostics["request_stats"]["generate"]["success"] == 0
+
+
+@pytest.mark.parametrize("entry", ["template", "capability"])
+@pytest.mark.parametrize("cross_hard_deadline", [True, False])
+def test_google_buffered_event_checks_hard_deadline_between_content_parts(
+    entry: str,
+    cross_hard_deadline: bool,
+) -> None:
+    async def scenario() -> tuple[list[Any], ModelRouter]:
+        clock = ManualClock()
+        budget = StreamBudget.from_timeouts(
+            10.0, hard_timeout=1.0, clock=clock
+        )
+        runtime_client = RecordingSafeRuntimeClient()
+        runtime_client.stream_lines = [
+            '[{"candidates":['
+            '{"content":{"parts":[{"text":"first"},{"text":"second"}]}},'
+            '{"content":{"parts":[{"text":"third"}]}}]}]'
+        ]
+        router = _remote_router(
+            runtime_client,
+            provider_type=PROVIDER_TYPE_GOOGLE,
+            allow_local=False,
+        )
+        stream = (
+            router.astream("generate", {"name": "elm"}, budget=budget)
+            if entry == "template"
+            else router.astream_capability(
+                "generate", _messages(), budget=budget
+            )
+        )
+        events: list[Any] = []
+        while "first" not in events:
+            events.append(await anext(stream))
+        if cross_hard_deadline:
+            clock.advance(1.0)
+        events.extend([event async for event in stream])
+        return events, router
+
+    events, router = asyncio.run(scenario())
+    text_events = [event for event in events if isinstance(event, str)]
+    terminals = [
+        event["state"]
+        for event in events
+        if isinstance(event, dict)
+        and event.get("state") in {"completed", "interrupted"}
+    ]
+    stats = router.get_diagnostics()["request_stats"]["generate"]
+
+    if cross_hard_deadline:
+        assert text_events == ["first"]
+        assert terminals == ["interrupted"]
+        assert stats["timeout"] == 1
+        assert stats["success"] == 0
+    else:
+        assert text_events == ["first", "second", "third"]
+        assert terminals == ["completed"]
+        assert stats["timeout"] == 0
+        assert stats["success"] == 1
 
 
 @pytest.mark.parametrize("entry", ["template", "capability"])

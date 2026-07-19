@@ -350,6 +350,48 @@ def test_embedding_chunk_budget_starts_before_config_and_payload_preparation(
     assert budget.deadline == expected_started_at + 23.0
 
 
+@pytest.mark.parametrize("require_real", [True, False])
+def test_embedding_parse_cannot_finish_after_chunk_budget(
+    require_real: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(1.0, clock=clock)
+    client = RecordingSafeRuntimeClient(
+        [{"data": [{"index": 0, "embedding": [1.0]}]}]
+    )
+    service = remote_service(client)
+    real_parser = service._parse_embedding_response
+
+    def advancing_parser(data: Any, expected_count: int) -> list[list[float]]:
+        result = real_parser(data, expected_count)
+        clock.advance(1.0)
+        return result
+
+    monkeypatch.setattr(
+        service, "_parse_embedding_response", advancing_parser
+    )
+
+    if require_real:
+        with pytest.raises(RuntimeError, match="外部服务请求超时"):
+            service._request_embedding_chunk_result(
+                ["oak"], require_real=True, budget=budget
+            )
+        assert service._stats["fake_embeds"] == 0
+    else:
+        result = service._request_embedding_chunk_result(
+            ["oak"], require_real=False, budget=budget
+        )
+        assert result.items[0].source == "remote_fallback_fake"
+        assert result.items[0].cacheable is False
+        assert result.items[0].vector == service._fake_embed("oak")
+        assert service._stats["fake_embeds"] == 1
+
+    assert len(client.calls) == 1
+    assert client.calls[0]["budget"] is budget
+    assert service._stats["api_calls"] == 0
+
+
 def test_embedding_request_uses_safe_client_and_preserves_payload() -> None:
     client = RecordingSafeRuntimeClient(
         [{"data": [{"index": 1, "embedding": [2.0]}, {"index": 0, "embedding": [1.0]}]}]
