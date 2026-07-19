@@ -192,7 +192,18 @@ def _parse_json_object(content: bytearray) -> dict[str, Any]:
     return cast(dict[str, Any], parsed)
 
 
-def _read_sync_json(
+def _cleanup_displaced_primary(
+    cleanup_error: httpcore.NetworkError,
+) -> BaseException | None:
+    if type(cleanup_error) is not httpcore.NetworkError:
+        return None
+    delegate_cleanup_error = cleanup_error.__context__
+    if delegate_cleanup_error is None:
+        return None
+    return delegate_cleanup_error.__context__
+
+
+def _read_sync_json_impl(
     response: httpx.Response,
     max_bytes: int,
     budget: DeadlineBudget,
@@ -213,7 +224,24 @@ def _read_sync_json(
         budget.phase_timeout()
 
 
-async def _read_async_json(
+def _read_sync_json(
+    response: httpx.Response,
+    max_bytes: int,
+    budget: DeadlineBudget,
+) -> dict[str, Any]:
+    try:
+        return _read_sync_json_impl(response, max_bytes, budget)
+    except httpcore.NetworkError as exc:
+        primary_error = _cleanup_displaced_primary(exc)
+        if primary_error is None:
+            raise
+        primary_traceback = primary_error.__traceback__
+        primary_error.__context__ = None
+        primary_error.__cause__ = None
+    raise primary_error.with_traceback(primary_traceback) from None
+
+
+async def _read_async_json_impl(
     response: httpx.Response,
     max_bytes: int,
     budget: DeadlineBudget,
@@ -232,6 +260,23 @@ async def _read_async_json(
         return _parse_json_object(content)
     finally:
         budget.phase_timeout()
+
+
+async def _read_async_json(
+    response: httpx.Response,
+    max_bytes: int,
+    budget: DeadlineBudget,
+) -> dict[str, Any]:
+    try:
+        return await _read_async_json_impl(response, max_bytes, budget)
+    except httpcore.NetworkError as exc:
+        primary_error = _cleanup_displaced_primary(exc)
+        if primary_error is None:
+            raise
+        primary_traceback = primary_error.__traceback__
+        primary_error.__context__ = None
+        primary_error.__cause__ = None
+    raise primary_error.with_traceback(primary_traceback) from None
 
 
 class SafeRuntimeClient:
@@ -341,6 +386,8 @@ class SafeRuntimeClient:
                 budget=budget,
             )
             client: httpx.Client | None = None
+            primary_error: BaseException | None = None
+            response_cleanup_failed = False
             try:
                 client = httpx.Client(
                     transport=transport,
@@ -348,19 +395,53 @@ class SafeRuntimeClient:
                     trust_env=False,
                     follow_redirects=False,
                 )
-                with client.stream(
+                response_context = client.stream(
                     "POST",
                     request_url,
                     headers=_request_headers(headers),
                     json=json_body,
-                ) as response:
-                    return _read_sync_json(response, max_bytes, budget)
-            finally:
-                if client is None:
-                    transport.close()
+                )
+                response: httpx.Response | None = None
+                try:
+                    response = response_context.__enter__()
+                    result = _read_sync_json(response, max_bytes, budget)
+                except BaseException as exc:
+                    if response is None:
+                        raise
+                    if response.is_closed:
+                        response_cleanup_failed = True
+                    else:
+                        try:
+                            response_context.__exit__(
+                                type(exc),
+                                exc,
+                                exc.__traceback__,
+                            )
+                        except BaseException:
+                            response_cleanup_failed = True
+                    raise
                 else:
-                    client.close()
-                budget.phase_timeout()
+                    try:
+                        response_context.__exit__(None, None, None)
+                    except BaseException:
+                        response_cleanup_failed = True
+                        raise
+                    return result
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                if not response_cleanup_failed:
+                    try:
+                        if client is None:
+                            transport.close()
+                        else:
+                            client.close()
+                    except BaseException:
+                        if primary_error is None:
+                            raise
+                if primary_error is None:
+                    budget.phase_timeout()
         finally:
             _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
 
@@ -400,6 +481,8 @@ class SafeRuntimeClient:
                     budget=effective_budget,
                 )
                 client: httpx.AsyncClient | None = None
+                primary_error: BaseException | None = None
+                response_cleanup_failed = False
                 try:
                     client = httpx.AsyncClient(
                         transport=transport,
@@ -407,23 +490,57 @@ class SafeRuntimeClient:
                         trust_env=False,
                         follow_redirects=False,
                     )
-                    async with client.stream(
+                    response_context = client.stream(
                         "POST",
                         request_url,
                         headers=_request_headers(headers),
                         json=json_body,
-                    ) as response:
-                        return await _read_async_json(
+                    )
+                    response: httpx.Response | None = None
+                    try:
+                        response = await response_context.__aenter__()
+                        result = await _read_async_json(
                             response,
                             max_bytes,
                             effective_budget,
                         )
-                finally:
-                    if client is None:
-                        await transport.aclose()
+                    except BaseException as exc:
+                        if response is None:
+                            raise
+                        if response.is_closed:
+                            response_cleanup_failed = True
+                        else:
+                            try:
+                                await response_context.__aexit__(
+                                    type(exc),
+                                    exc,
+                                    exc.__traceback__,
+                                )
+                            except BaseException:
+                                response_cleanup_failed = True
+                        raise
                     else:
-                        await client.aclose()
-                    effective_budget.phase_timeout()
+                        try:
+                            await response_context.__aexit__(None, None, None)
+                        except BaseException:
+                            response_cleanup_failed = True
+                            raise
+                        return result
+                except BaseException as exc:
+                    primary_error = exc
+                    raise
+                finally:
+                    if not response_cleanup_failed:
+                        try:
+                            if client is None:
+                                await transport.aclose()
+                            else:
+                                await client.aclose()
+                        except BaseException:
+                            if primary_error is None:
+                                raise
+                    if primary_error is None:
+                        effective_budget.phase_timeout()
         except OutboundRequestError:
             raise
         except asyncio.CancelledError:

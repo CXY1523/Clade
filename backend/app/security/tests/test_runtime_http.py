@@ -155,6 +155,7 @@ class RecordingSyncStream(httpcore.NetworkStream):
         read_error: Exception | None = None,
         write_error: Exception | None = None,
         tls_error: Exception | None = None,
+        close_error: Exception | None = None,
     ) -> None:
         self._head = bytearray(
             raw_head
@@ -171,6 +172,7 @@ class RecordingSyncStream(httpcore.NetworkStream):
         self.read_error = read_error
         self.write_error = write_error
         self.tls_error = tls_error
+        self.close_error = close_error
         self.request_bytes = bytearray()
         self.body_bytes_returned = 0
         self.close_count = 0
@@ -199,6 +201,8 @@ class RecordingSyncStream(httpcore.NetworkStream):
 
     def close(self) -> None:
         self.close_count += 1
+        if self.close_error is not None:
+            raise self.close_error
 
     def start_tls(
         self,
@@ -241,6 +245,7 @@ class RecordingAsyncStream(httpcore.AsyncNetworkStream):
         read_error: Exception | None = None,
         write_error: Exception | None = None,
         tls_error: Exception | None = None,
+        close_error: Exception | None = None,
         block_body: bool = False,
         body_read_delay: float = 0.0,
     ) -> None:
@@ -259,6 +264,7 @@ class RecordingAsyncStream(httpcore.AsyncNetworkStream):
         self.read_error = read_error
         self.write_error = write_error
         self.tls_error = tls_error
+        self.close_error = close_error
         self.block_body = block_body
         self.body_read_delay = body_read_delay
         self.request_bytes = bytearray()
@@ -300,6 +306,8 @@ class RecordingAsyncStream(httpcore.AsyncNetworkStream):
 
     async def aclose(self) -> None:
         self.close_count += 1
+        if self.close_error is not None:
+            raise self.close_error
 
     async def start_tls(
         self,
@@ -668,6 +676,78 @@ async def test_caller_budget_wins_over_transitional_read_timeout(
     assert exc_info.value.code == "outbound_timeout"
     assert policy.calls == []
     assert backend.connect_calls == []
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.asyncio
+async def test_timeout_primary_survives_failing_cleanup(
+    mode: Mode,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cleanup_sentinel = f"{mode}-timeout-cleanup-secret"
+    stream = _stream_for(
+        mode,
+        read_error=httpcore.ReadTimeout("primary-timeout"),
+        close_error=OSError(cleanup_sentinel),
+    )
+    client, _, _ = _runtime_client(mode, stream)
+    for logger_name in ("httpx", "httpcore.connection", "httpcore.http11"):
+        caplog.set_level(logging.DEBUG, logger=logger_name)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _invoke(mode, client)
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert stream.close_count == 1
+    assert cleanup_sentinel not in repr(exc_info.value)
+    assert cleanup_sentinel not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_survives_failing_cleanup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cancel_sentinel = "caller-cancel-primary"
+    cleanup_sentinel = "cancel-cleanup-secret"
+    stream = RecordingAsyncStream(
+        block_body=True,
+        close_error=OSError(cleanup_sentinel),
+    )
+    client, _, _ = _runtime_client("async", stream)
+    for logger_name in ("httpx", "httpcore.connection", "httpcore.http11"):
+        caplog.set_level(logging.DEBUG, logger=logger_name)
+    task = asyncio.create_task(_invoke("async", client))
+
+    await asyncio.wait_for(stream.body_read_started.wait(), timeout=1.0)
+    task.cancel(cancel_sentinel)
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await task
+
+    assert exc_info.value.args == (cancel_sentinel,)
+    assert stream.close_count == 1
+    assert cleanup_sentinel not in repr(exc_info.value)
+    assert cleanup_sentinel not in caplog.text
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.asyncio
+async def test_cleanup_failure_without_primary_keeps_fixed_error(
+    mode: Mode,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cleanup_sentinel = f"{mode}-standalone-cleanup-secret"
+    stream = _stream_for(mode, close_error=OSError(cleanup_sentinel))
+    client, _, _ = _runtime_client(mode, stream)
+    for logger_name in ("httpx", "httpcore.connection", "httpcore.http11"):
+        caplog.set_level(logging.DEBUG, logger=logger_name)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _invoke(mode, client)
+
+    assert exc_info.value.code == "outbound_connect_failed"
+    assert stream.close_count == 1
+    assert cleanup_sentinel not in repr(exc_info.value)
+    assert cleanup_sentinel not in caplog.text
 
 
 def _request_bytes(stream: Any) -> bytes:
