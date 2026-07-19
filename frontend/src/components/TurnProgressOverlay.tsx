@@ -375,7 +375,7 @@ export function TurnProgressOverlay({ message = "推演进行中...", showDetail
 
       if (event.type === 'ai_stream_interrupted') {
         const lastActivity = Date.now();
-        const interruptionMessage = event.message || "AI 生成中断，已使用备用结果";
+        const interruptionMessage = "AI 生成中断，已使用备用结果";
         setLastAIActivity(lastActivity);
         setConnectionStatus("warning");
         setAIProgress(prev => prev ? {

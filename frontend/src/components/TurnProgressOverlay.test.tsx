@@ -57,7 +57,7 @@ describe("TurnProgressOverlay interrupted AI stream", () => {
       emitEvent({
         type: "ai_stream_interrupted",
         task: "回合报告",
-        message: "AI 生成中断，已使用备用结果",
+        message: "回合报告 interrupted",
         category: "AI",
       });
     });

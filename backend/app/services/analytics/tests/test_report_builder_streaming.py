@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Callable
 
 import pytest
 
 from app.simulation.environment import ParsedPressure
 from app.services.analytics.report_builder import ReportBuilder
 from app.services.analytics.report_builder_v2 import ReportBuilderV2
+from app.services.analytics.turn_report import TurnReportService
 
 
 class InterruptedStreamRouter:
@@ -87,23 +89,30 @@ def _pressure() -> ParsedPressure:
 async def test_v1_displays_partial_stream_but_returns_complete_fallback() -> None:
     partial = "UNFINISHED_V1_NARRATIVE_" + "x" * 100
     shown: list[str] = []
+    events: list[tuple[str, str, str]] = []
     builder = ReportBuilder(InterruptedStreamRouter(partial))
 
     report = await builder.build_turn_narrative_async(
         species=[],
         pressures=[_pressure()],
         stream_callback=lambda chunk: shown.append(chunk),
+        event_callback=lambda *event: events.append(event),
     )
 
     assert shown == [partial]
     assert "**环境压力**" in report
     assert partial not in report
+    assert [event for event in events if event[0] == "ai_stream_interrupted"] == [
+        ("ai_stream_interrupted", "回合报告 interrupted", "AI")
+    ]
+    assert all(partial not in message and "outbound_timeout" not in message for _, message, _ in events)
 
 
 @pytest.mark.asyncio
 async def test_v2_displays_partial_stream_but_returns_complete_fallback() -> None:
     partial = "UNFINISHED_V2_NARRATIVE_" + "y" * 100
     shown: list[str] = []
+    events: list[tuple[str, str, str]] = []
     builder = ReportBuilderV2(InterruptedStreamRouter(partial))
 
     report = await builder.build_turn_narrative_async(
@@ -111,11 +120,68 @@ async def test_v2_displays_partial_stream_but_returns_complete_fallback() -> Non
         pressures=[_pressure()],
         turn_index=7,
         stream_callback=lambda chunk: shown.append(chunk),
+        event_callback=lambda *event: events.append(event),
     )
 
     assert shown == [partial]
     assert "## 🕐 第 7 回合" in report
     assert partial not in report
+    assert [event for event in events if event[0] == "ai_stream_interrupted"] == [
+        ("ai_stream_interrupted", "第7回合报告 interrupted", "AI")
+    ]
+    assert all(partial not in message and "outbound_timeout" not in message for _, message, _ in events)
+
+
+class EventEmittingReportBuilder:
+    def __init__(self) -> None:
+        self.event_callback: Callable[[str, str, str], None] | None = None
+
+    async def build_turn_narrative_async(self, **kwargs: Any) -> str:
+        self.event_callback = kwargs.get("event_callback")
+        assert self.event_callback is not None
+        self.event_callback(
+            "ai_stream_interrupted",
+            "回合报告 interrupted",
+            "AI",
+        )
+        return "完整报告：" + "z" * 60
+
+
+@pytest.mark.asyncio
+async def test_turn_report_service_bridges_builder_events(monkeypatch, tmp_path) -> None:
+    settings = SimpleNamespace(
+        ui_config_path=tmp_path / "missing-settings.json",
+        enable_turn_report_llm=True,
+    )
+    monkeypatch.setattr("app.services.analytics.turn_report.get_settings", lambda: settings)
+    builder = EventEmittingReportBuilder()
+    events: list[tuple[str, str, str]] = []
+
+    def emit_event(event_type: str, message: str, category: str) -> None:
+        events.append((event_type, message, category))
+        if event_type == "ai_stream_interrupted":
+            raise RuntimeError("downstream event consumer failed")
+
+    service = TurnReportService(
+        report_builder=builder,
+        environment_repository=object(),
+        trophic_service=object(),
+        emit_event_fn=emit_event,
+    )
+
+    report = await service.build_report(
+        turn_index=3,
+        mortality_results=[],
+        pressures=[],
+        branching_events=[],
+        all_species=[],
+    )
+
+    assert report.narrative.startswith("完整报告：")
+    assert builder.event_callback is not None
+    assert [event for event in events if event[0] == "ai_stream_interrupted"] == [
+        ("ai_stream_interrupted", "回合报告 interrupted", "AI")
+    ]
 
 
 @pytest.mark.parametrize(

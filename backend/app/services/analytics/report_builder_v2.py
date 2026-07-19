@@ -655,6 +655,7 @@ class ReportBuilderV2:
         species_details: dict[str, Any] | None = None,
         turn_index: int = 0,
         heartbeat_callback: Callable[[int], Awaitable[None] | None] | None = None,
+        event_callback: Callable[[str, str, str], None] | None = None,
     ) -> str:
         """生成 LLM 驱动的纪录片风格叙事
         
@@ -694,6 +695,7 @@ class ReportBuilderV2:
                 turn_index=turn_index,
                 stream_callback=stream_callback,
                 heartbeat_callback=heartbeat_callback,
+                event_callback=event_callback,
             )
             
             if narrative and len(narrative) > 50:
@@ -716,6 +718,7 @@ class ReportBuilderV2:
         turn_index: int,
         stream_callback: Callable[[str], Awaitable[None] | None] | None = None,
         heartbeat_callback: Callable[[int], Awaitable[None] | None] | None = None,
+        event_callback: Callable[[str, str, str], None] | None = None,
     ) -> str:
         """使用流式传输生成叙事，支持心跳监测
         
@@ -749,6 +752,7 @@ class ReportBuilderV2:
             capability="turn_report",
             messages=messages,
             task_name=f"第{turn_index}回合报告",
+            event_callback=event_callback,
             chunk_callback=handle_chunk,
         )
         if not outcome.completed:

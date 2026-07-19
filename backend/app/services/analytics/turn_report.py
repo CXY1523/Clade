@@ -1223,6 +1223,7 @@ class TurnReportService:
                     migration_events=migration_events,
                     branching_events=branching_events,
                     stream_callback=stream_callback,
+                    event_callback=self._emit_event,
                 )
                 
                 if narrative and len(narrative) > 50:
