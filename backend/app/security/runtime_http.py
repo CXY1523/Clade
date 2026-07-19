@@ -15,7 +15,7 @@ import httpcore
 import httpx
 
 from .bounded_runner import BoundedDaemonRunner, DEFAULT_BOUNDED_RUNNER
-from .deadline import DeadlineBudget, DeadlineExpired
+from .deadline import DeadlineBudget, DeadlineExpired, StreamBudget
 from .outbound_url import (
     OutboundRequestError,
     OutboundURLPolicy,
@@ -691,20 +691,10 @@ class SafeRuntimeClient:
         max_event_bytes: int = STREAM_EVENT_MAX_BYTES,
         idle_timeout: float | None = None,
         total_timeout: float | None = None,
+        budget: StreamBudget | None = None,
     ) -> AsyncIterator[str]:
-        token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(True)
-        try:
-            validated = self._policy.validate(base_url, allow_local=allow_local)
-            request_url = _validated_request_url(validated, request_target)
-            if (
-                not isinstance(max_bytes, int)
-                or isinstance(max_bytes, bool)
-                or max_bytes < 0
-                or not isinstance(max_event_bytes, int)
-                or isinstance(max_event_bytes, bool)
-                or max_event_bytes < 0
-            ):
-                raise _invalid_url()
+        effective_budget = budget
+        if effective_budget is None:
             idle_limit = _validated_stream_timeout(
                 self._timeouts.stream_idle
                 if idle_timeout is None
@@ -715,25 +705,53 @@ class SafeRuntimeClient:
                 if total_timeout is None
                 else total_timeout,
             )
+            effective_budget = StreamBudget.from_timeouts(
+                idle_limit,
+                hard_timeout=total_limit,
+            )
+        token = _SUPPRESS_RUNTIME_HTTP_LOGS.set(True)
+        try:
+            validated = await self._runner.arun(
+                lambda: self._policy.validate(
+                    base_url,
+                    allow_local=allow_local,
+                ),
+                timeout=effective_budget.phase_timeout(),
+            )
+            effective_budget.phase_timeout()
+            request_url = _validated_request_url(validated, request_target)
+            if (
+                not isinstance(max_bytes, int)
+                or isinstance(max_bytes, bool)
+                or max_bytes < 0
+                or not isinstance(max_event_bytes, int)
+                or isinstance(max_event_bytes, bool)
+                or max_event_bytes < 0
+            ):
+                raise _invalid_url()
+            effective_budget.phase_timeout()
             transport = PinnedAsyncTransport(
                 validated,
                 self._async_network_backend,
+                budget=effective_budget,
             )
             client: httpx.AsyncClient | None = None
             try:
                 client = httpx.AsyncClient(
                     transport=transport,
                     timeout=httpx.Timeout(
-                        connect=self._timeouts.connect,
+                        connect=effective_budget.phase_timeout(
+                            self._timeouts.connect
+                        ),
                         read=None,
-                        write=self._timeouts.write,
-                        pool=self._timeouts.pool,
+                        write=effective_budget.phase_timeout(
+                            self._timeouts.write
+                        ),
+                        pool=effective_budget.phase_timeout(self._timeouts.pool),
                     ),
                     trust_env=False,
                     follow_redirects=False,
                 )
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + total_limit
                 response_context = client.stream(
                     "POST",
                     request_url,
@@ -742,30 +760,23 @@ class SafeRuntimeClient:
                 )
                 response: httpx.Response | None = None
                 try:
-                    response = await asyncio.wait_for(
-                        response_context.__aenter__(),
-                        timeout=min(
-                            idle_limit,
-                            max(0.0, deadline - loop.time()),
-                        ),
-                    )
+                    async with asyncio.timeout(effective_budget.phase_timeout()):
+                        response = await response_context.__aenter__()
+                    effective_budget.phase_timeout()
                     _check_response_headers(response, max_bytes)
                     iterator = response.aiter_raw().__aiter__()
                     line_buffer = bytearray()
                     total_bytes = 0
 
                     while True:
-                        remaining_total = deadline - loop.time()
-                        if remaining_total <= 0:
-                            raise TimeoutError
-                        chunk_timeout = min(idle_limit, remaining_total)
                         try:
-                            chunk = await asyncio.wait_for(
-                                iterator.__anext__(),
-                                timeout=chunk_timeout,
-                            )
+                            async with asyncio.timeout(
+                                effective_budget.phase_timeout()
+                            ):
+                                chunk = await iterator.__anext__()
                         except StopAsyncIteration:
                             break
+                        effective_budget.phase_timeout()
 
                         total_bytes += len(chunk)
                         if total_bytes > max_bytes:
@@ -796,8 +807,7 @@ class SafeRuntimeClient:
                             line_buffer.clear()
                             if raw_line.endswith(b"\r"):
                                 raw_line = raw_line[:-1]
-                            if loop.time() >= deadline:
-                                raise TimeoutError
+                            effective_budget.phase_timeout()
                             line = raw_line.decode("utf-8", errors="strict")
                             _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
                             token = None
@@ -813,8 +823,7 @@ class SafeRuntimeClient:
                         raw_line = bytes(line_buffer)
                         if raw_line.endswith(b"\r"):
                             raw_line = raw_line[:-1]
-                        if loop.time() >= deadline:
-                            raise TimeoutError
+                        effective_budget.phase_timeout()
                         line = raw_line.decode("utf-8", errors="strict")
                         _SUPPRESS_RUNTIME_HTTP_LOGS.reset(token)
                         token = None
@@ -834,7 +843,12 @@ class SafeRuntimeClient:
             raise
         except asyncio.CancelledError:
             raise
-        except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
+        except (
+            DeadlineExpired,
+            TimeoutError,
+            httpx.TimeoutException,
+            httpcore.TimeoutException,
+        ):
             raise _timeout() from None
         except (httpx.DecodingError, httpx.ProtocolError, httpcore.ProtocolError):
             raise _bad_response() from None

@@ -55,3 +55,51 @@ class DeadlineBudget:
         if remaining <= 0:
             raise DeadlineExpired
         return remaining if limit is None else min(remaining, limit)
+
+
+@dataclass
+class StreamBudget:
+    idle_timeout: float
+    hard_deadline: float
+    initial_idle_deadline: float
+    clock: Clock = field(default=time.monotonic, repr=False)
+    _idle_deadline: float | None = None
+    _content_started: bool = False
+
+    @classmethod
+    def from_timeouts(
+        cls,
+        idle_timeout: float,
+        *,
+        hard_timeout: float = 600.0,
+        started_at: float | None = None,
+        clock: Clock = time.monotonic,
+    ) -> "StreamBudget":
+        idle = _positive_finite(idle_timeout)
+        hard = _positive_finite(hard_timeout)
+        start = clock() if started_at is None else started_at
+        return cls(idle, start + hard, start + idle, clock)
+
+    @property
+    def content_started(self) -> bool:
+        return self._content_started
+
+    def mark_content(self) -> None:
+        self._content_started = True
+        self._idle_deadline = None
+
+    def remaining(self) -> float:
+        now = self.clock()
+        if not self._content_started:
+            idle_deadline = self.initial_idle_deadline
+        else:
+            if self._idle_deadline is None:
+                self._idle_deadline = now + self.idle_timeout
+            idle_deadline = self._idle_deadline
+        return max(0.0, min(idle_deadline, self.hard_deadline) - now)
+
+    def phase_timeout(self, limit: float | None = None) -> float:
+        remaining = self.remaining()
+        if remaining <= 0:
+            raise DeadlineExpired
+        return remaining if limit is None else min(remaining, limit)

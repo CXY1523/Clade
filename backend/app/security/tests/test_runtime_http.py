@@ -17,7 +17,7 @@ import pytest
 import app.security as security
 import app.security.runtime_http as runtime_http
 from app.security.bounded_runner import BoundedDaemonRunner
-from app.security.deadline import DeadlineBudget
+from app.security.deadline import DeadlineBudget, StreamBudget
 from app.security.outbound_url import (
     OutboundRequestError,
     OutboundURLPolicy,
@@ -340,6 +340,53 @@ class AdvancingAsyncStream(RecordingAsyncStream):
         if not self._head and self._body:
             self._clock.advance(next(self._read_advances))
         return await super().read(max_bytes, timeout=timeout)
+
+
+class HeadAdvancingAsyncStream(RecordingAsyncStream):
+    def __init__(self, clock: ManualClock, *, seconds: float) -> None:
+        super().__init__(body=b"content\n", content_length=None)
+        self._clock = clock
+        self._seconds = seconds
+        self._advanced = False
+
+    async def read(
+        self,
+        max_bytes: int,
+        timeout: float | None = None,
+    ) -> bytes:
+        if self._head and not self._advanced:
+            self._clock.advance(self._seconds)
+            self._advanced = True
+        return await super().read(max_bytes, timeout=timeout)
+
+
+class ScriptedAdvancingAsyncStream(RecordingAsyncStream):
+    def __init__(
+        self,
+        clock: ManualClock,
+        *,
+        chunks: list[tuple[bytes, float]],
+    ) -> None:
+        super().__init__(body=b"", content_length=None)
+        self._clock = clock
+        self._chunks = chunks
+        self._chunk_index = 0
+
+    async def read(
+        self,
+        max_bytes: int,
+        timeout: float | None = None,
+    ) -> bytes:
+        if self._head:
+            return await super().read(max_bytes, timeout=timeout)
+        self.body_read_started.set()
+        if self._chunk_index >= len(self._chunks):
+            return b""
+        chunk, seconds = self._chunks[self._chunk_index]
+        self._chunk_index += 1
+        self._clock.advance(seconds)
+        self.body_bytes_returned += len(chunk)
+        return chunk
 
 
 class RecordingSyncBackend(httpcore.NetworkBackend):
@@ -1770,17 +1817,23 @@ def _open_runtime_line_stream(
     max_event_bytes: Any = STREAM_EVENT_MAX_BYTES,
     idle_timeout: float | None = None,
     total_timeout: float | None = None,
+    budget: StreamBudget | None = None,
 ) -> Any:
+    kwargs: dict[str, Any] = {
+        "request_target": request_target,
+        "headers": {} if headers is None else headers,
+        "json_body": {"request": True} if json_body is None else json_body,
+        "allow_local": allow_local,
+        "max_bytes": max_bytes,
+        "max_event_bytes": max_event_bytes,
+        "idle_timeout": idle_timeout,
+        "total_timeout": total_timeout,
+    }
+    if budget is not None:
+        kwargs["budget"] = budget
     return client.astream_lines(
         base_url,
-        request_target=request_target,
-        headers={} if headers is None else headers,
-        json_body={"request": True} if json_body is None else json_body,
-        allow_local=allow_local,
-        max_bytes=max_bytes,
-        max_event_bytes=max_event_bytes,
-        idle_timeout=idle_timeout,
-        total_timeout=total_timeout,
+        **kwargs,
     )
 
 
@@ -1789,6 +1842,104 @@ async def _collect_runtime_lines(
     **kwargs: Any,
 ) -> list[str]:
     return [line async for line in _open_runtime_line_stream(client, **kwargs)]
+
+
+@pytest.mark.asyncio
+async def test_stream_blocking_dns_consumes_initial_idle_budget() -> None:
+    clock = ManualClock()
+    budget = StreamBudget.from_timeouts(3.0, clock=clock)
+    policy = AdvancingPolicy(clock, dns_seconds=3.1)
+    stream = RecordingAsyncStream(body=b"unread\n", content_length=None)
+    client, _, backend = _runtime_client("async", stream, policy=policy)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(client, budget=budget)
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert backend.connect_calls == []
+    assert stream.close_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_response_headers_consume_initial_idle_budget() -> None:
+    clock = ManualClock()
+    budget = StreamBudget.from_timeouts(3.0, clock=clock)
+    stream = HeadAdvancingAsyncStream(clock, seconds=3.1)
+    client, _, _ = _runtime_client("async", stream)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await _collect_runtime_lines(client, budget=budget)
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert stream.body_bytes_returned == 0
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_protocol_lines_cannot_refresh_idle_budget() -> None:
+    clock = ManualClock()
+    budget = StreamBudget.from_timeouts(3.0, clock=clock)
+    stream = ScriptedAdvancingAsyncStream(
+        clock,
+        chunks=[
+            (b": heartbeat\n", 1.0),
+            (b"\n", 1.0),
+            (b": again\n", 1.1),
+        ],
+    )
+    client, _, _ = _runtime_client("async", stream)
+    received: list[str] = []
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        async for line in _open_runtime_line_stream(client, budget=budget):
+            received.append(line)
+
+    assert received == [": heartbeat", ""]
+    assert exc_info.value.code == "outbound_timeout"
+    assert budget.content_started is False
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_content_idle_window_starts_when_consumer_resumes() -> None:
+    clock = ManualClock()
+    budget = StreamBudget.from_timeouts(3.0, hard_timeout=10.0, clock=clock)
+    stream = ScriptedAdvancingAsyncStream(
+        clock,
+        chunks=[(b"first\n", 1.0), (b"second\n", 2.9)],
+    )
+    client, _, _ = _runtime_client("async", stream)
+    iterator = _open_runtime_line_stream(client, budget=budget)
+
+    assert await anext(iterator) == "first"
+    budget.mark_content()
+    clock.advance(5.0)
+    assert await anext(iterator) == "second"
+    await iterator.aclose()
+
+    assert stream.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_hard_deadline_closes_once_despite_content() -> None:
+    clock = ManualClock()
+    budget = StreamBudget.from_timeouts(2.0, hard_timeout=3.0, clock=clock)
+    stream = ScriptedAdvancingAsyncStream(
+        clock,
+        chunks=[(b"a\n", 1.0), (b"b\n", 1.0), (b"c\n", 1.1)],
+    )
+    client, _, _ = _runtime_client("async", stream)
+    iterator = _open_runtime_line_stream(client, budget=budget)
+
+    assert await anext(iterator) == "a"
+    budget.mark_content()
+    assert await anext(iterator) == "b"
+    budget.mark_content()
+    with pytest.raises(OutboundRequestError) as exc_info:
+        await anext(iterator)
+
+    assert exc_info.value.code == "outbound_timeout"
+    assert stream.close_count == 1
 
 
 @pytest.mark.asyncio
@@ -2012,23 +2163,21 @@ async def test_stream_idle_timeout_uses_runtime_default_and_closes_once() -> Non
 
 @pytest.mark.asyncio
 async def test_stream_total_deadline_is_distinct_and_spans_yields() -> None:
-    stream = RecordingAsyncStream(
-        body=b"a\n" * 20,
-        content_length=None,
-        body_chunk_size=2,
-        body_read_delay=0.03,
+    clock = ManualClock()
+    budget = StreamBudget.from_timeouts(10.0, hard_timeout=3.0, clock=clock)
+    stream = ScriptedAdvancingAsyncStream(
+        clock,
+        chunks=[(b"a\n", 1.0), (b"a\n", 1.0), (b"a\n", 1.1)],
     )
-    client, _, _ = _runtime_client(
-        "async",
-        stream,
-        timeouts=RuntimeTimeouts(stream_idle=0.1, stream_total=0.2),
-    )
-    iterator = _open_runtime_line_stream(client)
+    client, _, _ = _runtime_client("async", stream)
+    iterator = _open_runtime_line_stream(client, budget=budget)
 
     assert await anext(iterator) == "a"
+    budget.mark_content()
+    assert await anext(iterator) == "a"
+    budget.mark_content()
     with pytest.raises(OutboundRequestError) as exc_info:
-        async for _ in iterator:
-            pass
+        await anext(iterator)
 
     assert exc_info.value.code == "outbound_timeout"
     assert stream.close_count == 1
@@ -2305,7 +2454,7 @@ async def test_stream_invalid_timeouts_are_rejected_before_network(
         await _collect_runtime_lines(client, **kwargs)
 
     assert exc_info.value.code == "outbound_url_invalid"
-    assert policy.calls == [(VALIDATED_BASE, False)]
+    assert policy.calls == []
     assert backend.connect_calls == []
     assert stream.close_count == 0
 
