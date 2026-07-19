@@ -13,6 +13,7 @@ Token 使用：约 500-1500（取决于物种数量）
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import Sequence, Callable, Awaitable, Any
@@ -695,7 +696,7 @@ class ReportBuilderV2:
                 heartbeat_callback=heartbeat_callback,
             )
             
-            if narrative:
+            if narrative and len(narrative) > 50:
                 logger.info(f"[ReportV2] LLM叙事生成成功: 回合{turn_index}, {len(highlight_species)}个重点物种, {len(narrative)}字")
                 return narrative
             else:
@@ -730,7 +731,7 @@ class ReportBuilderV2:
             if heartbeat_callback and chunk_count % 5 == 0:
                 try:
                     result = heartbeat_callback(chunk_count)
-                    if asyncio.iscoroutine(result):
+                    if inspect.isawaitable(result):
                         await result
                 except Exception as e:
                     logger.debug(f"[ReportV2] 心跳回调异常: {e}")
@@ -738,7 +739,7 @@ class ReportBuilderV2:
             if stream_callback:
                 try:
                     result = stream_callback(chunk)
-                    if asyncio.iscoroutine(result):
+                    if inspect.isawaitable(result):
                         await result
                 except Exception as e:
                     logger.debug(f"[ReportV2] 流式回调异常: {e}")

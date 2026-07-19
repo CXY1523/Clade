@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -37,6 +38,40 @@ class InterruptedStreamRouter:
             "reason": "outbound_timeout",
             "partial": True,
         }
+
+
+class CompleteStreamRouter:
+    def __init__(self, chunks: list[str]) -> None:
+        self.chunks = chunks
+
+    async def astream(self, capability: str, payload: dict[str, Any]):
+        for chunk in self.chunks:
+            yield chunk
+        yield {"type": "status", "state": "completed"}
+
+    async def astream_capability(
+        self,
+        capability: str,
+        messages: list[dict[str, str]],
+        response_format: dict[str, Any] | None = None,
+    ):
+        for chunk in self.chunks:
+            yield chunk
+        yield {"type": "status", "state": "completed"}
+
+
+class OrderedAwaitable:
+    def __init__(self, order: list[str], label: str) -> None:
+        self.order = order
+        self.label = label
+        self.awaited = False
+
+    def __await__(self):
+        async def complete() -> None:
+            self.awaited = True
+            self.order.append(self.label)
+
+        return complete().__await__()
 
 
 def _pressure() -> ParsedPressure:
@@ -81,3 +116,74 @@ async def test_v2_displays_partial_stream_but_returns_complete_fallback() -> Non
     assert shown == [partial]
     assert "## 🕐 第 7 回合" in report
     assert partial not in report
+
+
+@pytest.mark.parametrize(
+    ("length", "uses_fallback"),
+    [(0, True), (5, True), (50, True), (51, False)],
+)
+@pytest.mark.asyncio
+async def test_v2_only_accepts_complete_narratives_longer_than_50_chars(
+    length: int,
+    uses_fallback: bool,
+) -> None:
+    narrative = "n" * length
+    builder = ReportBuilderV2(CompleteStreamRouter([narrative] if narrative else []))
+
+    report = await builder.build_turn_narrative_async(
+        species=[],
+        pressures=[_pressure()],
+        turn_index=8,
+    )
+
+    if uses_fallback:
+        assert "## 🕐 第 8 回合" in report
+        assert report != narrative
+    else:
+        assert report == narrative
+
+
+@pytest.mark.asyncio
+async def test_v2_awaits_heartbeat_and_stream_awaitables_in_order() -> None:
+    chunks = [f"chunk-{index:02d}-data-" for index in range(1, 6)]
+    order: list[str] = []
+    heartbeat_futures: list[asyncio.Future[None]] = []
+    stream_awaitables: list[OrderedAwaitable] = []
+
+    def heartbeat_callback(count: int) -> asyncio.Future[None]:
+        order.append(f"heartbeat-called:{count}")
+        future = asyncio.get_running_loop().create_future()
+        heartbeat_futures.append(future)
+
+        def complete() -> None:
+            order.append(f"heartbeat-awaited:{count}")
+            future.set_result(None)
+
+        asyncio.get_running_loop().call_soon(complete)
+        return future
+
+    def stream_callback(chunk: str) -> OrderedAwaitable:
+        order.append(f"stream-called:{chunk}")
+        awaitable = OrderedAwaitable(order, f"stream-awaited:{chunk}")
+        stream_awaitables.append(awaitable)
+        return awaitable
+
+    builder = ReportBuilderV2(CompleteStreamRouter(chunks))
+
+    report = await builder.build_turn_narrative_async(
+        species=[],
+        pressures=[_pressure()],
+        turn_index=9,
+        stream_callback=stream_callback,
+        heartbeat_callback=heartbeat_callback,
+    )
+
+    assert report == "".join(chunks)
+    assert heartbeat_futures and all(future.done() for future in heartbeat_futures)
+    assert stream_awaitables and all(item.awaited for item in stream_awaitables)
+    assert order[-4:] == [
+        "heartbeat-called:5",
+        "heartbeat-awaited:5",
+        "stream-called:chunk-05-data-",
+        "stream-awaited:chunk-05-data-",
+    ]
