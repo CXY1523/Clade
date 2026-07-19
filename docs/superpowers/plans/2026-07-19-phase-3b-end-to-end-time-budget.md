@@ -1609,6 +1609,6 @@ git add docs/superpowers/plans/2026-07-19-phase-3b-end-to-end-time-budget.md
 git commit -m "docs: record Phase 3B verification"
 ```
 
-- [ ] **Step 7: Push and verify PR #15**
+- [x] **Step 7: Push and verify PR #15**
 
 Push `phase-2c-outbound-url-security` to the existing `fork` remote. Verify PR #15 points at the pushed head, remains Draft, and its description identifies the cumulative Phase 1 through Phase 3B scope. Do not merge or mark ready for review without a separate user decision.
