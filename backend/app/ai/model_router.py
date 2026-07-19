@@ -12,6 +12,8 @@ from urllib.parse import quote, urlencode
 
 from ..security import (
     AI_JSON_MAX_BYTES,
+    DeadlineBudget,
+    DeadlineExpired,
     RETRYABLE_OUTBOUND_CODES,
     STREAM_EVENT_MAX_BYTES,
     STREAM_MAX_BYTES,
@@ -33,6 +35,32 @@ LB_LEAST_LATENCY = "least_latency"   # 最低延迟
 
 _STREAM_RESPONSE_ERROR = "AI stream response error"
 _PRIMARY_RESPONSE_ERROR = "AI response error"
+_PUBLIC_OUTBOUND_TIMEOUT = "The upstream request timed out"
+
+
+def _ensure_deadline(
+    supplied: DeadlineBudget | None,
+    *,
+    timeout: float,
+    started_at: float,
+) -> DeadlineBudget:
+    if supplied is not None:
+        return supplied
+    try:
+        return DeadlineBudget.from_timeout(timeout, started_at=started_at)
+    except ValueError:
+        raise OutboundRequestError(
+            "outbound_url_invalid", 400, "外部服务地址无效"
+        ) from None
+
+
+def _budget_phase_timeout(budget: DeadlineBudget) -> float:
+    try:
+        return budget.phase_timeout()
+    except DeadlineExpired:
+        raise OutboundRequestError(
+            "outbound_timeout", 504, _PUBLIC_OUTBOUND_TIMEOUT
+        ) from None
 
 
 class _PrimaryResponseError(Exception):
@@ -103,6 +131,7 @@ class ModelRouter:
         self._queued_requests = 0  # 当前排队请求数
         self._total_requests = 0   # 总请求数
         self._total_timeouts = 0   # 总超时数
+        self._total_cancellations = 0
         self._request_stats: dict[str, dict] = {}  # 每个 capability 的统计
         self._last_summary_time = 0  # 上次输出摘要的时间
         self._summary_interval = 10  # 摘要输出间隔（秒）
@@ -231,9 +260,62 @@ class ModelRouter:
             "queued_requests": self._queued_requests,
             "total_requests": self._total_requests,
             "total_timeouts": self._total_timeouts,
+            "total_cancellations": self._total_cancellations,
             "timeout_rate": f"{(self._total_timeouts / max(self._total_requests, 1)) * 100:.1f}%",
             "request_stats": dict(self._request_stats),
         }
+
+    def _begin_request_stats(self, capability: str) -> int:
+        self._total_requests += 1
+        stats = self._request_stats.setdefault(
+            capability,
+            {
+                "total": 0,
+                "success": 0,
+                "timeout": 0,
+                "error": 0,
+                "cancelled": 0,
+                "avg_time": 0,
+            },
+        )
+        stats.setdefault("cancelled", 0)
+        stats["total"] += 1
+        return self._total_requests
+
+    def _finish_request_stats(
+        self,
+        capability: str,
+        outcome: str,
+        elapsed: float,
+        *,
+        finished: bool,
+    ) -> bool:
+        if finished:
+            return True
+        stats = self._request_stats[capability]
+        stats[outcome] += 1
+        if outcome == "timeout":
+            self._total_timeouts += 1
+        elif outcome == "cancelled":
+            self._total_cancellations += 1
+        elif outcome == "success":
+            stats["avg_time"] = (
+                stats["avg_time"] * (stats["success"] - 1) + elapsed
+            ) / stats["success"]
+        return True
+
+    async def _acquire_with_budget(self, budget: DeadlineBudget) -> None:
+        try:
+            queue_timeout = _budget_phase_timeout(budget)
+            await asyncio.wait_for(
+                self._semaphore.acquire(), timeout=queue_timeout
+            )
+        except OutboundRequestError:
+            raise
+        except (TimeoutError, asyncio.TimeoutError):
+            raise OutboundRequestError(
+                "outbound_timeout", 504, _PUBLIC_OUTBOUND_TIMEOUT
+            ) from None
     
     def _log_diagnostics(self, event: str, capability: str, extra: str = ""):
         """输出诊断日志到终端（更清晰的格式）"""
@@ -545,8 +627,15 @@ class ModelRouter:
             request_target = "/v1/chat/completions"
         return base_url_stripped, request_target
 
-    def invoke(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def invoke(
+        self,
+        capability: str,
+        payload: dict[str, Any],
+        *,
+        budget: DeadlineBudget | None = None,
+    ) -> dict[str, Any]:
         """Sync invocation (blocking)"""
+        started_at = time.monotonic()
         allow_local = self.allow_local_ai_endpoints
         req = self._prepare_request(capability, payload)
         if req["is_local"]:
@@ -554,6 +643,10 @@ class ModelRouter:
             return req["result"]
             
         try:
+            effective_budget = _ensure_deadline(
+                budget, timeout=req["timeout"], started_at=started_at
+            )
+            _budget_phase_timeout(effective_budget)
             logger.debug(f"[ModelRouter] Sync invoke {capability} (provider={req['meta']['provider']})")
             data = self._runtime_client.post_json(
                 req["base_url"],
@@ -562,6 +655,7 @@ class ModelRouter:
                 json_body=req["body"],
                 allow_local=allow_local,
                 read_timeout=req["timeout"],
+                budget=effective_budget,
                 max_bytes=AI_JSON_MAX_BYTES,
             )
             content = self._extract_primary_content(
@@ -594,99 +688,95 @@ class ModelRouter:
                 "error": exc.public_message,
             }
 
-    async def ainvoke(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def ainvoke(
+        self,
+        capability: str,
+        payload: dict[str, Any],
+        *,
+        budget: DeadlineBudget | None = None,
+    ) -> dict[str, Any]:
         """Async invocation (non-blocking) with semaphore."""
+        started_at = time.monotonic()
         allow_local = self.allow_local_ai_endpoints
         req = self._prepare_request(capability, payload)
         if req["is_local"]:
             return req["result"]
 
-        self._total_requests += 1
+        try:
+            effective_budget = _ensure_deadline(
+                budget, timeout=req["timeout"], started_at=started_at
+            )
+        except OutboundRequestError as exc:
+            return {**req["meta"], "error": exc.public_message}
+
+        request_id = self._begin_request_stats(capability)
         self._queued_requests += 1
         request_queued = True
         request_active = False
-        request_id = self._total_requests
-        queue_start = time.time()
-
-        if capability not in self._request_stats:
-            self._request_stats[capability] = {
-                "total": 0,
-                "success": 0,
-                "timeout": 0,
-                "error": 0,
-                "avg_time": 0,
-            }
-        self._request_stats[capability]["total"] += 1
+        semaphore_acquired = False
+        stats_finished = False
+        queue_start = time.monotonic()
         self._log_diagnostics("排队", capability, f"请求#{request_id}")
 
         last_error = "AI request failed"
+        final_outcome = "error"
         try:
             for attempt in range(self.max_retries):
+                process_start = time.monotonic()
                 try:
-                    async with self._semaphore:
-                        queue_time = time.time() - queue_start
-                        if request_queued:
-                            self._queued_requests -= 1
-                            request_queued = False
-                        self._active_requests += 1
-                        request_active = True
-                        process_start = time.time()
+                    await self._acquire_with_budget(effective_budget)
+                    semaphore_acquired = True
+                    queue_time = time.monotonic() - queue_start
+                    if request_queued:
+                        self._queued_requests -= 1
+                        request_queued = False
+                    self._active_requests += 1
+                    request_active = True
 
-                        try:
-                            self._log_diagnostics(
-                                "开始处理",
-                                capability,
-                                (
-                                    f"请求#{request_id} 排队耗时:{queue_time:.2f}s "
-                                    f"尝试:{attempt + 1}/{self.max_retries}"
-                                ),
-                            )
-                            timeout = req.get("timeout") or self.timeout
-                            headers = {**req["headers"], "Connection": "close"}
-                            provider_type = req.get(
-                                "provider_type", PROVIDER_TYPE_OPENAI
-                            )
-                            data = await self._runtime_client.apost_json(
-                                req["base_url"],
-                                request_target=req["request_target"],
-                                headers=headers,
-                                json_body=req["body"],
-                                allow_local=allow_local,
-                                read_timeout=timeout,
-                                max_bytes=AI_JSON_MAX_BYTES,
-                            )
-                            content = self._extract_primary_content(data, provider_type)
-                            parsed_content = self._parse_content(content)
-                        finally:
-                            if request_active:
-                                self._active_requests -= 1
-                                request_active = False
+                    self._log_diagnostics(
+                        "开始处理",
+                        capability,
+                        (
+                            f"请求#{request_id} 排队耗时:{queue_time:.2f}s "
+                            f"尝试:{attempt + 1}/{self.max_retries}"
+                        ),
+                    )
+                    timeout = req.get("timeout") or self.timeout
+                    headers = {**req["headers"], "Connection": "close"}
+                    provider_type = req.get(
+                        "provider_type", PROVIDER_TYPE_OPENAI
+                    )
+                    _budget_phase_timeout(effective_budget)
+                    data = await self._runtime_client.apost_json(
+                        req["base_url"],
+                        request_target=req["request_target"],
+                        headers=headers,
+                        json_body=req["body"],
+                        allow_local=allow_local,
+                        read_timeout=timeout,
+                        budget=effective_budget,
+                        max_bytes=AI_JSON_MAX_BYTES,
+                    )
+                    content = self._extract_primary_content(data, provider_type)
+                    parsed_content = self._parse_content(content)
                 except _PrimaryResponseError:
-                    self._request_stats[capability]["error"] += 1
+                    stats_finished = self._finish_request_stats(
+                        capability,
+                        "error",
+                        time.monotonic() - started_at,
+                        finished=stats_finished,
+                    )
                     logger.warning(
                         "[ModelRouter] Async invoke invalid response %s code=invalid_response_shape",
                         capability,
                     )
-                    return {
-                        **req["meta"],
-                        "error": _PRIMARY_RESPONSE_ERROR,
-                    }
+                    return {**req["meta"], "error": _PRIMARY_RESPONSE_ERROR}
                 except OutboundRequestError as exc:
                     last_error = exc.public_message
-                    process_time = time.time() - process_start
-                    if exc.code == "outbound_timeout":
-                        self._total_timeouts += 1
-                        self._request_stats[capability]["timeout"] += 1
-                        self._log_diagnostics(
-                            "⏱️ 超时", capability, f"请求#{request_id}"
-                        )
-                    else:
-                        self._request_stats[capability]["error"] += 1
-                        self._log_diagnostics(
-                            "❌ 外部请求错误",
-                            capability,
-                            f"请求#{request_id} code={exc.code}",
-                        )
+                    final_outcome = (
+                        "timeout" if exc.code == "outbound_timeout" else "error"
+                    )
+                    process_time = time.monotonic() - process_start
                     logger.warning(
                         "[ModelRouter] Async invoke failed %s attempt=%s/%s code=%s duration=%.2fs",
                         capability,
@@ -696,33 +786,45 @@ class ModelRouter:
                         process_time,
                     )
                     if exc.code not in RETRYABLE_OUTBOUND_CODES:
-                        return {
-                            **req["meta"],
-                            "error": exc.public_message,
-                        }
+                        stats_finished = self._finish_request_stats(
+                            capability,
+                            final_outcome,
+                            time.monotonic() - started_at,
+                            finished=stats_finished,
+                        )
+                        return {**req["meta"], "error": exc.public_message}
+                except asyncio.CancelledError:
+                    stats_finished = self._finish_request_stats(
+                        capability,
+                        "cancelled",
+                        time.monotonic() - started_at,
+                        finished=stats_finished,
+                    )
+                    raise
                 except Exception as exc:
-                    self._request_stats[capability]["error"] += 1
+                    stats_finished = self._finish_request_stats(
+                        capability,
+                        "error",
+                        time.monotonic() - started_at,
+                        finished=stats_finished,
+                    )
                     self._log_diagnostics(
                         "❌ 异常",
                         capability,
                         f"请求#{request_id} type={type(exc).__name__}",
                     )
-                    return {
-                        **req["meta"],
-                        "error": "AI request failed",
-                    }
+                    return {**req["meta"], "error": "AI request failed"}
                 else:
-                    process_time = time.time() - process_start
-                    self._request_stats[capability]["success"] += 1
-                    stats = self._request_stats[capability]
-                    stats["avg_time"] = (
-                        stats["avg_time"] * (stats["success"] - 1) + process_time
-                    ) / stats["success"]
-
+                    process_time = time.monotonic() - process_start
+                    stats_finished = self._finish_request_stats(
+                        capability,
+                        "success",
+                        time.monotonic() - started_at,
+                        finished=stats_finished,
+                    )
                     lb_provider_id = req.get("lb_provider_id")
                     if lb_provider_id:
                         self._record_provider_latency(lb_provider_id, process_time)
-
                     self._log_diagnostics(
                         "✅ 成功",
                         capability,
@@ -733,20 +835,62 @@ class ModelRouter:
                         "content": parsed_content,
                         "raw": data,
                     }
+                finally:
+                    if request_active:
+                        self._active_requests -= 1
+                        request_active = False
+                    if semaphore_acquired:
+                        self._semaphore.release()
+                        semaphore_acquired = False
 
                 if attempt < self.max_retries - 1:
-                    self._queued_requests += 1
-                    request_queued = True
+                    if not request_queued:
+                        self._queued_requests += 1
+                        request_queued = True
                     sleep_time = min(2.0, 0.5 * (attempt + 1))
-                    await asyncio.sleep(sleep_time)
+                    try:
+                        backoff_timeout = effective_budget.phase_timeout()
+                        await asyncio.wait_for(
+                            asyncio.sleep(sleep_time), timeout=backoff_timeout
+                        )
+                    except asyncio.CancelledError:
+                        stats_finished = self._finish_request_stats(
+                            capability,
+                            "cancelled",
+                            time.monotonic() - started_at,
+                            finished=stats_finished,
+                        )
+                        raise
+                    except (DeadlineExpired, TimeoutError, asyncio.TimeoutError):
+                        last_error = _PUBLIC_OUTBOUND_TIMEOUT
+                        final_outcome = "timeout"
+                        break
 
+            stats_finished = self._finish_request_stats(
+                capability,
+                final_outcome,
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
+            if effective_budget.remaining() <= 0:
+                return {**req["meta"], "error": last_error}
             return {
                 **req["meta"],
                 "error": f"{last_error} (after {self.max_retries} attempts)",
             }
+        except asyncio.CancelledError:
+            stats_finished = self._finish_request_stats(
+                capability,
+                "cancelled",
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
+            raise
         finally:
             if request_active:
                 self._active_requests -= 1
+            if semaphore_acquired:
+                self._semaphore.release()
             if request_queued:
                 self._queued_requests -= 1
 
@@ -1059,8 +1203,11 @@ class ModelRouter:
         capability: str,
         messages: list[dict[str, str]],
         response_format: dict[str, Any] | None = None,
+        *,
+        budget: DeadlineBudget | None = None,
     ) -> str:
         """Sync direct call"""
+        started_at = time.monotonic()
         allow_local = self.allow_local_ai_endpoints
         config = self.resolve(capability)
         override = self.overrides.get(capability, {})
@@ -1178,6 +1325,10 @@ class ModelRouter:
             stream=False,
         )
         try:
+            effective_budget = _ensure_deadline(
+                budget, timeout=timeout, started_at=started_at
+            )
+            _budget_phase_timeout(effective_budget)
             data = self._runtime_client.post_json(
                 request_base_url,
                 request_target=request_target,
@@ -1185,6 +1336,7 @@ class ModelRouter:
                 json_body=body,
                 allow_local=allow_local,
                 read_timeout=timeout,
+                budget=effective_budget,
                 max_bytes=AI_JSON_MAX_BYTES,
             )
         except OutboundRequestError as exc:
@@ -1203,8 +1355,11 @@ class ModelRouter:
         capability: str,
         messages: list[dict[str, str]],
         response_format: dict[str, Any] | None = None,
+        *,
+        budget: DeadlineBudget | None = None,
     ) -> str:
         """Async direct call"""
+        started_at = time.monotonic()
         allow_local = self.allow_local_ai_endpoints
         config = self.resolve(capability)
         override = self.overrides.get(capability, {})
@@ -1337,8 +1492,28 @@ class ModelRouter:
             stream=False,
         )
         
-        async with self._semaphore:
+        try:
+            effective_budget = _ensure_deadline(
+                budget, timeout=timeout_value, started_at=started_at
+            )
+        except OutboundRequestError as exc:
+            raise RuntimeError(exc.public_message) from None
+
+        request_id = self._begin_request_stats(capability)
+        self._queued_requests += 1
+        request_queued = True
+        request_active = False
+        semaphore_acquired = False
+        stats_finished = False
+        try:
+            await self._acquire_with_budget(effective_budget)
+            semaphore_acquired = True
+            self._queued_requests -= 1
+            request_queued = False
+            self._active_requests += 1
+            request_active = True
             try:
+                _budget_phase_timeout(effective_budget)
                 data = await self._runtime_client.apost_json(
                     request_base_url,
                     request_target=request_target,
@@ -1346,16 +1521,76 @@ class ModelRouter:
                     json_body=body,
                     allow_local=allow_local,
                     read_timeout=timeout_value,
+                    budget=effective_budget,
                     max_bytes=AI_JSON_MAX_BYTES,
                 )
+                result = self._extract_capability_content(
+                    data, provider_type, capability
+                )
             except OutboundRequestError as exc:
+                outcome = (
+                    "timeout" if exc.code == "outbound_timeout" else "error"
+                )
+                stats_finished = self._finish_request_stats(
+                    capability,
+                    outcome,
+                    time.monotonic() - started_at,
+                    finished=stats_finished,
+                )
                 logger.warning(
                     "[ModelRouter] Async capability call failed %s code=%s",
                     capability,
                     exc.code,
                 )
                 raise RuntimeError(exc.public_message) from None
-            return self._extract_capability_content(data, provider_type, capability)
+            except asyncio.CancelledError:
+                stats_finished = self._finish_request_stats(
+                    capability,
+                    "cancelled",
+                    time.monotonic() - started_at,
+                    finished=stats_finished,
+                )
+                raise
+            except Exception:
+                stats_finished = self._finish_request_stats(
+                    capability,
+                    "error",
+                    time.monotonic() - started_at,
+                    finished=stats_finished,
+                )
+                raise
+            else:
+                stats_finished = self._finish_request_stats(
+                    capability,
+                    "success",
+                    time.monotonic() - started_at,
+                    finished=stats_finished,
+                )
+                return result
+        except OutboundRequestError as exc:
+            outcome = "timeout" if exc.code == "outbound_timeout" else "error"
+            stats_finished = self._finish_request_stats(
+                capability,
+                outcome,
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
+            raise RuntimeError(exc.public_message) from None
+        except asyncio.CancelledError:
+            stats_finished = self._finish_request_stats(
+                capability,
+                "cancelled",
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
+            raise
+        finally:
+            if request_active:
+                self._active_requests -= 1
+            if semaphore_acquired:
+                self._semaphore.release()
+            if request_queued:
+                self._queued_requests -= 1
 
     async def chat(
         self,
@@ -1363,6 +1598,8 @@ class ModelRouter:
         capability: str = "turn_report",
         system_prompt: str | None = None,
         max_tokens: int | None = None,
+        *,
+        budget: DeadlineBudget | None = None,
     ) -> str:
         """通用聊天接口 - 直接传入完整 prompt 文本进行对话
         
@@ -1380,6 +1617,7 @@ class ModelRouter:
         Raises:
             RuntimeError: 当配置缺失或调用失败时
         """
+        started_at = time.monotonic()
         allow_local = self.allow_local_ai_endpoints
         config = self.resolve(capability)
         override = self.overrides.get(capability, {})
@@ -1490,8 +1728,28 @@ class ModelRouter:
             stream=False,
         )
         
-        async with self._semaphore:
+        try:
+            effective_budget = _ensure_deadline(
+                budget, timeout=timeout_value, started_at=started_at
+            )
+        except OutboundRequestError as exc:
+            raise RuntimeError(exc.public_message) from None
+
+        self._begin_request_stats(capability)
+        self._queued_requests += 1
+        request_queued = True
+        request_active = False
+        semaphore_acquired = False
+        stats_finished = False
+        try:
+            await self._acquire_with_budget(effective_budget)
+            semaphore_acquired = True
+            self._queued_requests -= 1
+            request_queued = False
+            self._active_requests += 1
+            request_active = True
             try:
+                _budget_phase_timeout(effective_budget)
                 data = await self._runtime_client.apost_json(
                     request_base_url,
                     request_target=request_target,
@@ -1499,16 +1757,76 @@ class ModelRouter:
                     json_body=body,
                     allow_local=allow_local,
                     read_timeout=timeout_value,
+                    budget=effective_budget,
                     max_bytes=AI_JSON_MAX_BYTES,
                 )
+                result = self._extract_capability_content(
+                    data, provider_type, capability
+                )
             except OutboundRequestError as exc:
+                outcome = (
+                    "timeout" if exc.code == "outbound_timeout" else "error"
+                )
+                stats_finished = self._finish_request_stats(
+                    capability,
+                    outcome,
+                    time.monotonic() - started_at,
+                    finished=stats_finished,
+                )
                 logger.warning(
                     "[ModelRouter] Chat failed %s code=%s",
                     capability,
                     exc.code,
                 )
                 raise RuntimeError(exc.public_message) from None
-            return self._extract_capability_content(data, provider_type, capability)
+            except asyncio.CancelledError:
+                stats_finished = self._finish_request_stats(
+                    capability,
+                    "cancelled",
+                    time.monotonic() - started_at,
+                    finished=stats_finished,
+                )
+                raise
+            except Exception:
+                stats_finished = self._finish_request_stats(
+                    capability,
+                    "error",
+                    time.monotonic() - started_at,
+                    finished=stats_finished,
+                )
+                raise
+            else:
+                stats_finished = self._finish_request_stats(
+                    capability,
+                    "success",
+                    time.monotonic() - started_at,
+                    finished=stats_finished,
+                )
+                return result
+        except OutboundRequestError as exc:
+            outcome = "timeout" if exc.code == "outbound_timeout" else "error"
+            stats_finished = self._finish_request_stats(
+                capability,
+                outcome,
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
+            raise RuntimeError(exc.public_message) from None
+        except asyncio.CancelledError:
+            stats_finished = self._finish_request_stats(
+                capability,
+                "cancelled",
+                time.monotonic() - started_at,
+                finished=stats_finished,
+            )
+            raise
+        finally:
+            if request_active:
+                self._active_requests -= 1
+            if semaphore_acquired:
+                self._semaphore.release()
+            if request_queued:
+                self._queued_requests -= 1
 
     async def astream_capability(
         self,

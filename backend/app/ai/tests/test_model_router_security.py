@@ -26,6 +26,7 @@ from app.core.ai_router_config import configure_model_router
 from app.models.config import ProviderConfig, UIConfig
 from app.security import (
     AI_JSON_MAX_BYTES,
+    DeadlineBudget,
     STREAM_EVENT_MAX_BYTES,
     STREAM_MAX_BYTES,
     OutboundRequestError,
@@ -179,6 +180,7 @@ class RecordingSafeRuntimeClient:
         json_body: dict[str, Any],
         allow_local: bool,
         read_timeout: float,
+        budget: DeadlineBudget | None = None,
         max_bytes: int,
     ) -> dict[str, Any]:
         self._record(
@@ -189,6 +191,7 @@ class RecordingSafeRuntimeClient:
             json_body=json_body,
             allow_local=allow_local,
             read_timeout=read_timeout,
+            budget=budget,
             max_bytes=max_bytes,
         )
         if self.on_sync_call is not None:
@@ -204,6 +207,7 @@ class RecordingSafeRuntimeClient:
         json_body: dict[str, Any],
         allow_local: bool,
         read_timeout: float,
+        budget: DeadlineBudget | None = None,
         max_bytes: int,
     ) -> dict[str, Any]:
         self._record(
@@ -214,6 +218,7 @@ class RecordingSafeRuntimeClient:
             json_body=json_body,
             allow_local=allow_local,
             read_timeout=read_timeout,
+            budget=budget,
             max_bytes=max_bytes,
         )
         if self.on_async_call is not None:
@@ -256,6 +261,57 @@ class RecordingSafeRuntimeClient:
             self.stream_block_on_exhaustion,
         )
         return self.stream_iterator
+
+
+class ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class AdvancingRuntimeClient(RecordingSafeRuntimeClient):
+    def __init__(
+        self,
+        clock: ManualClock,
+        outcomes: list[tuple[float, dict[str, Any] | BaseException]],
+    ) -> None:
+        super().__init__()
+        self._clock = clock
+        self._outcomes = outcomes
+
+    async def apost_json(
+        self,
+        base_url: str,
+        *,
+        request_target: str,
+        headers: dict[str, str],
+        json_body: dict[str, Any],
+        allow_local: bool,
+        read_timeout: float,
+        budget: DeadlineBudget | None = None,
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        self._record(
+            "apost_json",
+            base_url,
+            request_target=request_target,
+            headers=headers,
+            json_body=json_body,
+            allow_local=allow_local,
+            read_timeout=read_timeout,
+            budget=budget,
+            max_bytes=max_bytes,
+        )
+        advance, outcome = self._outcomes.pop(0)
+        self._clock.advance(advance)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
 @pytest.fixture
@@ -588,6 +644,186 @@ def test_ainvoke_unsafe_selected_pool_provider_does_not_fail_over() -> None:
     assert router._lb_counters["generate"] == 1
 
 
+@pytest.mark.parametrize(
+    "entry_name",
+    ["invoke", "ainvoke", "call_capability", "acall_capability", "chat"],
+)
+def test_normal_entries_pass_same_budget_object_to_runtime(entry_name: str) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    response = {"choices": [{"message": {"content": "oak"}}]}
+    runtime_client.sync_results = [response]
+    runtime_client.async_results = [response]
+    router = _remote_router(runtime_client, allow_local=False)
+    budget = DeadlineBudget.from_timeout(30.0)
+
+    if entry_name == "invoke":
+        router.invoke("generate", {"name": "oak"}, budget=budget)
+    elif entry_name == "ainvoke":
+        asyncio.run(router.ainvoke("generate", {"name": "oak"}, budget=budget))
+    elif entry_name == "call_capability":
+        router.call_capability("generate", _messages(), budget=budget)
+    elif entry_name == "acall_capability":
+        asyncio.run(
+            router.acall_capability("generate", _messages(), budget=budget)
+        )
+    else:
+        asyncio.run(
+            router.chat("Name a tree", capability="generate", budget=budget)
+        )
+
+    assert len(runtime_client.calls) == 1
+    assert runtime_client.calls[0]["budget"] is budget
+
+
+@pytest.mark.parametrize(
+    "entry_name",
+    ["invoke", "ainvoke", "call_capability", "acall_capability", "chat"],
+)
+def test_normal_entry_preparation_is_inside_total_budget(
+    entry_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    response = {"choices": [{"message": {"content": "must-not-run"}}]}
+    runtime_client.sync_results = [response]
+    runtime_client.async_results = [response]
+    router = _remote_router(
+        runtime_client, timeout=0.001, max_retries=1, allow_local=False
+    )
+    clock = ManualClock()
+    original_resolve = router.resolve
+    original_from_timeout = DeadlineBudget.from_timeout
+
+    def from_timeout(
+        cls: type[DeadlineBudget],
+        timeout: float,
+        *,
+        started_at: float | None = None,
+        clock_arg: Callable[[], float] | None = None,
+    ) -> DeadlineBudget:
+        del cls, clock_arg
+        return original_from_timeout(
+            timeout, started_at=started_at, clock=clock
+        )
+
+    def slow_resolve(capability: str) -> ModelConfig:
+        clock.advance(0.01)
+        return original_resolve(capability)
+
+    monkeypatch.setattr(model_router_module.time, "monotonic", clock)
+    monkeypatch.setattr(
+        DeadlineBudget, "from_timeout", classmethod(from_timeout)
+    )
+    monkeypatch.setattr(router, "resolve", slow_resolve)
+
+    if entry_name == "invoke":
+        result = router.invoke("generate", {"name": "oak"})
+        assert result["error"] == PUBLIC_TIMEOUT
+    elif entry_name == "ainvoke":
+        result = asyncio.run(router.ainvoke("generate", {"name": "oak"}))
+        assert result["error"] == PUBLIC_TIMEOUT
+    elif entry_name == "call_capability":
+        with pytest.raises(RuntimeError, match=PUBLIC_TIMEOUT):
+            router.call_capability("generate", _messages())
+    elif entry_name == "acall_capability":
+        with pytest.raises(RuntimeError, match=PUBLIC_TIMEOUT):
+            asyncio.run(router.acall_capability("generate", _messages()))
+    else:
+        with pytest.raises(RuntimeError, match=PUBLIC_TIMEOUT):
+            asyncio.run(router.chat("Name a tree", capability="generate"))
+
+    assert runtime_client.calls == []
+
+
+def test_ainvoke_queue_wait_is_inside_total_budget() -> None:
+    async def scenario() -> None:
+        runtime_client = RecordingSafeRuntimeClient()
+        router = _remote_router(
+            runtime_client, timeout=0.02, max_retries=3, allow_local=False
+        )
+        router.set_concurrency_limit(1)
+        await router._semaphore.acquire()
+        try:
+            result = await router.ainvoke("generate", {"name": "elm"})
+        finally:
+            router._semaphore.release()
+
+        assert result["error"] == PUBLIC_TIMEOUT
+        assert runtime_client.calls == []
+        diagnostics = router.get_diagnostics()
+        assert diagnostics["queued_requests"] == 0
+        assert diagnostics["active_requests"] == 0
+        assert diagnostics["total_timeouts"] == 1
+        assert diagnostics["request_stats"]["generate"]["timeout"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_ainvoke_retries_share_one_budget_and_count_one_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(6.0, clock=clock)
+    runtime_client = AdvancingRuntimeClient(
+        clock,
+        outcomes=[
+            (4.0, OutboundRequestError("outbound_timeout", 504, PUBLIC_TIMEOUT)),
+            (2.0, OutboundRequestError("outbound_timeout", 504, PUBLIC_TIMEOUT)),
+        ],
+    )
+    router = _remote_router(
+        runtime_client, max_retries=3, allow_local=False
+    )
+
+    async def no_backoff(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(model_router_module.asyncio, "sleep", no_backoff)
+
+    result = asyncio.run(
+        router.ainvoke("generate", {"name": "elm"}, budget=budget)
+    )
+
+    assert result["error"] == PUBLIC_TIMEOUT
+    assert len(runtime_client.calls) == 2
+    assert all(call["budget"] is budget for call in runtime_client.calls)
+    diagnostics = router.get_diagnostics()
+    assert diagnostics["total_requests"] == 1
+    assert diagnostics["total_timeouts"] == 1
+    assert diagnostics["request_stats"]["generate"]["timeout"] == 1
+    assert diagnostics["request_stats"]["generate"]["error"] == 0
+
+
+def test_ainvoke_does_not_backoff_or_retry_after_budget_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    budget = DeadlineBudget.from_timeout(1.0, clock=clock)
+    runtime_client = AdvancingRuntimeClient(
+        clock,
+        outcomes=[
+            (1.0, OutboundRequestError("outbound_timeout", 504, PUBLIC_TIMEOUT)),
+        ],
+    )
+    router = _remote_router(
+        runtime_client, max_retries=3, allow_local=False
+    )
+    sleep_calls: list[float] = []
+
+    async def record_backoff(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr(model_router_module.asyncio, "sleep", record_backoff)
+
+    result = asyncio.run(
+        router.ainvoke("generate", {"name": "elm"}, budget=budget)
+    )
+
+    assert result["error"] == PUBLIC_TIMEOUT
+    assert len(runtime_client.calls) == 1
+    assert sleep_calls == []
+
+
 def test_ainvoke_cancellation_while_waiting_for_semaphore_restores_counters() -> None:
     async def scenario() -> None:
         runtime_client = RecordingSafeRuntimeClient()
@@ -607,6 +843,10 @@ def test_ainvoke_cancellation_while_waiting_for_semaphore_restores_counters() ->
                 await task
             assert router._queued_requests == 0
             assert router._active_requests == 0
+            diagnostics = router.get_diagnostics()
+            assert diagnostics["total_timeouts"] == 0
+            assert diagnostics["total_cancellations"] == 1
+            assert diagnostics["request_stats"]["generate"]["cancelled"] == 1
         finally:
             router._semaphore.release()
 
@@ -632,6 +872,10 @@ def test_ainvoke_cancellation_during_safe_call_restores_counters() -> None:
             await task
         assert router._queued_requests == 0
         assert router._active_requests == 0
+        diagnostics = router.get_diagnostics()
+        assert diagnostics["total_timeouts"] == 0
+        assert diagnostics["total_cancellations"] == 1
+        assert diagnostics["request_stats"]["generate"]["cancelled"] == 1
 
     asyncio.run(scenario())
 
@@ -663,6 +907,10 @@ def test_ainvoke_cancellation_during_retry_backoff_restores_counters(
             await task
         assert router._queued_requests == 0
         assert router._active_requests == 0
+        diagnostics = router.get_diagnostics()
+        assert diagnostics["total_timeouts"] == 0
+        assert diagnostics["total_cancellations"] == 1
+        assert diagnostics["request_stats"]["generate"]["cancelled"] == 1
 
     asyncio.run(scenario())
 
