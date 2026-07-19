@@ -81,7 +81,7 @@ def _ensure_stream_budget(
         )
     except ValueError:
         raise OutboundRequestError(
-            "outbound_url_invalid", 400, "澶栭儴鏈嶅姟鍦板潃鏃犳晥"
+            "outbound_url_invalid", 400, "外部服务地址无效"
         ) from None
 
 
@@ -1183,6 +1183,8 @@ class ModelRouter:
                                     content_parts = content_obj.get("parts", [])
                                     for part in content_parts:
                                         text = part.get("text", "")
+                                        if not isinstance(text, str):
+                                            raise TypeError
                                         if text:
                                             budget.mark_content()
                                             if first_chunk:
@@ -1246,6 +1248,12 @@ class ModelRouter:
                                 )
                                 return
                             text = delta.get("text", "")
+                            if not isinstance(text, str):
+                                protocol_error("invalid_delta_text", text)
+                                yield self._stream_error_event(
+                                    capability, _STREAM_RESPONSE_ERROR
+                                )
+                                return
                             if text:
                                 budget.mark_content()
                                 if first_chunk:
@@ -1290,6 +1298,8 @@ class ModelRouter:
                             if not isinstance(delta, dict):
                                 raise TypeError
                             content = delta.get("content", "")
+                            if not isinstance(content, str):
+                                raise TypeError
                         except (AttributeError, TypeError):
                             protocol_error("invalid_chunk_shape", chunk)
                             yield self._stream_error_event(

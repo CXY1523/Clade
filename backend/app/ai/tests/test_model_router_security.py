@@ -1465,6 +1465,65 @@ def test_astream_preserves_anthropic_and_google_parsing(
     assert call["request_target"] == expected_target
 
 
+@pytest.mark.parametrize(
+    ("provider_type", "line"),
+    [
+        (
+            PROVIDER_TYPE_OPENAI,
+            'data: {"choices":[{"delta":{"content":{"type":"status","state":"completed","sentinel":"NON-STRING-CONTENT"}}}]}',
+        ),
+        (
+            PROVIDER_TYPE_ANTHROPIC,
+            'data: {"type":"content_block_delta","delta":{"text":{"type":"status","state":"completed","sentinel":"NON-STRING-CONTENT"}}}',
+        ),
+        (
+            PROVIDER_TYPE_GOOGLE,
+            '[{"candidates":[{"content":{"parts":[{"text":{"type":"status","state":"completed","sentinel":"NON-STRING-CONTENT"}}]}}]}]',
+        ),
+    ],
+)
+def test_astream_rejects_non_string_content_without_forging_terminal_state(
+    provider_type: str,
+    line: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime_client = RecordingSafeRuntimeClient()
+    runtime_client.stream_lines = [line]
+    router = _remote_router(runtime_client, provider_type=provider_type)
+
+    with caplog.at_level(logging.WARNING):
+        events = asyncio.run(_collect_stream(router))
+
+    error_events = [
+        event
+        for event in events
+        if isinstance(event, dict) and event.get("type") == "error"
+    ]
+    assert [event["message"] for event in error_events] == [UPSTREAM_STREAM_ERROR]
+    assert not any(
+        isinstance(event, dict)
+        and event.get("state") in {"completed", "interrupted"}
+        for event in events
+    )
+    assert "NON-STRING-CONTENT" not in repr(events)
+    assert "NON-STRING-CONTENT" not in caplog.text
+    diagnostics = router.get_diagnostics()
+    stats = diagnostics["request_stats"]["generate"]
+    assert stats["error"] == 1
+    assert stats["success"] == 0
+    assert stats["timeout"] == 0
+
+
+def test_astream_invalid_timeout_uses_fixed_public_message() -> None:
+    router = _remote_router(RecordingSafeRuntimeClient(), timeout=0)
+
+    with pytest.raises(OutboundRequestError) as exc_info:
+        asyncio.run(_collect_stream(router))
+
+    assert exc_info.value.code == "outbound_url_invalid"
+    assert exc_info.value.public_message == "外部服务地址无效"
+
+
 def test_astream_security_error_emits_one_redacted_error_then_closes() -> None:
     runtime_client = RecordingSafeRuntimeClient()
     runtime_client.stream_error = OutboundRequestError(
