@@ -112,55 +112,65 @@ def get_achievements() -> dict:
 def get_unlocked_achievements() -> dict:
     """获取已解锁的成就"""
     from ..services.analytics.achievements import achievement_service
-    return {"unlocked": achievement_service.get_unlocked()}
+    return {
+        "achievements": achievement_service.get_unlocked_achievements(),
+    }
 
 
 @router.get("/achievements/pending", tags=["achievements"])
 def get_pending_achievement_unlocks() -> dict:
     """获取待通知的成就解锁事件（获取后清空）"""
     from ..services.analytics.achievements import achievement_service
-    
-    pending = achievement_service.get_pending_unlocks()
-    achievements = []
-    for ach_id in pending:
-        ach = achievement_service.get_achievement(ach_id)
-        if ach:
-            achievements.append({
-                "id": ach_id,
-                "name": ach.get("name", ""),
-                "description": ach.get("description", ""),
-                "icon": ach.get("icon", "🏆"),
-            })
-    
-    return {"pending": achievements}
+
+    events = achievement_service.get_pending_unlocks()
+    return {
+        "events": [
+            {
+                "achievement": {
+                    "id": event.achievement.id,
+                    "name": event.achievement.name,
+                    "description": event.achievement.description,
+                    "icon": event.achievement.icon,
+                    "rarity": event.achievement.rarity.value,
+                    "category": event.achievement.category.value,
+                },
+                "turn_index": event.turn_index,
+                "timestamp": event.timestamp,
+            }
+            for event in events
+        ]
+    }
 
 
 @router.post("/achievements/exploration/{feature}", tags=["achievements"])
-def record_exploration(feature: str) -> dict:
+def record_exploration(
+    feature: str,
+    container: 'ServiceContainer' = Depends(get_container),
+) -> dict:
     """记录玩家探索功能（用于解锁探索者成就）"""
     from ..services.analytics.achievements import achievement_service
-    
-    # 有效的功能列表
-    valid_features = {
-        "lineage_tree", "food_web", "species_detail",
-        "pressure_config", "save_load", "achievements",
-        "ecosystem_health", "migration", "hybridization",
-    }
-    
-    if feature not in valid_features:
-        return {"success": False, "error": "Invalid feature"}
-    
-    achievement_service.record_exploration(feature)
-    return {"success": True, "feature": feature}
+
+    current_turn = container.simulation_engine.turn_counter
+    event = achievement_service.record_exploration(feature, current_turn)
+    if event:
+        return {
+            "success": True,
+            "unlocked": {
+                "id": event.achievement.id,
+                "name": event.achievement.name,
+                "icon": event.achievement.icon,
+            },
+        }
+    return {"success": True, "unlocked": None}
 
 
 @router.post("/achievements/reset", tags=["achievements"])
 def reset_achievements() -> dict:
     """重置所有成就进度（新存档时调用）"""
     from ..services.analytics.achievements import achievement_service
-    
+
     achievement_service.reset()
-    return {"success": True}
+    return {"success": True, "message": "成就进度已重置"}
 
 
 # ========== 提示系统 ==========

@@ -3153,7 +3153,7 @@ def get_task_diagnostics() -> dict:
         }
 
 
-# ================== 成就系统 API ==================
+# ================== 旧路由仍需的分析服务 ==================
 
 from ..services.analytics.achievements import AchievementService
 from ..services.analytics.game_hints import GameHintsService
@@ -3161,84 +3161,6 @@ from ..services.analytics.game_hints import GameHintsService
 # 初始化服务
 achievement_service = AchievementService(settings.data_dir)
 game_hints_service = GameHintsService(max_hints=5)
-
-
-@router.get("/achievements", tags=["achievements"])
-def get_achievements() -> dict:
-    """获取所有成就及其解锁状态
-    
-    返回：
-    - achievements: 成就列表
-    - stats: 统计信息
-    """
-    return {
-        "achievements": achievement_service.get_all_achievements(),
-        "stats": achievement_service.get_stats(),
-    }
-
-
-@router.get("/achievements/unlocked", tags=["achievements"])
-def get_unlocked_achievements() -> dict:
-    """获取已解锁的成就"""
-    return {
-        "achievements": achievement_service.get_unlocked_achievements(),
-    }
-
-
-@router.get("/achievements/pending", tags=["achievements"])
-def get_pending_achievement_unlocks() -> dict:
-    """获取待通知的成就解锁事件（获取后清空）
-    
-    用于前端显示成就解锁弹窗。
-    """
-    events = achievement_service.get_pending_unlocks()
-    return {
-        "events": [
-            {
-                "achievement": {
-                    "id": e.achievement.id,
-                    "name": e.achievement.name,
-                    "description": e.achievement.description,
-                    "icon": e.achievement.icon,
-                    "rarity": e.achievement.rarity.value,
-                    "category": e.achievement.category.value,
-                },
-                "turn_index": e.turn_index,
-                "timestamp": e.timestamp,
-            }
-            for e in events
-        ]
-    }
-
-
-@router.post("/achievements/exploration/{feature}", tags=["achievements"])
-def record_exploration(feature: str) -> dict:
-    """记录玩家探索功能（用于解锁探索者成就）
-    
-    Args:
-        feature: 功能名称 (genealogy, foodweb, niche)
-    """
-    # 获取当前回合
-    current_turn = simulation_engine.turn_counter
-    
-    event = achievement_service.record_exploration(feature, current_turn)
-    if event:
-        return {
-            "success": True,
-            "unlocked": {
-                "id": event.achievement.id,
-                "name": event.achievement.name,
-                "icon": event.achievement.icon,
-            }
-        }
-    return {"success": True, "unlocked": None}
-
-
-@router.post("/achievements/reset", tags=["achievements"])
-def reset_achievements() -> dict:
-    """重置所有成就进度（新存档时调用）"""
-    achievement_service.reset()
-    return {"success": True, "message": "成就进度已重置"}
 
 
 # ================== 智能提示 API ==================
