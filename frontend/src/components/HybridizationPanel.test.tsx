@@ -147,4 +147,75 @@ describe("HybridizationPanel species API boundary", () => {
     expect(await screen.findByText("甲乙杂交种")).toBeInTheDocument();
     expect(browserFetch).not.toHaveBeenCalled();
   });
+
+  it("loads the forced hybrid preview through the shared HTTP client", async () => {
+    apiMocks.fetchSpeciesList.mockResolvedValue([
+      {
+        lineage_code: "force-a",
+        latin_name: "Species fortis",
+        common_name: "强制甲",
+        population: 90,
+        status: "alive",
+        ecological_role: "herbivore",
+      },
+      {
+        lineage_code: "force-b",
+        latin_name: "Species mixta",
+        common_name: "强制乙",
+        population: 75,
+        status: "alive",
+        ecological_role: "carnivore",
+      },
+    ]);
+    const previewPath =
+      "/api/hybridization/force/preview?species_a=force-a&species_b=force-b";
+    apiMocks.get.mockImplementation(async (path: string) => {
+      if (path === "/api/hybridization/candidates") {
+        return { candidates: [], total: 0 };
+      }
+      if (path === previewPath) {
+        return {
+          can_force_hybridize: true,
+          reason: "可以强行杂交",
+          can_normal_hybridize: false,
+          normal_fertility: 0,
+          energy_cost: 50,
+          can_afford: true,
+          current_energy: 100,
+          preview: {
+            type: "chimera",
+            estimated_fertility: 0.12,
+            stability: "unstable",
+            parent_a: { code: "force-a", name: "强制甲", trophic: 1 },
+            parent_b: { code: "force-b", name: "强制乙", trophic: 2 },
+            warnings: [
+              "嵌合体通常不育或极低可育性",
+              "基因不稳定可能导致寿命缩短",
+              "可能出现意想不到的能力或缺陷",
+            ],
+          },
+        };
+      }
+      throw new Error(`Unexpected shared HTTP request: ${path}`);
+    });
+    const browserFetch = vi.fn().mockRejectedValue(
+      new Error("HybridizationPanel must not fetch the forced preview directly"),
+    );
+    vi.stubGlobal("fetch", browserFetch);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    render(<HybridizationPanel onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /强行杂交/ }));
+    fireEvent.click((await screen.findAllByText("强制甲"))[0]);
+    fireEvent.click(await screen.findByText("强制乙"));
+
+    await waitFor(() => {
+      expect(apiMocks.get).toHaveBeenCalledWith(previewPath);
+    });
+    expect(await screen.findByText("嵌合体预览")).toBeInTheDocument();
+    expect(screen.getByText("12.0%")).toBeInTheDocument();
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
 });

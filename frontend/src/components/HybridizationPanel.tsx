@@ -153,10 +153,9 @@ export function HybridizationPanel({ onClose, onSuccess }: Props) {
     if (!forceSpeciesA || !forceSpeciesB) return;
     try {
       setPreviewLoading(true);
-      const response = await fetch(
+      const data = await http.get<ForceHybridPreview>(
         `/api/hybridization/force/preview?species_a=${forceSpeciesA.lineage_code}&species_b=${forceSpeciesB.lineage_code}`
       );
-      const data = await response.json();
       setForcePreview(data);
     } catch (e) {
       console.error("获取强行杂交预览失败:", e);
