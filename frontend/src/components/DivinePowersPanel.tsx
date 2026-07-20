@@ -10,7 +10,7 @@ import {
 } from "lucide-react";
 import { AnalysisPanel, AnalysisSection, ActionButton, StatCard, EmptyState } from "./common/AnalysisPanel";
 import { dispatchEnergyChanged } from "./EnergyBar";
-import { http } from "@/services/api";
+import { http, isApiError } from "@/services/api";
 
 // ==================== 类型定义 ====================
 
@@ -173,21 +173,19 @@ export function DivinePowersPanel({ onClose }: Props) {
   const handleChoosePath = async (path: string) => {
     setActionLoading(true);
     try {
-      const res = await fetch("/api/divine/path/choose", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        alert(data.message || "神格选择成功！");
-        fetchStatus();
-      } else {
-        alert(data.detail || "选择神格失败");
-      }
+      const data = await http.post<{ message?: string }>(
+        "/api/divine/path/choose",
+        { path },
+      );
+      alert(data.message || "神格选择成功！");
+      fetchStatus();
     } catch (e) {
       console.error(e);
-      alert("请求失败，请检查网络连接");
+      alert(
+        isApiError(e)
+          ? e.detail || "选择神格失败"
+          : "请求失败，请检查网络连接",
+      );
     } finally {
       setActionLoading(false);
     }

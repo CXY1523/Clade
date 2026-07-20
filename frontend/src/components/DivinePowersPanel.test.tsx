@@ -1,20 +1,28 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiMocks = vi.hoisted(() => ({
   get: vi.fn(),
+  post: vi.fn(),
 }));
 
-vi.mock("@/services/api", () => ({
-  http: {
-    get: apiMocks.get,
-  },
-}));
+vi.mock("@/services/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/api")>();
+  return {
+    ...actual,
+    http: {
+      ...actual.http,
+      get: apiMocks.get,
+      post: apiMocks.post,
+    },
+  };
+});
 
 import { DivinePowersPanel } from "./DivinePowersPanel";
 
 describe("DivinePowersPanel API boundary", () => {
   beforeEach(() => {
+    apiMocks.post.mockReset();
     apiMocks.get.mockReset().mockResolvedValue({
       path: null,
       available_paths: [
@@ -167,6 +175,81 @@ describe("DivinePowersPanel API boundary", () => {
       expect(apiMocks.get).toHaveBeenCalledWith("/api/divine/skills");
     });
     expect(await screen.findByText("Life Spark")).toBeInTheDocument();
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("chooses a divine path through the shared HTTP client", async () => {
+    apiMocks.post.mockResolvedValue({
+      success: true,
+      message: "Path chosen",
+      path_info: {
+        path: "creator",
+        name: "Creator",
+        icon: "creator",
+        description: "Create life",
+        passive_bonus: "Lower creation cost",
+        color: "#22c55e",
+        level: 1,
+        experience: 0,
+        next_level_exp: 100,
+        unlocked_skills: ["life_spark"],
+        secondary_path: null,
+      },
+    });
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not choose a path directly"),
+      );
+    const alertMock = vi.fn();
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("选择此神格"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/path/choose", {
+        path: "creator",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Path chosen");
+    const statusRequests = apiMocks.get.mock.calls.filter(
+      ([path]) => path === "/api/divine/status",
+    );
+    expect(statusRequests).toHaveLength(2);
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("shows a divine path rejection returned by the shared HTTP client", async () => {
+    apiMocks.post.mockRejectedValue(
+      Object.assign(new Error("Request failed: Path already chosen"), {
+        name: "ApiError",
+        status: 400,
+        statusText: "Bad Request",
+        detail: "Path already chosen",
+      }),
+    );
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not choose a path directly"),
+      );
+    const alertMock = vi.fn();
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("选择此神格"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/path/choose", {
+        path: "creator",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Path already chosen");
     expect(browserFetch).not.toHaveBeenCalled();
   });
 });
