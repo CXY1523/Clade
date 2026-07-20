@@ -89,4 +89,62 @@ describe("HybridizationPanel species API boundary", () => {
     expect(await screen.findByText("暂无可杂交物种对")).toBeInTheDocument();
     expect(browserFetch).not.toHaveBeenCalled();
   });
+
+  it("loads the normal hybrid preview through the shared HTTP client", async () => {
+    const candidate = {
+      species_a: {
+        lineage_code: "alpha-a",
+        common_name: "候选甲",
+        latin_name: "Species alpha",
+        genus_code: "alpha",
+      },
+      species_b: {
+        lineage_code: "alpha-b",
+        common_name: "候选乙",
+        latin_name: "Species beta",
+        genus_code: "alpha",
+      },
+      fertility: 0.42,
+      genus: "alpha",
+    };
+    const previewPath =
+      "/api/hybridization/preview?species_a=alpha-a&species_b=alpha-b";
+    apiMocks.get.mockImplementation(async (path: string) => {
+      if (path === "/api/hybridization/candidates") {
+        return { candidates: [candidate], total: 1 };
+      }
+      if (path === previewPath) {
+        return {
+          can_hybridize: true,
+          fertility: 0.42,
+          energy_cost: 10,
+          can_afford: true,
+          preview: {
+            lineage_code: "alpha-a×alpha-b",
+            common_name: "甲乙杂交种",
+            predicted_trophic_level: 2,
+            combined_capabilities: [],
+            parent_traits_merged: true,
+          },
+        };
+      }
+      throw new Error(`Unexpected shared HTTP request: ${path}`);
+    });
+    const browserFetch = vi.fn().mockRejectedValue(
+      new Error("HybridizationPanel must not fetch the normal preview directly"),
+    );
+    vi.stubGlobal("fetch", browserFetch);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    render(<HybridizationPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("候选甲"));
+
+    await waitFor(() => {
+      expect(apiMocks.get).toHaveBeenCalledWith(previewPath);
+    });
+    expect(await screen.findByText("甲乙杂交种")).toBeInTheDocument();
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
 });

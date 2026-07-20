@@ -130,10 +130,9 @@ export function HybridizationPanel({ onClose, onSuccess }: Props) {
   const fetchPreview = useCallback(async (pair: HybridCandidate) => {
     try {
       setPreviewLoading(true);
-      const response = await fetch(
+      const data = await http.get<HybridPreview>(
         `/api/hybridization/preview?species_a=${pair.species_a.lineage_code}&species_b=${pair.species_b.lineage_code}`
       );
-      const data = await response.json();
       setPreview(data);
     } catch (e) {
       console.error("获取预览失败:", e);
