@@ -49,6 +49,78 @@ describe("HybridizationPanel species API boundary", () => {
     vi.restoreAllMocks();
   });
 
+  function mockForcedExecutionSelection() {
+    apiMocks.fetchSpeciesList.mockResolvedValue([
+      {
+        lineage_code: "force-execute-a",
+        latin_name: "Species fortis",
+        common_name: "强制执行甲",
+        population: 90,
+        status: "alive",
+        ecological_role: "herbivore",
+      },
+      {
+        lineage_code: "force-execute-b",
+        latin_name: "Species mixta",
+        common_name: "强制执行乙",
+        population: 75,
+        status: "alive",
+        ecological_role: "carnivore",
+      },
+    ]);
+    const previewPath =
+      "/api/hybridization/force/preview?species_a=force-execute-a&species_b=force-execute-b";
+    apiMocks.get.mockImplementation(async (path: string) => {
+      if (path === "/api/hybridization/candidates") {
+        return { candidates: [], total: 0 };
+      }
+      if (path === previewPath) {
+        return {
+          can_force_hybridize: true,
+          reason: "可以强行杂交",
+          can_normal_hybridize: false,
+          normal_fertility: 0,
+          energy_cost: 50,
+          can_afford: true,
+          current_energy: 100,
+          preview: {
+            type: "chimera",
+            estimated_fertility: 0.12,
+            stability: "unstable",
+            parent_a: {
+              code: "force-execute-a",
+              name: "强制执行甲",
+              trophic: 1,
+            },
+            parent_b: {
+              code: "force-execute-b",
+              name: "强制执行乙",
+              trophic: 2,
+            },
+            warnings: [
+              "嵌合体通常不育或极低可育性",
+              "基因不稳定可能导致寿命缩短",
+              "可能出现意想不到的能力或缺陷",
+            ],
+          },
+          warnings: [
+            "嵌合体通常不育或极低可育性",
+            "基因不稳定可能导致寿命缩短",
+            "可能出现意想不到的能力或缺陷",
+          ],
+        };
+      }
+      throw new Error(`Unexpected shared HTTP request: ${path}`);
+    });
+  }
+
+  async function selectForcedExecutionPair() {
+    fireEvent.click(screen.getByRole("button", { name: /强行杂交/ }));
+    fireEvent.click((await screen.findAllByText("强制执行甲"))[0]);
+    fireEvent.click(await screen.findByText("强制执行乙"));
+    expect(await screen.findByText("嵌合体预览")).toBeInTheDocument();
+  }
+
   it("loads the living species list through the shared API service", async () => {
     const browserFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -369,6 +441,81 @@ describe("HybridizationPanel species API boundary", () => {
 
     expect(await screen.findByText("能量不足")).toBeInTheDocument();
     expect(screen.queryByText("请求失败: 能量不足")).not.toBeInTheDocument();
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("executes a forced hybrid through the shared HTTP client", async () => {
+    mockForcedExecutionSelection();
+    apiMocks.post.mockResolvedValue({
+      success: true,
+      chimera: {
+        lineage_code: "forced-chimera",
+        latin_name: "Chimaera probata",
+        common_name: "测试嵌合体",
+        description: "测试强行杂交生成的嵌合体",
+        fertility: 0.12,
+        parent_codes: ["force-execute-a", "force-execute-b"],
+        is_chimera: true,
+      },
+      energy_spent: 50,
+      energy_remaining: 50,
+    });
+    const browserFetch = vi.fn().mockRejectedValue(
+      new Error("HybridizationPanel must not execute a forced hybrid directly"),
+    );
+    vi.stubGlobal("fetch", browserFetch);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const onSuccess = vi.fn();
+
+    render(<HybridizationPanel onClose={vi.fn()} onSuccess={onSuccess} />);
+
+    await selectForcedExecutionPair();
+    fireEvent.click(screen.getByRole("button", { name: /执行强行杂交/ }));
+
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith(
+        "/api/hybridization/force/execute",
+        {
+          species_a: "force-execute-a",
+          species_b: "force-execute-b",
+        },
+      );
+    });
+    expect(
+      await screen.findByText("🧬 成功创造嵌合体：测试嵌合体！消耗 50 能量"),
+    ).toBeInTheDocument();
+    expect(onSuccess).toHaveBeenCalledOnce();
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("preserves the forced hybrid server error detail", async () => {
+    mockForcedExecutionSelection();
+    apiMocks.post.mockRejectedValue(
+      Object.assign(new Error("请求失败: 强行杂交能量不足"), {
+        name: "ApiError",
+        status: 400,
+        statusText: "Bad Request",
+        detail: "强行杂交能量不足",
+      }),
+    );
+    const browserFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      json: async () => ({ detail: "强行杂交能量不足" }),
+    } as Response);
+    vi.stubGlobal("fetch", browserFetch);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    render(<HybridizationPanel onClose={vi.fn()} />);
+
+    await selectForcedExecutionPair();
+    fireEvent.click(screen.getByRole("button", { name: /执行强行杂交/ }));
+
+    expect(await screen.findByText("强行杂交能量不足")).toBeInTheDocument();
+    expect(
+      screen.queryByText("请求失败: 强行杂交能量不足"),
+    ).not.toBeInTheDocument();
     expect(browserFetch).not.toHaveBeenCalled();
   });
 });

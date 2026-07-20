@@ -181,20 +181,13 @@ export function HybridizationPanel({ onClose, onSuccess }: Props) {
       setError(null);
       setSuccess(null);
       
-      const response = await fetch("/api/hybridization/force/execute", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          species_a: forceSpeciesA.lineage_code,
-          species_b: forceSpeciesB.lineage_code,
-        }),
+      const data = await http.post<{
+        chimera: { common_name: string };
+        energy_spent: number;
+      }>("/api/hybridization/force/execute", {
+        species_a: forceSpeciesA.lineage_code,
+        species_b: forceSpeciesB.lineage_code,
       });
-      
-      const data = await response.json();
-      
-      if (!response.ok) {
-        throw new Error(data.detail || "强行杂交失败");
-      }
       
       setSuccess(`🧬 成功创造嵌合体：${data.chimera.common_name}！消耗 ${data.energy_spent} 能量`);
       setForceSpeciesA(null);
@@ -203,7 +196,13 @@ export function HybridizationPanel({ onClose, onSuccess }: Props) {
       onSuccess?.();
       
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "强行杂交失败");
+      const message =
+        isApiError(e) && e.detail
+          ? e.detail
+          : e instanceof Error
+            ? e.message
+            : "强行杂交失败";
+      setError(message);
     } finally {
       setExecuting(false);
     }
