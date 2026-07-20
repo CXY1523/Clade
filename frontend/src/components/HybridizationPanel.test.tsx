@@ -4,12 +4,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const apiMocks = vi.hoisted(() => ({
   fetchSpeciesList: vi.fn(),
   get: vi.fn(),
+  post: vi.fn(),
 }));
 
 vi.mock("@/services/api", () => ({
   fetchSpeciesList: apiMocks.fetchSpeciesList,
+  isApiError: (error: unknown) =>
+    error instanceof Error &&
+    typeof (error as Error & { status?: unknown }).status === "number",
   http: {
     get: apiMocks.get,
+    post: apiMocks.post,
   },
 }));
 
@@ -36,6 +41,7 @@ describe("HybridizationPanel species API boundary", () => {
       },
     ]);
     apiMocks.get.mockReset().mockResolvedValue({ candidates: [] });
+    apiMocks.post.mockReset();
   });
 
   afterEach(() => {
@@ -216,6 +222,153 @@ describe("HybridizationPanel species API boundary", () => {
     });
     expect(await screen.findByText("嵌合体预览")).toBeInTheDocument();
     expect(screen.getByText("12.0%")).toBeInTheDocument();
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("executes a normal hybrid through the shared HTTP client", async () => {
+    const candidate = {
+      species_a: {
+        lineage_code: "execute-a",
+        common_name: "执行甲",
+        latin_name: "Species agens",
+        genus_code: "agens",
+      },
+      species_b: {
+        lineage_code: "execute-b",
+        common_name: "执行乙",
+        latin_name: "Species acta",
+        genus_code: "agens",
+      },
+      fertility: 0.55,
+      genus: "agens",
+    };
+    const previewPath =
+      "/api/hybridization/preview?species_a=execute-a&species_b=execute-b";
+    apiMocks.get.mockImplementation(async (path: string) => {
+      if (path === "/api/hybridization/candidates") {
+        return { candidates: [candidate], total: 1 };
+      }
+      if (path === previewPath) {
+        return {
+          can_hybridize: true,
+          fertility: 0.55,
+          energy_cost: 10,
+          can_afford: true,
+          preview: {
+            lineage_code: "execute-a×execute-b",
+            common_name: "执行杂交预览",
+            predicted_trophic_level: 2,
+            combined_capabilities: [],
+            parent_traits_merged: true,
+          },
+        };
+      }
+      throw new Error(`Unexpected shared HTTP request: ${path}`);
+    });
+    apiMocks.post.mockResolvedValue({
+      success: true,
+      hybrid: {
+        lineage_code: "execute-hybrid",
+        latin_name: "Species hybrida",
+        common_name: "执行杂交种",
+        description: "测试杂交种",
+        fertility: 0.55,
+        parent_codes: ["execute-a", "execute-b"],
+      },
+      energy_spent: 10,
+      energy_remaining: 90,
+    });
+    const browserFetch = vi.fn().mockRejectedValue(
+      new Error("HybridizationPanel must not execute a normal hybrid directly"),
+    );
+    vi.stubGlobal("fetch", browserFetch);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const onSuccess = vi.fn();
+
+    render(<HybridizationPanel onClose={vi.fn()} onSuccess={onSuccess} />);
+
+    fireEvent.click(await screen.findByText("执行甲"));
+    expect(await screen.findByText("执行杂交预览")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "执行杂交" }));
+
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/hybridization/execute", {
+        species_a: "execute-a",
+        species_b: "execute-b",
+      });
+    });
+    expect(
+      await screen.findByText("成功创建杂交种：执行杂交种！消耗 10 能量"),
+    ).toBeInTheDocument();
+    expect(onSuccess).toHaveBeenCalledOnce();
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("preserves the normal hybrid server error detail", async () => {
+    const candidate = {
+      species_a: {
+        lineage_code: "error-a",
+        common_name: "错误甲",
+        latin_name: "Species errora",
+        genus_code: "error",
+      },
+      species_b: {
+        lineage_code: "error-b",
+        common_name: "错误乙",
+        latin_name: "Species errorb",
+        genus_code: "error",
+      },
+      fertility: 0.5,
+      genus: "error",
+    };
+    const previewPath =
+      "/api/hybridization/preview?species_a=error-a&species_b=error-b";
+    apiMocks.get.mockImplementation(async (path: string) => {
+      if (path === "/api/hybridization/candidates") {
+        return { candidates: [candidate], total: 1 };
+      }
+      if (path === previewPath) {
+        return {
+          can_hybridize: true,
+          fertility: 0.5,
+          energy_cost: 10,
+          can_afford: true,
+          preview: {
+            lineage_code: "error-a×error-b",
+            common_name: "错误预览",
+            predicted_trophic_level: 2,
+            combined_capabilities: [],
+            parent_traits_merged: true,
+          },
+        };
+      }
+      throw new Error(`Unexpected shared HTTP request: ${path}`);
+    });
+    apiMocks.post.mockRejectedValue(
+      Object.assign(new Error("请求失败: 能量不足"), {
+        name: "ApiError",
+        status: 400,
+        statusText: "Bad Request",
+        detail: "能量不足",
+      }),
+    );
+    const browserFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      json: async () => ({ detail: "能量不足" }),
+    } as Response);
+    vi.stubGlobal("fetch", browserFetch);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    render(<HybridizationPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("错误甲"));
+    expect(await screen.findByText("错误预览")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "执行杂交" }));
+
+    expect(await screen.findByText("能量不足")).toBeInTheDocument();
+    expect(screen.queryByText("请求失败: 能量不足")).not.toBeInTheDocument();
     expect(browserFetch).not.toHaveBeenCalled();
   });
 });

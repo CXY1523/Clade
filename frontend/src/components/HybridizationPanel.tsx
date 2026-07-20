@@ -10,7 +10,7 @@ import {
   ArrowRight, Sparkles, Heart, Shield, ChevronDown, Skull, FlaskConical
 } from "lucide-react";
 import { AnalysisPanel, AnalysisSection, ActionButton, StatCard, EmptyState } from "./common/AnalysisPanel";
-import { fetchSpeciesList, http } from "@/services/api";
+import { fetchSpeciesList, http, isApiError } from "@/services/api";
 
 interface SpeciesInfo {
   lineage_code: string;
@@ -217,20 +217,13 @@ export function HybridizationPanel({ onClose, onSuccess }: Props) {
       setError(null);
       setSuccess(null);
       
-      const response = await fetch("/api/hybridization/execute", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          species_a: selectedPair.species_a.lineage_code,
-          species_b: selectedPair.species_b.lineage_code,
-        }),
+      const data = await http.post<{
+        hybrid: { common_name: string };
+        energy_spent: number;
+      }>("/api/hybridization/execute", {
+        species_a: selectedPair.species_a.lineage_code,
+        species_b: selectedPair.species_b.lineage_code,
       });
-      
-      const data = await response.json();
-      
-      if (!response.ok) {
-        throw new Error(data.detail || "杂交失败");
-      }
       
       setSuccess(`成功创建杂交种：${data.hybrid.common_name}！消耗 ${data.energy_spent} 能量`);
       setSelectedPair(null);
@@ -238,7 +231,13 @@ export function HybridizationPanel({ onClose, onSuccess }: Props) {
       onSuccess?.();
       
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "杂交失败");
+      const message =
+        isApiError(e) && e.detail
+          ? e.detail
+          : e instanceof Error
+            ? e.message
+            : "杂交失败";
+      setError(message);
     } finally {
       setExecuting(false);
     }
