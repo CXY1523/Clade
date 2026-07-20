@@ -10,6 +10,7 @@ import {
   ArrowRight, Sparkles, Heart, Shield, ChevronDown, Skull, FlaskConical
 } from "lucide-react";
 import { AnalysisPanel, AnalysisSection, ActionButton, StatCard, EmptyState } from "./common/AnalysisPanel";
+import { fetchSpeciesList } from "@/services/api";
 
 interface SpeciesInfo {
   lineage_code: string;
@@ -104,12 +105,8 @@ export function HybridizationPanel({ onClose, onSuccess }: Props) {
 
   async function fetchAllSpecies() {
     try {
-      // 正确的API端点是 /api/species/list
-      const response = await fetch("/api/species/list");
-      const data = await response.json();
-      // 支持多种可能的数据结构
-      const speciesList = data.species || data || [];
-      const alive = speciesList.filter((s: AllSpecies) => s.status === "alive");
+      const speciesList = await fetchSpeciesList();
+      const alive = speciesList.filter((s) => s.status === "alive");
       console.log("获取到存活物种:", alive.length, "个");
       setAllSpecies(alive);
     } catch (e) {
