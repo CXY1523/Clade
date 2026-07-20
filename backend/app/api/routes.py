@@ -3165,67 +3165,6 @@ game_hints_service = GameHintsService(max_hints=5)
 
 # ================== 智能提示 API ==================
 
-@router.get("/hints", tags=["hints"])
-def get_game_hints() -> dict:
-    """获取当前游戏状态的智能提示
-    
-    返回：
-    - hints: 提示列表（按优先级排序）
-    """
-    try:
-        all_species = species_repository.list_species()
-        current_turn = simulation_engine.turn_counter
-    except Exception as e:
-        logger.error(f"[提示API] 获取物种/回合失败: {e}")
-        return {"hints": [], "turn": 0}
-    
-    def _safe_parse_turn_report(record_data) -> TurnReport | None:
-        """防御性解析回合报告，避免脏数据导致 500。"""
-        if not record_data:
-            return None
-        try:
-            # record_data 可能是 JSON 字符串或 dict
-            if isinstance(record_data, str):
-                import json
-                record_data = json.loads(record_data)
-            return TurnReport.model_validate(record_data)
-        except Exception as e:
-            logger.warning(f"[Hints] 解析回合报告失败，忽略该记录: {e}")
-            return None
-    
-    # 获取最近的报告
-    logs = history_repository.list_turns(limit=2)
-    recent_report = None
-    previous_report = None
-    
-    if logs:
-        recent_report = _safe_parse_turn_report(logs[0].record_data)
-        if len(logs) > 1:
-            previous_report = _safe_parse_turn_report(logs[1].record_data)
-    
-    try:
-        hints = game_hints_service.generate_hints(
-            all_species=all_species,
-            current_turn=current_turn,
-            recent_report=recent_report,
-            previous_report=previous_report,
-        )
-        return {
-            "hints": [h.to_dict() for h in hints],
-            "turn": current_turn,
-        }
-    except Exception as e:
-        logger.error(f"[提示API] 生成提示失败: {e}", exc_info=True)
-        return {"hints": [], "turn": current_turn, "error": "failed_to_generate_hints"}
-
-
-@router.post("/hints/clear", tags=["hints"])
-def clear_hints_cooldown() -> dict:
-    """清除提示冷却（新存档时调用）"""
-    game_hints_service.clear_cooldown()
-    return {"success": True, "message": "提示冷却已清除"}
-
-
 # 在创建存档时重置成就和提示
 def _reset_game_services():
     """重置游戏服务状态（创建/加载存档时调用）"""

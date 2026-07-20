@@ -184,14 +184,51 @@ def get_game_hints(
 ) -> dict:
     """获取当前游戏状态的智能提示"""
     from ..services.analytics.game_hints import game_hints_service
+    from ..schemas.responses import TurnReport
     
     species_repo = container.species_repository
-    all_species = species_repo.list_species()
-    current_turn = container.simulation_engine.turn_counter
-    
-    # 调用 generate_hints 并转换为 dict
-    hints = game_hints_service.generate_hints(all_species, current_turn)
-    return {"hints": [h.to_dict() for h in hints]}
+    history_repo = container.history_repository
+
+    try:
+        all_species = species_repo.list_species()
+        current_turn = container.simulation_engine.turn_counter
+    except Exception as exc:
+        logger.error("[提示API] 获取物种/回合失败: %s", exc)
+        return {"hints": [], "turn": 0}
+
+    def _safe_parse_turn_report(record_data) -> TurnReport | None:
+        if not record_data:
+            return None
+        try:
+            if isinstance(record_data, str):
+                import json
+                record_data = json.loads(record_data)
+            return TurnReport.model_validate(record_data)
+        except Exception as exc:
+            logger.warning("[Hints] 解析回合报告失败，忽略该记录: %s", exc)
+            return None
+
+    logs = history_repo.list_turns(limit=2)
+    recent_report = _safe_parse_turn_report(logs[0].record_data) if logs else None
+    previous_report = (
+        _safe_parse_turn_report(logs[1].record_data) if len(logs) > 1 else None
+    )
+
+    try:
+        hints = game_hints_service.generate_hints(
+            all_species=all_species,
+            current_turn=current_turn,
+            recent_report=recent_report,
+            previous_report=previous_report,
+        )
+        return {"hints": [hint.to_dict() for hint in hints], "turn": current_turn}
+    except Exception as exc:
+        logger.error("[提示API] 生成提示失败: %s", exc, exc_info=True)
+        return {
+            "hints": [],
+            "turn": current_turn,
+            "error": "failed_to_generate_hints",
+        }
 
 
 @router.post("/hints/clear", tags=["hints"])
@@ -200,7 +237,7 @@ def clear_hints_cooldown() -> dict:
     from ..services.analytics.game_hints import game_hints_service
     
     game_hints_service.clear_cooldown()
-    return {"success": True}
+    return {"success": True, "message": "提示冷却已清除"}
 
 
 # ========== 杂交控制 ==========
