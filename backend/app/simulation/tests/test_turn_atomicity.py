@@ -1,4 +1,4 @@
-"""Regression coverage for failed core simulation stages."""
+"""Regression coverage for simulation turn transaction boundaries."""
 
 from types import SimpleNamespace
 
@@ -12,7 +12,7 @@ from ...models.environment import MapState
 from ...schemas.requests import TurnCommand
 from ..engine import SimulationEngine
 from ..pipeline import Pipeline, PipelineConfig
-from ..stages import MapEvolutionStage, ParsePressuresStage
+from ..stages import FinalizeStage, MapEvolutionStage, ParsePressuresStage
 
 
 def _database_snapshot(engine) -> dict[str, list[dict]]:
@@ -89,3 +89,62 @@ async def test_core_stage_failure_keeps_turn_counter_and_database_unchanged(monk
         failures.append("database state changed after the failed core stage")
 
     assert not failures, "\n".join(failures)
+
+
+@pytest.mark.asyncio
+async def test_successful_turn_commits_database_and_advances_counter_once(monkeypatch):
+    """A successful core turn must commit its writes and advance both turn indexes once."""
+
+    test_database_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    monkeypatch.setattr(database, "engine", test_database_engine)
+    SQLModel.metadata.create_all(test_database_engine)
+
+    with Session(test_database_engine) as session:
+        session.add(MapState(id=1, turn_index=4, sea_level=0.0, global_avg_temperature=15.0))
+        session.commit()
+
+    simulation_engine = SimulationEngine.__new__(SimulationEngine)
+    simulation_engine.turn_counter = 4
+    simulation_engine._event_callback = None
+    simulation_engine.environment = SimpleNamespace(
+        parse_pressures=lambda pressures: [],
+        apply_pressures=lambda pressures: {"warming": 1.0},
+    )
+    simulation_engine.escalation_service = SimpleNamespace(
+        register=lambda pressures, turn_index: [],
+    )
+    simulation_engine.map_evolution = SimpleNamespace(
+        advance=lambda events, turn_index, modifiers, state: [],
+        calculate_climate_changes=lambda modifiers, state: (1.0, 1.0),
+    )
+    simulation_engine.map_manager = SimpleNamespace(
+        reclassify_terrain_by_sea_level=lambda sea_level: None,
+    )
+    simulation_engine._use_tectonic_system = False
+    simulation_engine._pipeline = Pipeline(
+        [ParsePressuresStage(), MapEvolutionStage(), FinalizeStage()],
+        PipelineConfig(
+            continue_on_error=False,
+            emit_stage_events=False,
+            validate_dependencies=False,
+        ),
+    )
+
+    initial_database_state = _database_snapshot(test_database_engine)
+
+    await simulation_engine.run_turn_with_pipeline(TurnCommand(rounds=1))
+
+    assert simulation_engine.turn_counter == 5
+    assert _database_snapshot(test_database_engine) != initial_database_state
+
+    with Session(test_database_engine) as session:
+        persisted_map_state = session.get(MapState, 1)
+
+        assert persisted_map_state is not None
+        assert persisted_map_state.turn_index == 5
+        assert persisted_map_state.sea_level == 1.0
+        assert persisted_map_state.global_avg_temperature == 16.0
