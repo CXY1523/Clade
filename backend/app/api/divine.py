@@ -55,19 +55,22 @@ def calculate_energy_cost(request: dict) -> dict:
     from ..services.system.divine_energy import energy_service
     
     action = request.get("action", "")
+    parameters = {key: value for key, value in request.items() if key != "action"}
     
-    if action == "pressure" and "pressures" in request:
-        cost = energy_service.get_pressure_cost(request["pressures"])
+    if action == "pressure" and "pressures" in parameters:
+        cost = energy_service.get_pressure_cost(parameters["pressures"])
+        state = energy_service.get_state()
+        can_afford = not energy_service.enabled or state.current >= cost
     else:
-        cost = energy_service.get_cost(action, **request)
-    
-    can_afford, _ = energy_service.can_afford(action, **request)
+        cost = energy_service.get_cost(action, **parameters)
+        can_afford, _ = energy_service.can_afford(action, **parameters)
+        state = energy_service.get_state()
     
     return {
         "action": action,
         "cost": cost,
         "can_afford": can_afford,
-        "current_energy": energy_service.get_state().current,
+        "current_energy": state.current,
     }
 
 
