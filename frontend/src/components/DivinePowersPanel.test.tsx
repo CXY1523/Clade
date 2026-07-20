@@ -85,4 +85,88 @@ describe("DivinePowersPanel API boundary", () => {
     const requestedUrls = browserFetch.mock.calls.map(([input]) => String(input));
     expect(requestedUrls).not.toContain("/api/divine/status");
   });
+
+  it("loads divine skills through the shared HTTP client", async () => {
+    apiMocks.get.mockImplementation(async (path: string) => {
+      if (path === "/api/divine/status") {
+        return {
+          path: {
+            path: "creator",
+            name: "Creator",
+            icon: "creator",
+            description: "Create life",
+            passive_bonus: "Lower creation cost",
+            color: "#22c55e",
+            skills: ["life_spark"],
+            level: 1,
+            experience: 10,
+            next_level_exp: 100,
+            unlocked_skills: ["life_spark"],
+            secondary_path: null,
+          },
+          available_paths: null,
+          faith: {
+            total_followers: 0,
+            total_faith: 0,
+            faith_bonus_per_turn: 0,
+            followers: [],
+          },
+          miracles: [],
+          charging_miracle: null,
+          wagers: {
+            active_wagers: [],
+            total_bet: 0,
+            total_won: 0,
+            total_lost: 0,
+            net_profit: 0,
+            consecutive_wins: 0,
+            consecutive_losses: 0,
+            faith_shaken_turns: 0,
+            wager_types: [],
+          },
+          stats: {
+            total_skills_used: 0,
+            total_miracles_cast: 0,
+          },
+        };
+      }
+      if (path === "/api/divine/skills") {
+        return {
+          skills: [
+            {
+              id: "life_spark",
+              name: "Life Spark",
+              path: "creator",
+              description: "Create new life",
+              cost: 10,
+              cooldown: 1,
+              unlock_level: 1,
+              icon: "spark",
+              unlocked: true,
+              uses: 0,
+              is_current_path: true,
+            },
+          ],
+          current_path: "creator",
+        };
+      }
+      throw new Error(`Unexpected shared request: ${path}`);
+    });
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not fetch divine skills directly"),
+      );
+    vi.stubGlobal("fetch", browserFetch);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(apiMocks.get).toHaveBeenCalledWith("/api/divine/status");
+      expect(apiMocks.get).toHaveBeenCalledWith("/api/divine/skills");
+    });
+    expect(await screen.findByText("Life Spark")).toBeInTheDocument();
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
 });

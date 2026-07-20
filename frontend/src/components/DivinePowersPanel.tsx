@@ -512,8 +512,10 @@ function PathTab({
   const [skills, setSkills] = useState<SkillInfo[]>([]);
 
   useEffect(() => {
-    fetch("/api/divine/skills")
-      .then((r) => r.json())
+    http
+      .get<{ skills: SkillInfo[]; current_path: string | null }>(
+        "/api/divine/skills",
+      )
       .then((data) => setSkills(data.skills || []))
       .catch(console.error);
   }, [status]);
