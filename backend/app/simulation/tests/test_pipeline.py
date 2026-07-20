@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
+from .. import stages as stages_module
 from ..pipeline import Pipeline, PipelineConfig, PipelineBuilder, PipelineResult
 from ..stage_config import StageLoader, stage_registry, AVAILABLE_MODES
 from ..ecological_realism_stage import EcologicalRealismStage
@@ -22,6 +23,7 @@ from ..stages import (
     BuildReportStage,
     EmbeddingPluginsStage,
     EmbeddingStage,
+    ExportDataStage,
     FetchSpeciesStage,
     FinalMortalityStage,
     GeneActivationStage,
@@ -174,6 +176,120 @@ class TestPipeline:
         assert "失败阶段" in result.failed_stages
         # 第三个阶段仍然执行
         assert stages[2].executed
+
+    async def test_degradable_failure_continues_and_keeps_pipeline_successful(
+        self, mock_ctx, mock_engine
+    ):
+        """An auxiliary output failure is recorded without failing the core turn."""
+
+        class FailingReportStage(BuildReportStage):
+            async def execute(self, ctx, engine):
+                raise RuntimeError("forced report failure")
+
+        final_stage = SimpleTestStage(180, "final-stage")
+        pipeline = Pipeline(
+            [FailingReportStage(), final_stage],
+            PipelineConfig(
+                continue_on_error=False,
+                validate_dependencies=False,
+            ),
+        )
+
+        result = await pipeline.execute(mock_ctx, mock_engine)
+
+        assert result.success
+        assert result.failed_stages == ["构建报告"]
+        assert result.degraded_stages == ["构建报告"]
+        assert result.metrics is not None
+        assert result.metrics.degraded_stages == ["构建报告"]
+        assert final_stage.executed
+
+    @pytest.mark.parametrize(
+        "stage_type",
+        [BuildReportStage, EmbeddingStage, EmbeddingPluginsStage, ExportDataStage],
+    )
+    async def test_auxiliary_output_stages_are_explicitly_degradable(self, stage_type):
+        """Only allowlisted auxiliary output stages may degrade."""
+
+        assert getattr(stage_type, "is_degradable", False)
+
+    async def test_real_report_failure_is_recorded_as_degradation(
+        self, monkeypatch, mock_ctx, mock_engine
+    ):
+        """The real report stage must surface an unhandled build failure."""
+
+        class FailingTurnReportService:
+            def __init__(self, **kwargs):
+                pass
+
+            async def build_report(self, **kwargs):
+                raise RuntimeError("forced report service failure")
+
+        monkeypatch.setattr(
+            stages_module, "TurnReportService", FailingTurnReportService
+        )
+        mock_engine.report_builder = MagicMock()
+        mock_engine.trophic_service = MagicMock()
+        pipeline = Pipeline(
+            [BuildReportStage()],
+            PipelineConfig(
+                continue_on_error=False,
+                validate_dependencies=False,
+            ),
+        )
+
+        result = await pipeline.execute(mock_ctx, mock_engine)
+
+        assert result.success
+        assert result.degraded_stages == ["构建报告"]
+
+    async def test_real_embedding_failure_is_recorded_as_degradation(
+        self, mock_ctx, mock_engine
+    ):
+        """The real Embedding stage must surface a failed turn-end hook."""
+
+        def fail_turn_end(turn_index, species_batch):
+            raise RuntimeError("forced embedding failure")
+
+        mock_engine._use_embedding_integration = True
+        mock_engine.embedding_integration = SimpleNamespace(on_turn_end=fail_turn_end)
+        pipeline = Pipeline(
+            [EmbeddingStage()],
+            PipelineConfig(
+                continue_on_error=False,
+                validate_dependencies=False,
+            ),
+        )
+
+        result = await pipeline.execute(mock_ctx, mock_engine)
+
+        assert result.success
+        assert result.degraded_stages == ["Embedding集成"]
+
+    async def test_real_embedding_plugin_failure_is_recorded_as_degradation(
+        self, mock_ctx, mock_engine
+    ):
+        """The real plugin stage must surface a failed plugin hook."""
+
+        def fail_turn_end(ctx):
+            raise RuntimeError("forced embedding plugin failure")
+
+        stage = EmbeddingPluginsStage()
+        stage._initialized = True
+        stage._manager = SimpleNamespace(on_turn_end=fail_turn_end)
+        stage._sync_tensor_bridge = lambda ctx: None
+        pipeline = Pipeline(
+            [stage],
+            PipelineConfig(
+                continue_on_error=False,
+                validate_dependencies=False,
+            ),
+        )
+
+        result = await pipeline.execute(mock_ctx, mock_engine)
+
+        assert result.success
+        assert result.degraded_stages == ["Embedding扩展插件"]
     
     async def test_stop_on_error(self, mock_ctx, mock_engine):
         """测试错误时停止"""

@@ -315,11 +315,21 @@ class BaseStage(ABC):
     # Their request layer owns the complete deadline, so the pipeline must not
     # add its generic business-stage timeout around them.
     uses_internal_request_budget = False
+    is_degradable = False
     
     def __init__(self, order: int, name: str, is_async: bool = False):
         self._order = order
         self._name = name
         self._is_async = is_async
+        self._degradable_failure_pending = False
+
+    def _mark_degradable_failure(self) -> None:
+        self._degradable_failure_pending = True
+
+    def _consume_degradable_failure(self) -> bool:
+        pending = self._degradable_failure_pending
+        self._degradable_failure_pending = False
+        return pending
     
     @property
     def name(self) -> str:
@@ -2502,6 +2512,7 @@ class BuildReportStage(BaseStage):
     """构建报告阶段"""
     
     uses_internal_request_budget = True
+    is_degradable = True
 
     def __init__(self):
         super().__init__(StageOrder.BUILD_REPORT.value, "构建报告", is_async=True)
@@ -2596,6 +2607,7 @@ class BuildReportStage(BaseStage):
             )
         except Exception as exc:
             logger.error("[报告生成] 失败 type=%s", type(exc).__name__)
+            self._mark_degradable_failure()
     
     def _build_simple_species_data(self, ctx: SimulationContext) -> list:
         """从上下文中构建简单的物种快照列表（用于跳过报告或超时时）"""
@@ -2823,6 +2835,7 @@ class EmbeddingStage(BaseStage):
     """Embedding 集成阶段"""
     
     uses_internal_request_budget = True
+    is_degradable = True
 
     def __init__(self):
         super().__init__(StageOrder.EMBEDDING_INTEGRATION.value, "Embedding集成")
@@ -2870,6 +2883,7 @@ class EmbeddingStage(BaseStage):
         except Exception as e:
             logger.warning(f"[Embedding] 失败: {e}")
             ctx.embedding_turn_data = {}
+            self._mark_degradable_failure()
 
 
 class EmbeddingPluginsStage(BaseStage):
@@ -2888,6 +2902,7 @@ class EmbeddingPluginsStage(BaseStage):
     """
     
     uses_internal_request_budget = True
+    is_degradable = True
 
     def __init__(self):
         super().__init__(StageOrder.EMBEDDING_PLUGINS.value, "Embedding扩展插件")
@@ -2979,6 +2994,7 @@ class EmbeddingPluginsStage(BaseStage):
                 
         except Exception as e:
             logger.warning(f"[EmbeddingPlugins] 执行失败: {e}")
+            self._mark_degradable_failure()
     
     def _sync_tensor_bridge(self, ctx: SimulationContext) -> None:
         """同步张量桥接器"""
@@ -3061,6 +3077,8 @@ class SaveHistoryStage(BaseStage):
 
 class ExportDataStage(BaseStage):
     """导出数据阶段"""
+
+    is_degradable = True
     
     def __init__(self):
         super().__init__(StageOrder.EXPORT_DATA.value, "导出数据")
