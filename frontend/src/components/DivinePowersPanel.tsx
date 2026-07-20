@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { AnalysisPanel, AnalysisSection, ActionButton, StatCard, EmptyState } from "./common/AnalysisPanel";
 import { dispatchEnergyChanged } from "./EnergyBar";
+import { http } from "@/services/api";
 
 // ==================== 类型定义 ====================
 
@@ -156,8 +157,7 @@ export function DivinePowersPanel({ onClose }: Props) {
 
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch("/api/divine/status");
-      const data = await res.json();
+      const data = await http.get<DivineStatus>("/api/divine/status");
       setStatus(data);
     } catch (e) {
       console.error("获取神力状态失败:", e);
