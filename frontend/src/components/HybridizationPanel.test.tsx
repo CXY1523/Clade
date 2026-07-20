@@ -3,10 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiMocks = vi.hoisted(() => ({
   fetchSpeciesList: vi.fn(),
+  get: vi.fn(),
 }));
 
 vi.mock("@/services/api", () => ({
   fetchSpeciesList: apiMocks.fetchSpeciesList,
+  http: {
+    get: apiMocks.get,
+  },
 }));
 
 import { HybridizationPanel } from "./HybridizationPanel";
@@ -31,6 +35,7 @@ describe("HybridizationPanel species API boundary", () => {
         ecological_role: "herbivore",
       },
     ]);
+    apiMocks.get.mockReset().mockResolvedValue({ candidates: [] });
   });
 
   afterEach(() => {
@@ -66,5 +71,22 @@ describe("HybridizationPanel species API boundary", () => {
     expect(await screen.findByText("1 个可用物种")).toBeInTheDocument();
     const requestedUrls = browserFetch.mock.calls.map(([input]) => String(input));
     expect(requestedUrls).not.toContain("/api/species/list");
+  });
+
+  it("loads hybrid candidates through the shared HTTP client", async () => {
+    const browserFetch = vi.fn().mockRejectedValue(
+      new Error("HybridizationPanel must not fetch candidates directly"),
+    );
+    vi.stubGlobal("fetch", browserFetch);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    render(<HybridizationPanel onClose={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(apiMocks.get).toHaveBeenCalledWith("/api/hybridization/candidates");
+    });
+    expect(await screen.findByText("暂无可杂交物种对")).toBeInTheDocument();
+    expect(browserFetch).not.toHaveBeenCalled();
   });
 });

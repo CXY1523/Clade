@@ -10,7 +10,7 @@ import {
   ArrowRight, Sparkles, Heart, Shield, ChevronDown, Skull, FlaskConical
 } from "lucide-react";
 import { AnalysisPanel, AnalysisSection, ActionButton, StatCard, EmptyState } from "./common/AnalysisPanel";
-import { fetchSpeciesList } from "@/services/api";
+import { fetchSpeciesList, http } from "@/services/api";
 
 interface SpeciesInfo {
   lineage_code: string;
@@ -117,8 +117,7 @@ export function HybridizationPanel({ onClose, onSuccess }: Props) {
   async function fetchCandidates() {
     try {
       setLoading(true);
-      const response = await fetch("/api/hybridization/candidates");
-      const data = await response.json();
+      const data = await http.get<{ candidates?: HybridCandidate[] }>("/api/hybridization/candidates");
       setCandidates(data.candidates || []);
     } catch (e) {
       console.error("获取杂交候选失败:", e);
