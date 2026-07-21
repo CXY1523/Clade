@@ -298,4 +298,31 @@ describe("Embedding API boundary", () => {
     );
     expect(browserFetch).not.toHaveBeenCalled();
   });
+
+  it("loads embedding hints through the shared HTTP client", async () => {
+    const response = {
+      hints: [
+        {
+          type: "opportunity" as const,
+          message: "Expand into the northern forest.",
+          priority: "medium" as const,
+          related_species: ["sp-alpha"],
+          suggested_actions: ["migrate"],
+        },
+      ],
+    };
+    apiMocks.post.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.getHints("sp-alpha");
+
+    expect(result).toEqual(response);
+    expect(apiMocks.post).toHaveBeenCalledWith("/api/embedding/hints", {
+      species_code: "sp-alpha",
+    });
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
 });

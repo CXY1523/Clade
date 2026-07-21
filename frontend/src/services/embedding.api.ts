@@ -294,12 +294,9 @@ export const embeddingApi = {
 
   /** 获取物种游戏提示 */
   async getHints(speciesCode: string): Promise<HintsResponse> {
-    const response = await fetch(`${API_BASE}/hints`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ species_code: speciesCode })
+    return http.post<HintsResponse>(`${API_BASE}/hints`, {
+      species_code: speciesCode,
     });
-    return response.json();
   },
 
   // ===== 叙事 =====
