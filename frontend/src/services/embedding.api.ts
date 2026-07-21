@@ -9,6 +9,8 @@
  * 5. 物种解释 (Explanation)
  */
 
+import { http } from "./api";
+
 const API_BASE = '/api/embedding';
 
 // ==================== 类型定义 ====================
@@ -215,12 +217,10 @@ export const embeddingApi = {
   
   /** 构建分类树 */
   async buildTaxonomy(rebuild = false, params?: Record<string, any>): Promise<TaxonomyResponse> {
-    const response = await fetch(`${API_BASE}/taxonomy/build`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rebuild, params })
+    return http.post<TaxonomyResponse>(`${API_BASE}/taxonomy/build`, {
+      rebuild,
+      params,
     });
-    return response.json();
   },
 
   /** 获取物种分类信息 */
@@ -229,8 +229,7 @@ export const embeddingApi = {
     classification: string[];
     related_species: string[];
   }> {
-    const response = await fetch(`${API_BASE}/taxonomy/species/${speciesCode}`);
-    return response.json();
+    return http.get(`${API_BASE}/taxonomy/species/${speciesCode}`);
   },
 
   // ===== 演化预测 =====
