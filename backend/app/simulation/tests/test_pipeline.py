@@ -29,6 +29,7 @@ from ..stages import (
     GeneActivationStage,
     InitStage,
     PostMigrationNicheStage,
+    SaveHistoryStage,
     SpeciationStage,
     StageDependency,
     TieringAndNicheStage,
@@ -126,6 +127,31 @@ class TestPipeline:
         engine = MagicMock()
         engine._use_embedding_integration = False
         return engine
+
+    async def test_save_history_stage_uses_injected_repository(self):
+        history_repository = MagicMock()
+        record_data = {"turn_index": 7, "source": "injected-repository"}
+        report = SimpleNamespace(
+            turn_index=7,
+            pressures_summary="stable",
+            narrative="A stable turn",
+            model_dump=MagicMock(return_value=record_data),
+        )
+        ctx = SimpleNamespace(
+            report=report,
+            embedding_turn_data=None,
+            emit_event=MagicMock(),
+        )
+
+        stage = SaveHistoryStage(history_repository=history_repository)
+
+        await stage.execute(ctx, SimpleNamespace())
+
+        saved_turn = history_repository.log_turn.call_args.args[0]
+        assert saved_turn.turn_index == 7
+        assert saved_turn.pressures_summary == "stable"
+        assert saved_turn.narrative == "A stable turn"
+        assert saved_turn.record_data == record_data
     
     async def test_execute_all_stages(self, simple_stages, mock_ctx, mock_engine):
         """测试执行所有阶段"""

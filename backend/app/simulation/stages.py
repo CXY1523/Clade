@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable, Se
 import numpy as np
 
 if TYPE_CHECKING:
+    from ..repositories.history_repository import HistoryRepository
     from .context import SimulationContext
     from .engine import SimulationEngine
 
@@ -3034,8 +3035,13 @@ class EmbeddingPluginsStage(BaseStage):
 class SaveHistoryStage(BaseStage):
     """保存历史记录阶段"""
     
-    def __init__(self):
+    def __init__(self, history_repository: HistoryRepository | None = None):
         super().__init__(StageOrder.SAVE_HISTORY.value, "保存历史记录")
+        if history_repository is None:
+            from ..repositories.history_repository import HistoryRepository
+
+            history_repository = HistoryRepository()
+        self._history_repository = history_repository
     
     def get_dependency(self) -> StageDependency:
         return StageDependency(
@@ -3046,7 +3052,6 @@ class SaveHistoryStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.history_repository import history_repository
         from ..models.history import TurnLog
         
         logger.info("保存历史记录...")
@@ -3065,7 +3070,7 @@ class SaveHistoryStage(BaseStage):
                 "has_narrative": "narrative" in embedding_turn_data,
             }
         
-        history_repository.log_turn(
+        self._history_repository.log_turn(
             TurnLog(
                 turn_index=ctx.report.turn_index,
                 pressures_summary=ctx.report.pressures_summary,

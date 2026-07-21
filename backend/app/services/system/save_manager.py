@@ -16,7 +16,7 @@ from ...models.history import TurnLog
 from ...models.species import Species
 from ...repositories.environment_repository import environment_repository
 from ...repositories.genus_repository import genus_repository
-from ...repositories.history_repository import history_repository
+from ...repositories.history_repository import HistoryRepository
 from ...repositories.species_repository import species_repository
 from ...security.save_paths import (
     SavePathBoundaryError,
@@ -59,13 +59,19 @@ class SaveManager:
         saves_dir: str | Path,
         embedding_service: 'EmbeddingService | None' = None,
         energy_service: 'DivineEnergyService | None' = None,
-        progression_service: 'DivineProgressionService | None' = None
+        progression_service: 'DivineProgressionService | None' = None,
+        history_repository: HistoryRepository | None = None,
     ) -> None:
         self.saves_dir = Path(saves_dir).resolve()
         self.saves_dir.mkdir(parents=True, exist_ok=True)
         self._embedding_service = embedding_service
         self._energy_service = energy_service
         self._progression_service = progression_service
+        self._history_repository = (
+            history_repository
+            if history_repository is not None
+            else HistoryRepository()
+        )
 
     def set_embedding_service(self, service: 'EmbeddingService') -> None:
         """设置 embedding 服务（延迟注入）"""
@@ -217,7 +223,7 @@ class SaveManager:
         # 【优化】只获取最新回合的栖息地数据，减少 70%+ 数据量
         habitats = environment_repository.list_latest_habitats()
         
-        history_logs = history_repository.list_turns(limit=1000)
+        history_logs = self._history_repository.list_turns(limit=1000)
         genus_list = genus_repository.list_all()
         
         # 保存数据（包含完整地图）
@@ -522,7 +528,7 @@ class SaveManager:
         logger.info("[存档管理器] 清除当前运行时状态...")
         environment_repository.clear_state()
         species_repository.clear_state()
-        history_repository.clear_state()
+        self._history_repository.clear_state()
         genus_repository.clear_state()
         # 清空全局物种缓存，避免旧剧本数据覆盖读档内容
         get_species_cache().clear()
@@ -581,7 +587,7 @@ class SaveManager:
                      except ValueError:
                         pass
                 log = TurnLog(**log_data)
-                history_repository.log_turn(log)
+                self._history_repository.log_turn(log)
         
         # 恢复属数据（Genus）
         if save_data.get("genus_list"):

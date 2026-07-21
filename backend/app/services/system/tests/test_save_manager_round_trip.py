@@ -1,8 +1,10 @@
 """Regression coverage for save/load core-state consistency."""
 
+import importlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, Session, create_engine
@@ -11,9 +13,16 @@ from ....core import database
 from ....models.environment import MapState
 from ....models.species import Species
 from ....repositories.environment_repository import environment_repository
+from ....repositories.genus_repository import genus_repository
 from ....repositories.species_repository import species_repository
 from ..species_cache import get_species_cache
 from ..save_manager import SaveManager
+
+
+def test_history_repository_module_does_not_publish_singleton() -> None:
+    module = importlib.import_module("app.repositories.history_repository")
+
+    assert not hasattr(module, "history_repository")
 
 
 def _species(
@@ -82,6 +91,29 @@ def _core_state(turn_index: int) -> dict[str, Any]:
         },
         "species": species_state,
     }
+
+
+def test_save_manager_reads_history_from_injected_repository(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    history_repository = MagicMock()
+    history_repository.list_turns.return_value = []
+    monkeypatch.setattr(species_repository, "list_species", lambda: [])
+    monkeypatch.setattr(environment_repository, "list_tiles", lambda: [])
+    monkeypatch.setattr(environment_repository, "get_state", lambda: None)
+    monkeypatch.setattr(environment_repository, "list_latest_habitats", lambda: [])
+    monkeypatch.setattr(genus_repository, "list_all", lambda: [])
+
+    manager = SaveManager(
+        tmp_path / "saves",
+        history_repository=history_repository,
+    )
+
+    save_dir = manager.save_game("injected-history", turn_index=3)
+
+    assert (save_dir / "game_state.json.gz").is_file()
+    history_repository.list_turns.assert_called_once_with(limit=1000)
 
 
 def test_save_then_load_restores_identical_core_state(
