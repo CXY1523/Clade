@@ -244,4 +244,58 @@ describe("Embedding API boundary", () => {
     });
     expect(browserFetch).not.toHaveBeenCalled();
   });
+
+  it("explains species through the shared HTTP client", async () => {
+    const response = {
+      success: true,
+      species_code: "sp-alpha",
+      species_name: "Alpha",
+      explanation: "Alpha adapted to a warmer habitat.",
+      key_factors: ["temperature"],
+      trait_explanations: { heat_tolerance: "Selected by warming" },
+    };
+    apiMocks.post.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.explainSpecies("sp-alpha");
+
+    expect(result).toEqual(response);
+    expect(apiMocks.post).toHaveBeenCalledWith(
+      "/api/embedding/explain/species",
+      { species_code: "sp-alpha" },
+    );
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("compares species through the shared HTTP client", async () => {
+    const response = {
+      success: true,
+      similarity: 0.72,
+      relationship: "closely related",
+      details: {
+        same_habitat: true,
+        habitat_a: "temperate_forest",
+        habitat_b: "temperate_forest",
+        trophic_difference: 1,
+        trait_differences: { size: 0.2 },
+      },
+    };
+    apiMocks.post.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.compareSpecies("sp-alpha", "sp-beta");
+
+    expect(result).toEqual(response);
+    expect(apiMocks.post).toHaveBeenCalledWith(
+      "/api/embedding/compare/species",
+      { species_code_a: "sp-alpha", species_code_b: "sp-beta" },
+    );
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
 });

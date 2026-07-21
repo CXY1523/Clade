@@ -276,22 +276,18 @@ export const embeddingApi = {
 
   /** 解释物种演化原因 */
   async explainSpecies(speciesCode: string): Promise<SpeciesExplanationResponse> {
-    const response = await fetch(`${API_BASE}/explain/species`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ species_code: speciesCode })
-    });
-    return response.json();
+    return http.post<SpeciesExplanationResponse>(
+      `${API_BASE}/explain/species`,
+      { species_code: speciesCode },
+    );
   },
 
   /** 对比两个物种 */
   async compareSpecies(codeA: string, codeB: string): Promise<SpeciesCompareResponse> {
-    const response = await fetch(`${API_BASE}/compare/species`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ species_code_a: codeA, species_code_b: codeB })
+    return http.post<SpeciesCompareResponse>(`${API_BASE}/compare/species`, {
+      species_code_a: codeA,
+      species_code_b: codeB,
     });
-    return response.json();
   },
 
   // ===== 提示 =====
