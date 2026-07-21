@@ -140,6 +140,14 @@ const blessStatusResponse = {
   },
 };
 
+const sanctifyStatusResponse = {
+  ...blessStatusResponse,
+  faith: {
+    ...blessStatusResponse.faith,
+    followers: [{ ...followerResponse, is_blessed: true }],
+  },
+};
+
 function mockSelectedPathRequests(
   statusResponse: unknown = selectedStatusResponse,
 ) {
@@ -717,6 +725,81 @@ describe("DivinePowersPanel API boundary", () => {
       });
     });
     expect(alertMock).toHaveBeenCalledWith("Blessing unavailable");
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("sanctifies a blessed follower through the shared HTTP client", async () => {
+    mockSelectedPathRequests(sanctifyStatusResponse);
+    apiMocks.post.mockResolvedValue({
+      success: true,
+      message: "Species sanctified",
+      faith_summary: {
+        ...sanctifyStatusResponse.faith,
+        followers: [
+          { ...followerResponse, is_blessed: true, is_sanctified: true },
+        ],
+      },
+    });
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not sanctify a follower directly"),
+      );
+    const alertMock = vi.fn();
+    const energyChanged = vi.fn();
+    window.addEventListener("energy-changed", energyChanged, { once: true });
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("信仰"));
+    fireEvent.click(await screen.findByText("圣化"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/faith/sanctify", {
+        lineage_code: "sp-alpha",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Species sanctified");
+    const statusRequests = apiMocks.get.mock.calls.filter(
+      ([path]) => path === "/api/divine/status",
+    );
+    expect(statusRequests).toHaveLength(2);
+    expect(energyChanged).toHaveBeenCalledTimes(1);
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("shows a sanctify-follower rejection from the shared HTTP client", async () => {
+    mockSelectedPathRequests(sanctifyStatusResponse);
+    apiMocks.post.mockRejectedValue(
+      Object.assign(new Error("Request failed: Sanctification unavailable"), {
+        name: "ApiError",
+        status: 400,
+        statusText: "Bad Request",
+        detail: "Sanctification unavailable",
+      }),
+    );
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not sanctify a follower directly"),
+      );
+    const alertMock = vi.fn();
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("信仰"));
+    fireEvent.click(await screen.findByText("圣化"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/faith/sanctify", {
+        lineage_code: "sp-alpha",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Sanctification unavailable");
     expect(browserFetch).not.toHaveBeenCalled();
   });
 });
