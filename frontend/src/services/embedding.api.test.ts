@@ -161,4 +161,61 @@ describe("Embedding API boundary", () => {
     );
     expect(browserFetch).not.toHaveBeenCalled();
   });
+
+  it("runs semantic search through the shared HTTP client", async () => {
+    const response = {
+      success: true,
+      results: [
+        {
+          type: "species" as const,
+          id: "sp-alpha",
+          title: "Alpha",
+          description: "Heat-tolerant species",
+          similarity: 0.91,
+          metadata: { turn: 12 },
+        },
+      ],
+      query: "heat tolerance",
+    };
+    apiMocks.post.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.search(
+      "heat tolerance",
+      ["species", "concept"],
+      7,
+    );
+
+    expect(result).toEqual(response);
+    expect(apiMocks.post).toHaveBeenCalledWith("/api/embedding/search", {
+      query: "heat tolerance",
+      search_types: ["species", "concept"],
+      top_k: 7,
+    });
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("runs encoded quick search through the shared HTTP client", async () => {
+    const response = {
+      success: true,
+      results: [],
+      query: "alpha & beta",
+    };
+    apiMocks.get.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.quickSearch("alpha & beta", 4);
+
+    expect(result).toEqual(response);
+    expect(apiMocks.get).toHaveBeenCalledWith(
+      "/api/embedding/search/quick?q=alpha%20%26%20beta&limit=4",
+    );
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
 });

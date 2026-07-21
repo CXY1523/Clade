@@ -251,18 +251,18 @@ export const embeddingApi = {
 
   /** 语义搜索 */
   async search(query: string, searchTypes?: string[], topK = 10): Promise<SearchResponse> {
-    const response = await fetch(`${API_BASE}/search`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, search_types: searchTypes, top_k: topK })
+    return http.post<SearchResponse>(`${API_BASE}/search`, {
+      query,
+      search_types: searchTypes,
+      top_k: topK,
     });
-    return response.json();
   },
 
   /** 快速搜索 */
   async quickSearch(query: string, limit = 5): Promise<SearchResponse> {
-    const response = await fetch(`${API_BASE}/search/quick?q=${encodeURIComponent(query)}&limit=${limit}`);
-    return response.json();
+    return http.get(
+      `${API_BASE}/search/quick?q=${encodeURIComponent(query)}&limit=${limit}`,
+    );
   },
 
   // ===== 问答 =====
