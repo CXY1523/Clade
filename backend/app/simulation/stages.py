@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable, Se
 import numpy as np
 
 if TYPE_CHECKING:
+    from ..repositories.genus_repository import GenusRepository
     from ..repositories.history_repository import HistoryRepository
     from .context import SimulationContext
     from .engine import SimulationEngine
@@ -1741,8 +1742,16 @@ class GeneDiversityStage(BaseStage):
 class GeneFlowStage(BaseStage):
     """基因流动阶段"""
     
-    def __init__(self):
+    def __init__(
+        self,
+        genus_repository: GenusRepository | None = None,
+    ) -> None:
         super().__init__(StageOrder.GENE_FLOW.value, "基因流动")
+        if genus_repository is None:
+            from ..repositories.genus_repository import GenusRepository
+
+            genus_repository = GenusRepository()
+        self._genus_repository = genus_repository
     
     def get_dependency(self) -> StageDependency:
         return StageDependency(
@@ -1754,7 +1763,6 @@ class GeneFlowStage(BaseStage):
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
         from ..repositories.species_repository import species_repository
-        from ..repositories.genus_repository import genus_repository
         
         logger.info("基因流动计算...")
         ctx.emit_event("stage", "🔄 基因流动", "进化")
@@ -1773,7 +1781,7 @@ class GeneFlowStage(BaseStage):
             for genus_code, species_list in genus_groups.items():
                 if len(species_list) < 2:
                     continue
-                genus = genus_repository.get_by_code(genus_code)
+                genus = self._genus_repository.get_by_code(genus_code)
                 if not genus:
                     continue
                 flow_count = engine.gene_flow_service.apply_gene_flow(genus, species_list)
