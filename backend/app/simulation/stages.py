@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 from ..services.species.trophic_interaction import get_trophic_service
 from ..services.species.intervention import InterventionService
 from ..services.species.extinction_checker import ExtinctionChecker
-from ..services.species.reemergence import ReemergenceService
 from ..services.analytics.turn_report import TurnReportService
 from ..services.analytics.population_snapshot import PopulationSnapshotService
 from ..tensor.speciation_monitor import SpeciationMonitor
@@ -2499,8 +2498,6 @@ class BackgroundManagementStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.species_repository import species_repository
-        
         logger.info("背景物种管理...")
         ctx.emit_event("stage", "🌾 背景物种管理", "生态")
         
@@ -2510,9 +2507,10 @@ class BackgroundManagementStage(BaseStage):
         if ctx.mass_extinction:
             promoted = engine.background_manager.promote_candidates(ctx.background_results)
             if promoted:
-                # 使用 ReemergenceService 评估物种重现
-                reemergence_service = ReemergenceService(species_repository)
-                ctx.reemergence_events = reemergence_service.evaluate_reemergence(promoted, ctx.modifiers)
+                ctx.reemergence_events = engine.background_manager.evaluate_reemergence(
+                    promoted,
+                    ctx.modifiers,
+                )
                 if ctx.reemergence_events:
                     ctx.emit_event("info", f"大灭绝后重现: {len(ctx.reemergence_events)} 个物种", "生态")
 

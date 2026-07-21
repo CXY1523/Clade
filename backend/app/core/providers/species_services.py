@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ...services.species.niche import NicheAnalyzer
     from ...services.species.speciation import SpeciationService
     from ...services.species.background import BackgroundSpeciesManager
+    from ...services.species.reemergence import ReemergenceService
     from ...services.species.tiering import SpeciesTieringService
     from ...services.species.reproduction import ReproductionService
     from ...services.species.hybridization import HybridizationService
@@ -59,6 +60,14 @@ class SpeciesServiceProvider:
                 genus_repository=self.genus_repository,
             )
         )
+
+    @cached_property
+    def reemergence_service(self) -> 'ReemergenceService':
+        from ...services.species.reemergence import ReemergenceService
+        return self._get_or_override(
+            'reemergence_service',
+            lambda: ReemergenceService(self.species_repository),
+        )
     
     @cached_property
     def background_manager(self) -> 'BackgroundSpeciesManager':
@@ -70,7 +79,8 @@ class SpeciesServiceProvider:
                     population_threshold=self.settings.background_population_threshold,
                     mass_extinction_threshold=self.settings.mass_extinction_threshold,
                     promotion_quota=self.settings.background_promotion_quota,
-                )
+                ),
+                reemergence_service=self.reemergence_service,
             )
         )
     
