@@ -164,6 +164,7 @@ class SimulationServiceProvider:
                 niche_analyzer=self.niche_analyzer,
                 speciation=self.speciation_service,
                 background_manager=self.background_manager,
+                species_repository=self.species_repository,
                 tiering=self.tiering_service,
                 focus_processor=self.focus_processor,
                 critical_analyzer=self.critical_analyzer,

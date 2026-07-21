@@ -682,7 +682,6 @@ class FetchSpeciesStage(BaseStage):
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
         import time
-        from ..repositories.species_repository import species_repository
         from ..services.species.habitat_manager import habitat_manager
         from ..services.system.species_cache import get_species_cache
         
@@ -697,7 +696,7 @@ class FetchSpeciesStage(BaseStage):
         # 下一回合开始时必须从数据库重新加载，否则 species_batch 不包含新物种
         t0 = time.perf_counter()
         species_cache = get_species_cache()
-        ctx.all_species = species_repository.list_species()
+        ctx.all_species = engine.species_repository.list_species()
         species_cache.update(ctx.all_species, ctx.turn_index)
         timings["db_fetch"] = time.perf_counter() - t0
         
@@ -733,9 +732,8 @@ class FetchSpeciesStage(BaseStage):
         
         # 更新干预状态（使用 InterventionService）
         t0 = time.perf_counter()
-        from ..repositories.species_repository import species_repository
         intervention_service = InterventionService(
-            species_repository=species_repository,
+            species_repository=engine.species_repository,
             event_callback=ctx.emit_event,
         )
         intervention_service.update_intervention_status(ctx.species_batch)

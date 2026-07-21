@@ -44,6 +44,7 @@ from ..services.species.trophic_interaction import TrophicInteractionService
 from ..services.species.food_web_manager import FoodWebManager
 
 if TYPE_CHECKING:
+    from ..repositories.species_repository import SpeciesRepository
     from ..services.species.background import BackgroundSpeciesManager
 
 from ..services.analytics.critical_analyzer import CriticalAnalyzer
@@ -104,6 +105,7 @@ class SimulationEngine:
         niche_analyzer: NicheAnalyzer,
         speciation: SpeciationService,
         background_manager: "BackgroundSpeciesManager",
+        species_repository: "SpeciesRepository",
         tiering: SpeciesTieringService,
         focus_processor: FocusBatchProcessor,
         critical_analyzer: CriticalAnalyzer,
@@ -136,6 +138,7 @@ class SimulationEngine:
         self.niche_analyzer = niche_analyzer
         self.speciation = speciation
         self.background_manager = background_manager
+        self.species_repository = species_repository
         self.tiering = tiering
         self.focus_processor = focus_processor
         self.critical_analyzer = critical_analyzer
