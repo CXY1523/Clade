@@ -14,7 +14,6 @@ from ...ai.model_router import staggered_gather
 from ...ai.prompts.species import SPECIES_PROMPTS
 
 logger = logging.getLogger(__name__)
-from ...repositories.genus_repository import genus_repository
 from ...repositories.species_repository import species_repository
 from ...repositories.environment_repository import environment_repository
 from ...schemas.responses import BranchingEvent
@@ -33,6 +32,7 @@ from ...core.config import get_settings
 from ...simulation.constants import get_time_config
 
 if TYPE_CHECKING:
+    from ...repositories.genus_repository import GenusRepository
     from .gene_library import GeneLibraryService
 
 # 获取配置
@@ -54,7 +54,17 @@ class SpeciationService:
     如需刷新配置，使用 reload_config() 显式更新。
     """
 
-    def __init__(self, router, config: SpeciationConfig | None = None) -> None:
+    def __init__(
+        self,
+        router,
+        config: SpeciationConfig | None = None,
+        genus_repository: GenusRepository | None = None,
+    ) -> None:
+        if genus_repository is None:
+            from ...repositories.genus_repository import GenusRepository
+
+            genus_repository = GenusRepository()
+        self._genus_repository = genus_repository
         self.router = router
         self.trophic_calculator = TrophicLevelCalculator()
         self.genetic_calculator = GeneticDistanceCalculator()
@@ -1540,7 +1550,7 @@ class SpeciationService:
                 )
             
             # 【修复】即使没有 genus 也调用继承方法（处理新突变和额外基因）
-            genus = genus_repository.get_by_code(new_species.genus_code) if new_species.genus_code else None
+            genus = self._genus_repository.get_by_code(new_species.genus_code) if new_species.genus_code else None
             self.gene_library_service.inherit_dormant_genes(ctx["parent"], new_species, genus)
             species_repository.upsert(new_species)
             
@@ -1688,7 +1698,7 @@ class SpeciationService:
             
             # 【修复】即使没有 genus 也调用继承方法（处理新突变和额外基因）
             if hasattr(self, 'gene_library_service') and self.gene_library_service:
-                genus = genus_repository.get_by_code(new_species.genus_code) if new_species.genus_code else None
+                genus = self._genus_repository.get_by_code(new_species.genus_code) if new_species.genus_code else None
                 self.gene_library_service.inherit_dormant_genes(ctx["parent"], new_species, genus)
                 species_repository.upsert(new_species)
             
@@ -5797,7 +5807,7 @@ class SpeciationService:
         if not parent.genus_code:
             return
         
-        genus = genus_repository.get_by_code(parent.genus_code)
+        genus = self._genus_repository.get_by_code(parent.genus_code)
         if not genus:
             return
         
@@ -5813,7 +5823,7 @@ class SpeciationService:
             key = self._make_distance_key(offspring.lineage_code, sibling.lineage_code)
             new_distances[key] = distance
         
-        genus_repository.update_distances(parent.genus_code, new_distances, turn_index)
+        self._genus_repository.update_distances(parent.genus_code, new_distances, turn_index)
     
     def _make_distance_key(self, code1: str, code2: str) -> str:
         """生成距离键"""
