@@ -1425,26 +1425,26 @@ function WagersTab({
 
   const handleCheckWager = async (wagerId: string) => {
     try {
-      const res = await fetch("/api/divine/wager/check", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ wager_id: wagerId }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        if (data.status === "resolved") {
-          const result = data.success ? "成功" : "失败";
-          alert(`预言${result}！${data.reason}\n${data.success ? `获得 ${data.reward} 能量` : `损失押注能量`}`);
-          onRefresh();
-          dispatchEnergyChanged();
-        } else {
-          alert(data.message);
-        }
+      const data = await http.post<{
+        status: string;
+        success?: boolean;
+        reason?: string;
+        reward?: number;
+        message?: string;
+      }>("/api/divine/wager/check", { wager_id: wagerId });
+      if (data.status === "resolved") {
+        const result = data.success ? "成功" : "失败";
+        alert(`预言${result}！${data.reason}\n${data.success ? `获得 ${data.reward} 能量` : `损失押注能量`}`);
+        onRefresh();
+        dispatchEnergyChanged();
       } else {
-        alert(data.detail);
+        alert(data.message);
       }
     } catch (e) {
       console.error(e);
+      if (isApiError(e)) {
+        alert(e.detail);
+      }
     }
   };
 

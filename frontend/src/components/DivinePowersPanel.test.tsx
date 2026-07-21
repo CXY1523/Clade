@@ -119,6 +119,26 @@ const wagerStatusResponse = {
   },
 };
 
+const activeWagerResponse = {
+  id: "wager_5_0",
+  wager_type: "dominance",
+  target_species: "sp-alpha",
+  secondary_species: null,
+  bet_amount: 20,
+  start_turn: 5,
+  end_turn: 10,
+  predicted_outcome: "",
+  initial_state: { population: 1000 },
+};
+
+const activeWagerStatusResponse = {
+  ...wagerStatusResponse,
+  wagers: {
+    ...wagerStatusResponse.wagers,
+    active_wagers: [activeWagerResponse],
+  },
+};
+
 const followerResponse = {
   lineage_code: "sp-alpha",
   common_name: "Alpha",
@@ -800,6 +820,84 @@ describe("DivinePowersPanel API boundary", () => {
       });
     });
     expect(alertMock).toHaveBeenCalledWith("Sanctification unavailable");
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("checks a divine wager through the shared HTTP client", async () => {
+    mockSelectedPathRequests(activeWagerStatusResponse);
+    apiMocks.post.mockResolvedValue({
+      status: "resolved",
+      success: true,
+      reason: "已成为霸主",
+      reward: 40,
+      current_energy: 120,
+      wager_summary: {
+        ...activeWagerStatusResponse.wagers,
+        active_wagers: [],
+        total_won: 40,
+        net_profit: 20,
+      },
+    });
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not check a wager directly"),
+      );
+    const alertMock = vi.fn();
+    const energyChanged = vi.fn();
+    window.addEventListener("energy-changed", energyChanged, { once: true });
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("预言"));
+    fireEvent.click(await screen.findByText("检查"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/wager/check", {
+        wager_id: "wager_5_0",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("预言成功！已成为霸主\n获得 40 能量");
+    const statusRequests = apiMocks.get.mock.calls.filter(
+      ([path]) => path === "/api/divine/status",
+    );
+    expect(statusRequests).toHaveLength(2);
+    expect(energyChanged).toHaveBeenCalledTimes(1);
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("shows a wager-check rejection from the shared HTTP client", async () => {
+    mockSelectedPathRequests(activeWagerStatusResponse);
+    apiMocks.post.mockRejectedValue(
+      Object.assign(new Error("Request failed: Wager not found"), {
+        name: "ApiError",
+        status: 404,
+        statusText: "Not Found",
+        detail: "Wager not found",
+      }),
+    );
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not check a wager directly"),
+      );
+    const alertMock = vi.fn();
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("预言"));
+    fireEvent.click(await screen.findByText("检查"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/wager/check", {
+        wager_id: "wager_5_0",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Wager not found");
     expect(browserFetch).not.toHaveBeenCalled();
   });
 });
