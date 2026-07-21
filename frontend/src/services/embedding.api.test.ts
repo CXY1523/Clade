@@ -418,4 +418,33 @@ describe("Embedding API boundary", () => {
     );
     expect(browserFetch).not.toHaveBeenCalled();
   });
+
+  it("loads embedding statistics through the shared HTTP client", async () => {
+    const response = {
+      cache_stats: {
+        cache_dir: "cache/embeddings",
+        file_count: 4,
+        memory_cache_count: 2,
+        total_size_bytes: 4096,
+        total_size_mb: 0.004,
+        model_identifier: "local-test-model",
+      },
+      index_stats: {
+        species_count: 12,
+        event_count: 30,
+        concept_count: 8,
+      },
+    };
+    apiMocks.get.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.getStats();
+
+    expect(result).toEqual(response);
+    expect(apiMocks.get).toHaveBeenCalledWith("/api/embedding/stats");
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
 });

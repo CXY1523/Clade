@@ -324,8 +324,7 @@ export const embeddingApi = {
 
   /** 获取 Embedding 系统统计 */
   async getStats(): Promise<EmbeddingStatsResponse> {
-    const response = await fetch(`${API_BASE}/stats`);
-    return response.json();
+    return http.get(`${API_BASE}/stats`);
   }
 };
 
