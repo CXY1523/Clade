@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from ...models.species import Species
-from ...repositories.species_repository import species_repository
 from ...schemas.responses import BackgroundSummary, ReemergenceEvent
 from ...simulation.species import MortalityResult
 
