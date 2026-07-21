@@ -29,7 +29,6 @@ from .naming_hints import NamingHintGenerator
 from .organ_evolution_service import OrganEvolutionService, get_organ_evolution_service
 from ...tensor.tradeoff import TradeoffCalculator
 from ...core.config import get_settings
-from ...simulation.constants import get_time_config
 
 if TYPE_CHECKING:
     from ...repositories.genus_repository import GenusRepository
@@ -1882,6 +1881,8 @@ class SpeciationService:
         # prompt format(**payload) 不会递归解析 value 中的花括号
         species_list_escaped = species_list
         
+        from ...simulation.constants import get_time_config
+
         time_config = get_time_config(max(turn_index, 0))
         time_context = (
             "\n=== ⏳ 时间尺度上下文 (Chronos Flow) ===\n"
