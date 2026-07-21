@@ -15,7 +15,7 @@ from ...models.genus import Genus
 from ...models.history import TurnLog
 from ...models.species import Species
 from ...repositories.environment_repository import environment_repository
-from ...repositories.genus_repository import genus_repository
+from ...repositories.genus_repository import GenusRepository
 from ...repositories.history_repository import HistoryRepository
 from ...repositories.species_repository import species_repository
 from ...security.save_paths import (
@@ -61,6 +61,7 @@ class SaveManager:
         energy_service: 'DivineEnergyService | None' = None,
         progression_service: 'DivineProgressionService | None' = None,
         history_repository: HistoryRepository | None = None,
+        genus_repository: GenusRepository | None = None,
     ) -> None:
         self.saves_dir = Path(saves_dir).resolve()
         self.saves_dir.mkdir(parents=True, exist_ok=True)
@@ -71,6 +72,11 @@ class SaveManager:
             history_repository
             if history_repository is not None
             else HistoryRepository()
+        )
+        self._genus_repository = (
+            genus_repository
+            if genus_repository is not None
+            else GenusRepository()
         )
 
     def set_embedding_service(self, service: 'EmbeddingService') -> None:
@@ -224,7 +230,7 @@ class SaveManager:
         habitats = environment_repository.list_latest_habitats()
         
         history_logs = self._history_repository.list_turns(limit=1000)
-        genus_list = genus_repository.list_all()
+        genus_list = self._genus_repository.list_all()
         
         # 保存数据（包含完整地图）
         save_data = {
@@ -529,7 +535,7 @@ class SaveManager:
         environment_repository.clear_state()
         species_repository.clear_state()
         self._history_repository.clear_state()
-        genus_repository.clear_state()
+        self._genus_repository.clear_state()
         # 清空全局物种缓存，避免旧剧本数据覆盖读档内容
         get_species_cache().clear()
 
@@ -594,7 +600,7 @@ class SaveManager:
             logger.info(f"[存档管理器] 恢复 {len(save_data['genus_list'])} 个属...")
             for genus_data in save_data["genus_list"]:
                 genus = Genus(**genus_data)
-                genus_repository.upsert(genus)
+                self._genus_repository.upsert(genus)
         
         # ========== 恢复 Embedding 数据 ==========
         embeddings_loaded = False

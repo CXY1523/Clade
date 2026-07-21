@@ -11,9 +11,9 @@ from sqlmodel import SQLModel, Session, create_engine
 
 from ....core import database
 from ....models.environment import MapState
+from ....models.genus import Genus
 from ....models.species import Species
 from ....repositories.environment_repository import environment_repository
-from ....repositories.genus_repository import genus_repository
 from ....repositories.species_repository import species_repository
 from ..species_cache import get_species_cache
 from ..save_manager import SaveManager
@@ -99,21 +99,67 @@ def test_save_manager_reads_history_from_injected_repository(
 ) -> None:
     history_repository = MagicMock()
     history_repository.list_turns.return_value = []
+    genus_repository = MagicMock()
+    genus_repository.list_all.return_value = []
     monkeypatch.setattr(species_repository, "list_species", lambda: [])
     monkeypatch.setattr(environment_repository, "list_tiles", lambda: [])
     monkeypatch.setattr(environment_repository, "get_state", lambda: None)
     monkeypatch.setattr(environment_repository, "list_latest_habitats", lambda: [])
-    monkeypatch.setattr(genus_repository, "list_all", lambda: [])
 
     manager = SaveManager(
         tmp_path / "saves",
         history_repository=history_repository,
+        genus_repository=genus_repository,
     )
 
     save_dir = manager.save_game("injected-history", turn_index=3)
 
     assert (save_dir / "game_state.json.gz").is_file()
     history_repository.list_turns.assert_called_once_with(limit=1000)
+
+
+def test_save_manager_uses_injected_genus_repository_for_save_and_load(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stored_genus = Genus(
+        code="GEN-TEST",
+        name_latin="Testus",
+        name_common="test genus",
+        genetic_distances={"SP-1": 0.2},
+        gene_library={"trait": ["value"]},
+        created_turn=2,
+        updated_turn=3,
+    )
+    injected_genus_repository = MagicMock()
+    injected_genus_repository.list_all.return_value = [stored_genus]
+    history_repository = MagicMock()
+    history_repository.list_turns.return_value = []
+
+    monkeypatch.setattr(species_repository, "list_species", lambda: [])
+    monkeypatch.setattr(species_repository, "clear_state", lambda: None)
+    monkeypatch.setattr(environment_repository, "list_tiles", lambda: [])
+    monkeypatch.setattr(environment_repository, "get_state", lambda: None)
+    monkeypatch.setattr(
+        environment_repository,
+        "list_latest_habitats",
+        lambda: [],
+    )
+    monkeypatch.setattr(environment_repository, "clear_state", lambda: None)
+
+    manager = SaveManager(
+        tmp_path / "saves",
+        history_repository=history_repository,
+        genus_repository=injected_genus_repository,
+    )
+
+    manager.save_game("injected-genus", turn_index=3)
+    manager.load_game("injected-genus")
+
+    injected_genus_repository.list_all.assert_called_once_with()
+    injected_genus_repository.clear_state.assert_called_once_with()
+    restored_genus = injected_genus_repository.upsert.call_args.args[0]
+    assert restored_genus.model_dump() == stored_genus.model_dump()
 
 
 def test_save_then_load_restores_identical_core_state(
