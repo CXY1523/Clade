@@ -1,8 +1,5 @@
 """Energy route contracts for the split API router."""
 
-import ast
-from pathlib import Path
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -138,33 +135,3 @@ def test_set_energy_updates_and_returns_the_complete_status(
         "total_regenerated": 0,
         "percentage": 24.0,
     }
-
-
-def test_legacy_router_no_longer_registers_energy_endpoints() -> None:
-    routes_path = Path(__file__).parents[1] / "routes.py"
-    module = ast.parse(routes_path.read_text(encoding="utf-8"))
-    registered_paths: list[str] = []
-
-    for node in ast.walk(module):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for decorator in node.decorator_list:
-            if not isinstance(decorator, ast.Call) or not decorator.args:
-                continue
-            function = decorator.func
-            if (
-                isinstance(function, ast.Attribute)
-                and isinstance(function.value, ast.Name)
-                and function.value.id == "router"
-                and isinstance(decorator.args[0], ast.Constant)
-                and isinstance(decorator.args[0].value, str)
-            ):
-                registered_paths.append(decorator.args[0].value)
-
-    duplicate_energy_paths = sorted(
-        path
-        for path in registered_paths
-        if path == "/energy" or path.startswith("/energy/")
-    )
-
-    assert duplicate_energy_paths == []

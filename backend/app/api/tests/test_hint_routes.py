@@ -1,8 +1,6 @@
 """Game-hint route contracts for the split API router."""
 
-import ast
 import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import create_autospec
 
@@ -155,33 +153,3 @@ def test_clear_hints_preserves_the_legacy_response(
     assert response.status_code == 200
     assert response.json() == {"success": True, "message": "提示冷却已清除"}
     hints_service.clear_cooldown.assert_called_once_with()
-
-
-def test_legacy_router_no_longer_registers_hint_endpoints() -> None:
-    routes_path = Path(__file__).parents[1] / "routes.py"
-    module = ast.parse(routes_path.read_text(encoding="utf-8"))
-    registered_paths: list[str] = []
-
-    for node in ast.walk(module):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for decorator in node.decorator_list:
-            if not isinstance(decorator, ast.Call) or not decorator.args:
-                continue
-            function = decorator.func
-            if (
-                isinstance(function, ast.Attribute)
-                and isinstance(function.value, ast.Name)
-                and function.value.id == "router"
-                and isinstance(decorator.args[0], ast.Constant)
-                and isinstance(decorator.args[0].value, str)
-            ):
-                registered_paths.append(decorator.args[0].value)
-
-    duplicate_hint_paths = sorted(
-        path
-        for path in registered_paths
-        if path == "/hints" or path.startswith("/hints/")
-    )
-
-    assert duplicate_hint_paths == []

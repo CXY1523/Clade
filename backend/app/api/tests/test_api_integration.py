@@ -3,12 +3,13 @@ API 集成测试 - 验证路由和依赖注入
 
 测试目标：
 1. 验证新路由 (api/router.py) 与 Depends 注入正确工作
-2. 验证 USE_LEGACY_ROUTES=true 时仍能启动
+2. 验证旧 routes.py 已删除且拆分路由仍能启动
 3. 验证 ConfigService 缓存和配置加载
 4. 验证 ResourceManager 注入
 5. 验证 SessionManager 状态管理
 """
 
+import importlib.util
 import sys
 
 import pytest
@@ -1280,7 +1281,8 @@ class TestNewRouterIntegration:
         assert schema["type"] == "object"
 
 
-# 旧路由兼容性测试已移除 - api/routes.py 已删除
+def test_legacy_routes_module_is_removed() -> None:
+    assert importlib.util.find_spec("app.api.routes") is None
 
 
 # ============================================================================
