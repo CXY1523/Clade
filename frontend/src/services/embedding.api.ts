@@ -236,18 +236,15 @@ export const embeddingApi = {
 
   /** 列出可用的演化压力类型 */
   async listPressures(): Promise<{ pressures: EvolutionPressure[] }> {
-    const response = await fetch(`${API_BASE}/evolution/pressures`);
-    return response.json();
+    return http.get(`${API_BASE}/evolution/pressures`);
   },
 
   /** 预测物种演化方向 */
   async predictEvolution(request: EvolutionPredictionRequest): Promise<EvolutionPredictionResponse> {
-    const response = await fetch(`${API_BASE}/evolution/predict`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(request)
-    });
-    return response.json();
+    return http.post<EvolutionPredictionResponse>(
+      `${API_BASE}/evolution/predict`,
+      request,
+    );
   },
 
   // ===== 搜索 =====

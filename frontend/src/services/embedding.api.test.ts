@@ -101,4 +101,64 @@ describe("Embedding API boundary", () => {
 
     await expect(embeddingApi.buildTaxonomy()).rejects.toBe(error);
   });
+
+  it("loads evolution pressures through the shared HTTP client", async () => {
+    const response = {
+      pressures: [
+        {
+          name: "warming",
+          name_cn: "升温",
+          description: "Rising average temperature",
+        },
+      ],
+    };
+    apiMocks.get.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.listPressures();
+
+    expect(result).toEqual(response);
+    expect(apiMocks.get).toHaveBeenCalledWith(
+      "/api/embedding/evolution/pressures",
+    );
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("predicts evolution through the shared HTTP client", async () => {
+    const request = {
+      species_code: "sp-alpha",
+      pressure_types: ["warming"],
+      pressure_strengths: [0.7],
+      generate_description: true,
+    };
+    const response = {
+      success: true,
+      species_code: "sp-alpha",
+      species_name: "Alpha",
+      applied_pressures: ["warming"],
+      predicted_trait_changes: { heat_tolerance: 0.2 },
+      reference_species: [
+        { code: "sp-beta", name: "Beta", similarity: 0.82 },
+      ],
+      confidence: 0.78,
+      predicted_description: "Alpha becomes more heat tolerant.",
+    };
+    apiMocks.post.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.predictEvolution(request);
+
+    expect(result).toEqual(response);
+    expect(apiMocks.post).toHaveBeenCalledWith(
+      "/api/embedding/evolution/predict",
+      request,
+    );
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
 });
