@@ -42,6 +42,73 @@ def test_configure_model_router_propagates_local_endpoint_policy() -> None:
     assert embedding_service.allow_local_ai_endpoints is False
 
 
+def test_configure_model_router_migrates_legacy_ai_config_before_applying_it() -> None:
+    router = ModelRouter(
+        defaults={
+            "speciation": ModelConfig(
+                provider="openai",
+                model="existing-speciation-model",
+                endpoint="/chat/completions",
+            ),
+            "turn_report": ModelConfig(
+                provider="openai",
+                model="existing-report-model",
+                endpoint="/chat/completions",
+            ),
+        }
+    )
+    embedding_service = RecordingEmbeddingService()
+    settings = SimpleNamespace(
+        speciation_model="fallback-model",
+        embedding_provider="openai",
+        ai_base_url=None,
+        ai_api_key=None,
+    )
+    config = UIConfig(
+        ai_provider="openai",
+        ai_model="legacy-default-model",
+        ai_base_url="https://legacy-default.example/v1",
+        ai_api_key="legacy-default-key",
+        capability_configs={
+            "speciation": {
+                "provider": "openai",
+                "base_url": "https://legacy-speciation.example/v1",
+                "api_key": "legacy-speciation-key",
+                "model": "legacy-speciation-model",
+                "timeout": 12,
+            },
+            "turn_report": {
+                "model": "legacy-report-model",
+                "timeout": 13,
+            },
+        },
+    )
+
+    result = configure_model_router(config, router, embedding_service, settings)
+
+    assert result is config
+    default_provider_id = config.default_provider_id
+    assert default_provider_id is not None
+    default_provider = config.providers[default_provider_id]
+    assert default_provider.base_url == "https://legacy-default.example/v1"
+    assert default_provider.api_key == "legacy-default-key"
+    assert config.default_model == "legacy-default-model"
+
+    speciation_route = config.capability_routes["speciation"]
+    assert speciation_route.provider_id == "custom_speciation"
+    assert speciation_route.model == "legacy-speciation-model"
+    assert speciation_route.timeout == 12
+    assert config.providers["custom_speciation"].api_key == "legacy-speciation-key"
+
+    report_route = config.capability_routes["turn_report"]
+    assert report_route.provider_id == default_provider_id
+    assert report_route.model == "legacy-report-model"
+    assert report_route.timeout == 13
+
+    assert router.api_base_url == "https://legacy-default.example/v1"
+    assert router.api_key == "legacy-default-key"
+
+
 def test_configure_model_router_retains_legacy_embedding_source_for_safe_runtime_validation() -> None:
     router = ModelRouter()
     embedding_service = RecordingEmbeddingService()

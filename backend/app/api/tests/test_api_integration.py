@@ -334,13 +334,9 @@ class TestNewRouterIntegration:
         mock_container.environment_repository.save_ui_config.side_effect = (
             lambda _path, config: config
         )
-        runtime_routes = MagicMock()
         headers = {"content-type": content_type} if content_type else {}
 
-        with (
-            patch("app.api.analytics.configure_model_router"),
-            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
-        ):
+        with patch("app.api.analytics.configure_model_router"):
             response = client.post(
                 "/api/config/ui",
                 content=b'{"config":{"providers":{}}}',
@@ -371,12 +367,7 @@ class TestNewRouterIntegration:
         mock_container.environment_repository.save_ui_config.side_effect = (
             lambda _path, config: config
         )
-        runtime_routes = MagicMock()
-
-        with (
-            patch("app.api.analytics.configure_model_router"),
-            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
-        ):
+        with patch("app.api.analytics.configure_model_router"):
             response = client.post(
                 "/api/config/ui",
                 content=b'{"config":{"providers":{}}}',
@@ -399,12 +390,7 @@ class TestNewRouterIntegration:
         mock_container.environment_repository.save_ui_config.side_effect = (
             lambda _path, config: config
         )
-        runtime_routes = MagicMock()
-
-        with (
-            patch("app.api.analytics.configure_model_router"),
-            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
-        ):
+        with patch("app.api.analytics.configure_model_router"):
             response = client.post(
                 "/api/config/ui",
                 json={
@@ -435,12 +421,10 @@ class TestNewRouterIntegration:
             allow_local_ai_endpoints=current_value,
         )
         mock_container.settings.clade_admin_token = None
-        runtime_routes = MagicMock()
 
         with (
             patch("app.api.analytics.merge_ui_config_secrets") as merge_secrets,
             patch("app.api.analytics.configure_model_router") as configure_router,
-            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
         ):
             response = client.post(
                 "/api/config/ui",
@@ -463,8 +447,7 @@ class TestNewRouterIntegration:
         mock_container.environment_repository.save_ui_config.assert_not_called()
         mock_container.config_service.invalidate_cache.assert_not_called()
         configure_router.assert_not_called()
-        runtime_routes.apply_ui_config.assert_not_called()
-        runtime_routes.simulation_engine.reload_configs.assert_not_called()
+        mock_container.simulation_engine.reload_configs.assert_not_called()
 
     @pytest.mark.parametrize(
         ("current_value", "requested_value"),
@@ -494,12 +477,10 @@ class TestNewRouterIntegration:
             allow_local_ai_endpoints=current_value,
         )
         mock_container.settings.clade_admin_token = "expected-token"
-        runtime_routes = MagicMock()
 
         with (
             patch("app.api.analytics.merge_ui_config_secrets") as merge_secrets,
             patch("app.api.analytics.configure_model_router") as configure_router,
-            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
         ):
             response = client.post(
                 "/api/config/ui",
@@ -526,8 +507,7 @@ class TestNewRouterIntegration:
         mock_container.environment_repository.save_ui_config.assert_not_called()
         mock_container.config_service.invalidate_cache.assert_not_called()
         configure_router.assert_not_called()
-        runtime_routes.apply_ui_config.assert_not_called()
-        runtime_routes.simulation_engine.reload_configs.assert_not_called()
+        mock_container.simulation_engine.reload_configs.assert_not_called()
 
     @pytest.mark.parametrize(
         ("current_value", "requested_value"),
@@ -557,10 +537,7 @@ class TestNewRouterIntegration:
             lambda: refresh_order.append("cache")
         )
         runtime_routes = MagicMock()
-        runtime_routes.apply_ui_config.side_effect = (
-            lambda _saved: refresh_order.append("apply")
-        )
-        runtime_routes.simulation_engine.reload_configs.side_effect = (
+        mock_container.simulation_engine.reload_configs.side_effect = (
             lambda _configs: refresh_order.append("reload")
         )
 
@@ -594,10 +571,11 @@ class TestNewRouterIntegration:
             mock_container.embedding_service,
             mock_container.settings,
         )
-        runtime_routes.apply_ui_config.assert_called_once_with(saved)
-        runtime_routes.simulation_engine.reload_configs.assert_called_once()
+        runtime_routes.apply_ui_config.assert_not_called()
+        runtime_routes.simulation_engine.reload_configs.assert_not_called()
+        mock_container.simulation_engine.reload_configs.assert_called_once()
         mock_container.config_service.invalidate_cache.assert_called_once_with()
-        assert refresh_order == ["save", "cache", "configure", "apply", "reload"]
+        assert refresh_order == ["save", "cache", "configure", "reload"]
 
     def test_post_config_preserves_empty_key(self, client, mock_container):
         from ...models.config import ProviderConfig, UIConfig
@@ -614,15 +592,11 @@ class TestNewRouterIntegration:
         mock_container.environment_repository.save_ui_config.side_effect = (
             lambda _path, config: config
         )
-        runtime_routes = MagicMock()
         refresh_order = []
         mock_container.config_service.invalidate_cache.side_effect = (
             lambda: refresh_order.append("cache")
         )
-        runtime_routes.apply_ui_config.side_effect = (
-            lambda _saved: refresh_order.append("apply")
-        )
-        runtime_routes.simulation_engine.reload_configs.side_effect = (
+        mock_container.simulation_engine.reload_configs.side_effect = (
             lambda _configs: refresh_order.append("reload")
         )
 
@@ -631,7 +605,6 @@ class TestNewRouterIntegration:
                 "app.api.analytics.configure_model_router",
                 side_effect=lambda *_args: refresh_order.append("configure"),
             ) as configure_router,
-            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
         ):
             response = client.post(
                 "/api/config/ui",
@@ -654,10 +627,9 @@ class TestNewRouterIntegration:
             mock_container.embedding_service,
             mock_container.settings,
         )
-        runtime_routes.apply_ui_config.assert_called_once_with(saved)
-        runtime_routes.simulation_engine.reload_configs.assert_called_once()
+        mock_container.simulation_engine.reload_configs.assert_called_once()
         mock_container.config_service.invalidate_cache.assert_called_once_with()
-        assert refresh_order == ["cache", "configure", "apply", "reload"]
+        assert refresh_order == ["cache", "configure", "reload"]
         assert "sk-secret" not in response.text
 
     def test_post_config_save_failure_does_not_refresh_runtime(
@@ -670,11 +642,9 @@ class TestNewRouterIntegration:
         mock_container.environment_repository.save_ui_config.side_effect = RuntimeError(
             "save failed"
         )
-        runtime_routes = MagicMock()
 
         with (
             patch("app.api.analytics.configure_model_router") as configure_router,
-            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
             pytest.raises(RuntimeError, match="save failed"),
         ):
             client.post(
@@ -684,8 +654,7 @@ class TestNewRouterIntegration:
 
         mock_container.config_service.invalidate_cache.assert_not_called()
         configure_router.assert_not_called()
-        runtime_routes.apply_ui_config.assert_not_called()
-        runtime_routes.simulation_engine.reload_configs.assert_not_called()
+        mock_container.simulation_engine.reload_configs.assert_not_called()
 
     def test_post_config_cache_error_does_not_stop_runtime_refresh(
         self, client, mock_container, caplog
@@ -704,7 +673,6 @@ class TestNewRouterIntegration:
         mock_container.environment_repository.save_ui_config.side_effect = (
             lambda _path, config: config
         )
-        runtime_routes = MagicMock()
         refresh_order = []
 
         class CacheRefreshError(RuntimeError):
@@ -715,10 +683,7 @@ class TestNewRouterIntegration:
             raise CacheRefreshError("cache failed for sk-secret")
 
         mock_container.config_service.invalidate_cache.side_effect = fail_cache
-        runtime_routes.apply_ui_config.side_effect = (
-            lambda _saved: refresh_order.append("apply")
-        )
-        runtime_routes.simulation_engine.reload_configs.side_effect = (
+        mock_container.simulation_engine.reload_configs.side_effect = (
             lambda _configs: refresh_order.append("reload")
         )
 
@@ -727,7 +692,6 @@ class TestNewRouterIntegration:
                 "app.api.analytics.configure_model_router",
                 side_effect=lambda *_args: refresh_order.append("configure"),
             ),
-            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
         ):
             response = client.post(
                 "/api/config/ui",
@@ -742,7 +706,7 @@ class TestNewRouterIntegration:
             )
 
         assert response.status_code == 200
-        assert refresh_order == ["cache", "configure", "apply", "reload"]
+        assert refresh_order == ["cache", "configure", "reload"]
         assert "CacheRefreshError" in caplog.text
         assert "sk-secret" not in response.text
         assert "sk-secret" not in caplog.text
@@ -764,7 +728,6 @@ class TestNewRouterIntegration:
         mock_container.environment_repository.save_ui_config.side_effect = (
             lambda _path, config: config
         )
-        runtime_routes = MagicMock()
         refresh_order = []
         mock_container.config_service.invalidate_cache.side_effect = (
             lambda: refresh_order.append("cache")
@@ -777,8 +740,7 @@ class TestNewRouterIntegration:
 
             return fail
 
-        runtime_routes.apply_ui_config.side_effect = fail_refresh("apply")
-        runtime_routes.simulation_engine.reload_configs.side_effect = fail_refresh(
+        mock_container.simulation_engine.reload_configs.side_effect = fail_refresh(
             "reload"
         )
 
@@ -787,7 +749,6 @@ class TestNewRouterIntegration:
                 "app.api.analytics.configure_model_router",
                 side_effect=fail_refresh("configure"),
             ),
-            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
         ):
             response = client.post(
                 "/api/config/ui",
@@ -802,8 +763,8 @@ class TestNewRouterIntegration:
             )
 
         assert response.status_code == 200
-        assert refresh_order == ["cache", "configure", "apply", "reload"]
-        assert caplog.text.count("RuntimeError") == 3
+        assert refresh_order == ["cache", "configure", "reload"]
+        assert caplog.text.count("RuntimeError") == 2
         assert "sk-secret" not in response.text
         assert "sk-secret" not in caplog.text
 
@@ -874,7 +835,6 @@ class TestNewRouterIntegration:
         mock_container.config_service.get_ui_config.side_effect = get_ui_config
         mock_container.settings.ui_config_path = str(path)
         mock_container.environment_repository.save_ui_config.side_effect = update_disk
-        runtime_routes = MagicMock()
 
         replacement_payload = {
             "config": {
@@ -901,7 +861,6 @@ class TestNewRouterIntegration:
 
         with (
             patch("app.api.analytics.configure_model_router", side_effect=refresh_router),
-            patch.dict(sys.modules, {"app.api.routes": runtime_routes}),
             ThreadPoolExecutor(max_workers=2) as executor,
         ):
             replacement = executor.submit(

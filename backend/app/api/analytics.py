@@ -470,20 +470,8 @@ def _update_ui_config(
             type(exc).__name__,
         )
     
-    # 【修复】应用 AI 配置到 ModelRouter（负载均衡、服务商路由等）
-    try:
-        from . import routes
-        routes.apply_ui_config(saved)
-        logger.info("[配置] AI 服务商配置已应用")
-    except Exception as exc:
-        logger.warning(
-            "[配置] 应用 AI 配置失败（不影响其他配置） (error_type=%s)",
-            type(exc).__name__,
-        )
-    
     # 【修复】刷新 SimulationEngine 及子服务的配置（分化、死亡率、生态平衡等）
     try:
-        from . import routes
         # 获取最新配置
         new_configs = {
             "ecology": config_service.get_ecology_balance(),
@@ -491,7 +479,7 @@ def _update_ui_config(
             "speciation": config_service.get_speciation(),
             "food_web": getattr(saved, 'food_web', None),
         }
-        routes.simulation_engine.reload_configs(new_configs)
+        container.simulation_engine.reload_configs(new_configs)
         logger.info("[配置] 游戏参数配置已刷新到引擎")
     except Exception as exc:
         logger.warning(

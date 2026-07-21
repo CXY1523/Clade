@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import TYPE_CHECKING, Optional
 
 from ..ai.model_router import (
@@ -16,6 +17,46 @@ if TYPE_CHECKING:
     from ..services.system.embedding import EmbeddingService
 
 logger = logging.getLogger(__name__)
+
+
+def _migrate_legacy_ai_config(config: UIConfig) -> None:
+    if not config.ai_api_key or config.providers:
+        return
+
+    default_provider_id = str(uuid.uuid4())[:8]
+    config.providers[default_provider_id] = ProviderConfig(
+        id=default_provider_id,
+        name="Default Provider",
+        type=config.ai_provider or "openai",
+        base_url=config.ai_base_url,
+        api_key=config.ai_api_key,
+    )
+    config.default_provider_id = default_provider_id
+    config.default_model = config.ai_model
+
+    if not config.capability_configs:
+        return
+    first_value = next(iter(config.capability_configs.values()), None)
+    if not isinstance(first_value, dict) or "api_key" not in first_value:
+        return
+
+    for capability, legacy_config in config.capability_configs.items():
+        if legacy_config.get("api_key") or legacy_config.get("base_url"):
+            provider_id = f"custom_{capability}"
+            config.providers[provider_id] = ProviderConfig(
+                id=provider_id,
+                name=f"Custom for {capability}",
+                type=legacy_config.get("provider", "openai"),
+                base_url=legacy_config.get("base_url") or config.ai_base_url,
+                api_key=legacy_config.get("api_key") or config.ai_api_key,
+            )
+        else:
+            provider_id = default_provider_id
+        config.capability_routes[capability] = CapabilityRouteConfig(
+            provider_id=provider_id,
+            model=legacy_config.get("model"),
+            timeout=legacy_config.get("timeout", 60),
+        )
 
 
 def _pick_provider_model(provider: Optional[ProviderConfig]) -> Optional[str]:
@@ -105,6 +146,8 @@ def configure_model_router(
 
     if not config:
         return config
+
+    _migrate_legacy_ai_config(config)
 
     model_router.allow_local_ai_endpoints = config.allow_local_ai_endpoints
     
