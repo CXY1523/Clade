@@ -120,3 +120,45 @@ def test_place_wager_accepts_the_active_frontend_contract(
     assert call.kwargs["initial_state"]["population"] == 1_000
     assert energy.get_state().current == 80
 
+
+def test_check_wager_returns_the_resolved_frontend_contract(
+    client: TestClient,
+    mock_container,
+    wager_services,
+) -> None:
+    progression, energy = wager_services
+    wager = SimpleNamespace(
+        id="wager_5_0",
+        wager_type=WagerType.EXTINCTION,
+        target_species="sp-alpha",
+        secondary_species=None,
+        predicted_outcome="",
+        bet_amount=20,
+        start_turn=5,
+        end_turn=8,
+        initial_state={"population": 1_000},
+    )
+    progression.get_state.return_value = SimpleNamespace(
+        wager_state=SimpleNamespace(active_wagers={"wager_5_0": wager}),
+    )
+    progression.resolve_wager.return_value = 40
+    progression.get_wager_summary.return_value = _wager_summary()
+    mock_container.simulation_engine.turn_counter = 8
+    mock_container.species_repository.get_by_lineage.return_value = None
+
+    response = client.post(
+        "/api/divine/wager/check",
+        json={"wager_id": "wager_5_0"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "resolved",
+        "success": True,
+        "reason": "物种已灭绝",
+        "reward": 40,
+        "current_energy": 140,
+        "wager_summary": _wager_summary(),
+    }
+    progression.resolve_wager.assert_called_once_with("wager_5_0", True)
+    assert energy.get_state().current == 140

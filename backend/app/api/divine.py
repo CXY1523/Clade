@@ -1038,32 +1038,117 @@ def check_wager(
     container: 'ServiceContainer' = Depends(get_container),
 ) -> dict:
     """检查预言结果"""
-    from ..services.system.divine_progression import divine_progression_service
+    from ..services.system.divine_progression import (
+        WAGER_TYPES,
+        WagerType,
+        divine_progression_service,
+    )
     from ..services.system.divine_energy import energy_service
-    
+
     wager_id = request.get("wager_id", "")
+    state = divine_progression_service.get_state()
+    if wager_id not in state.wager_state.active_wagers:
+        raise HTTPException(status_code=404, detail=f"预言 {wager_id} 不存在或已结算")
+
+    wager = state.wager_state.active_wagers[wager_id]
     engine = container.simulation_engine
     current_turn = engine.turn_counter
-    
+
+    if current_turn < wager.end_turn:
+        remaining = wager.end_turn - current_turn
+        return {
+            "status": "in_progress",
+            "message": f"预言进行中，剩余 {remaining} 回合",
+            "wager": wager.to_dict(),
+        }
+
     species_repo = container.species_repository
-    all_species = species_repo.list_species()
-    
-    game_state = {
-        "turn": current_turn,
-        "species": {sp.lineage_code: sp for sp in all_species},
-    }
-    
-    success, message, reward = divine_progression_service.check_wager(
-        wager_id, game_state, current_turn
-    )
-    
+    species = species_repo.get_by_lineage(wager.target_species)
+    success = False
+    reason = ""
+    wager_type = wager.wager_type
+
+    if wager_type == WagerType.EXTINCTION:
+        success = species is None or species.status != "alive"
+        reason = "物种已灭绝" if success else "物种仍存活"
+    elif wager_type == WagerType.DOMINANCE:
+        if species and species.status == "alive":
+            same_niche = [
+                candidate
+                for candidate in species_repo.list_species()
+                if candidate.status == "alive"
+                and candidate.trophic_level == species.trophic_level
+            ]
+
+            def get_population(candidate):
+                return (candidate.morphology_stats or {}).get("population", 0)
+
+            max_population = (
+                max(get_population(candidate) for candidate in same_niche)
+                if same_niche
+                else 0
+            )
+            success = get_population(species) >= max_population
+            reason = "已成为霸主" if success else "未能成为霸主"
+        else:
+            reason = "物种已灭绝"
+    elif wager_type == WagerType.EXPANSION:
+        if species and species.status == "alive":
+            initial_regions = wager.initial_state.get("regions", 1)
+            current_regions = len(species.regions) if species.regions else 1
+            new_regions = current_regions - initial_regions
+            success = new_regions >= 3
+            reason = f"扩展了 {new_regions} 个区域" if success else f"只扩展了 {new_regions} 个区域"
+        else:
+            reason = "物种已灭绝"
+    elif wager_type == WagerType.EVOLUTION:
+        descendants = [
+            candidate
+            for candidate in species_repo.list_species()
+            if candidate.parent_code == wager.target_species
+            and candidate.born_turn
+            and candidate.born_turn > wager.start_turn
+        ]
+        success = len(descendants) > 0
+        reason = f"产生了 {len(descendants)} 个后代" if success else "未产生后代"
+    elif wager_type == WagerType.DUEL:
+        opponent = (
+            species_repo.get_by_lineage(wager.secondary_species)
+            if wager.secondary_species
+            else None
+        )
+        species_alive = bool(species and species.status == "alive")
+        opponent_alive = bool(opponent and opponent.status == "alive")
+
+        def get_population(candidate):
+            return (candidate.morphology_stats or {}).get("population", 0) if candidate else 0
+
+        if species_alive and not opponent_alive:
+            winner = wager.target_species
+        elif opponent_alive and not species_alive:
+            winner = wager.secondary_species
+        elif species_alive and opponent_alive:
+            winner = (
+                wager.target_species
+                if get_population(species) > get_population(opponent)
+                else wager.secondary_species
+            )
+        else:
+            winner = None
+
+        success = winner == wager.predicted_outcome
+        reason = f"胜者: {winner}" if winner else "双方都灭绝"
+
+    reward = divine_progression_service.resolve_wager(wager_id, success)
     if reward > 0:
-        energy_service.add_energy(reward, f"预言成功奖励")
-    
+        energy_service.add_energy(reward, f"预言成功: {WAGER_TYPES[wager_type].name}")
+
     return {
+        "status": "resolved",
         "success": success,
-        "message": message,
+        "reason": reason,
         "reward": reward,
+        "current_energy": energy_service.get_state().current,
         "wager_summary": divine_progression_service.get_wager_summary(),
     }
 
