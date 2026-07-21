@@ -325,4 +325,97 @@ describe("Embedding API boundary", () => {
     });
     expect(browserFetch).not.toHaveBeenCalled();
   });
+
+  it("loads turn narratives through the shared HTTP client", async () => {
+    const response = {
+      success: true,
+      turn_index: 12,
+      narrative: "Alpha spread through the northern forest.",
+      key_events: [
+        { title: "Expansion", description: "Alpha entered a new region." },
+      ],
+      related_species: ["sp-alpha"],
+      novelty_info: { migration: 0.8 },
+    };
+    apiMocks.get.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.getTurnNarrative(12);
+
+    expect(result).toEqual(response);
+    expect(apiMocks.get).toHaveBeenCalledWith(
+      "/api/embedding/narrative/turn/12",
+    );
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("loads a bounded era range through the shared HTTP client", async () => {
+    const response = {
+      success: true,
+      eras: [
+        {
+          name: "Forest Expansion",
+          start_turn: 2,
+          end_turn: 12,
+          event_count: 5,
+          summary: "Species expanded northward.",
+        },
+      ],
+    };
+    apiMocks.get.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.getEras(2, 12);
+
+    expect(result).toEqual(response);
+    expect(apiMocks.get).toHaveBeenCalledWith(
+      "/api/embedding/narrative/eras?start_turn=2&end_turn=12",
+    );
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("omits an unspecified era end turn", async () => {
+    const response = { success: true, eras: [] };
+    apiMocks.get.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.getEras();
+
+    expect(result).toEqual(response);
+    expect(apiMocks.get).toHaveBeenCalledWith(
+      "/api/embedding/narrative/eras?start_turn=0",
+    );
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("loads species biographies through the shared HTTP client", async () => {
+    const response = {
+      success: true,
+      species_code: "sp-alpha",
+      species_name: "Alpha",
+      biography: "Alpha emerged in turn two and expanded northward.",
+    };
+    apiMocks.get.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.getSpeciesBiography("sp-alpha");
+
+    expect(result).toEqual(response);
+    expect(apiMocks.get).toHaveBeenCalledWith(
+      "/api/embedding/narrative/species/sp-alpha/biography",
+    );
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
 });

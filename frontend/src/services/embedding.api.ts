@@ -303,8 +303,7 @@ export const embeddingApi = {
 
   /** 获取回合叙事 */
   async getTurnNarrative(turnIndex: number): Promise<NarrativeResponse> {
-    const response = await fetch(`${API_BASE}/narrative/turn/${turnIndex}`);
-    return response.json();
+    return http.get(`${API_BASE}/narrative/turn/${turnIndex}`);
   },
 
   /** 获取演化时代划分 */
@@ -313,14 +312,12 @@ export const embeddingApi = {
     if (endTurn !== undefined) {
       url += `&end_turn=${endTurn}`;
     }
-    const response = await fetch(url);
-    return response.json();
+    return http.get(url);
   },
 
   /** 获取物种传记 */
   async getSpeciesBiography(speciesCode: string): Promise<BiographyResponse> {
-    const response = await fetch(`${API_BASE}/narrative/species/${speciesCode}/biography`);
-    return response.json();
+    return http.get(`${API_BASE}/narrative/species/${speciesCode}/biography`);
   },
 
   // ===== 统计 =====
