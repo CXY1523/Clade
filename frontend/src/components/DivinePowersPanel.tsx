@@ -206,22 +206,20 @@ export function DivinePowersPanel({ onClose }: Props) {
     
     setActionLoading(true);
     try {
-      const res = await fetch("/api/divine/skill/use", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ skill_id: skillId, target }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        alert(data.result?.details || "技能释放成功");
-        fetchStatus();
-        dispatchEnergyChanged();
-      } else {
-        alert(data.detail || "技能释放失败");
-      }
+      const data = await http.post<{ result?: { details?: string } }>(
+        "/api/divine/skill/use",
+        { skill_id: skillId, target },
+      );
+      alert(data.result?.details || "技能释放成功");
+      fetchStatus();
+      dispatchEnergyChanged();
     } catch (e) {
       console.error(e);
-      alert("请求失败，请检查网络连接");
+      alert(
+        isApiError(e)
+          ? e.detail || "技能释放失败"
+          : "请求失败，请检查网络连接",
+      );
     } finally {
       setActionLoading(false);
     }
