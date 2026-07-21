@@ -1021,22 +1021,16 @@ function FaithTab({ status, onRefresh }: { status: DivineStatus; onRefresh: () =
   const handleBless = async (code: string) => {
     setActionLoading(true);
     try {
-      const res = await fetch("/api/divine/faith/bless", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lineage_code: code }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        alert(data.message || "显圣成功！消耗20能量");
-        onRefresh();
-        dispatchEnergyChanged();
-      } else {
-        alert(data.detail || "显圣失败");
-      }
+      const data = await http.post<{ message?: string }>(
+        "/api/divine/faith/bless",
+        { lineage_code: code },
+      );
+      alert(data.message || "显圣成功！消耗20能量");
+      onRefresh();
+      dispatchEnergyChanged();
     } catch (e) {
       console.error(e);
-      alert("请求失败");
+      alert(isApiError(e) ? e.detail || "显圣失败" : "请求失败");
     } finally {
       setActionLoading(false);
     }

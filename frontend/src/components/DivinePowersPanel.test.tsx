@@ -119,6 +119,27 @@ const wagerStatusResponse = {
   },
 };
 
+const followerResponse = {
+  lineage_code: "sp-alpha",
+  common_name: "Alpha",
+  faith_value: 12,
+  contribution_per_turn: 2,
+  turns_as_follower: 4,
+  is_blessed: false,
+  is_sanctified: false,
+};
+
+const blessStatusResponse = {
+  ...selectedStatusResponse,
+  faith: {
+    ...selectedStatusResponse.faith,
+    total_followers: 1,
+    total_faith: 12,
+    faith_bonus_per_turn: 2,
+    followers: [followerResponse],
+  },
+};
+
 function mockSelectedPathRequests(
   statusResponse: unknown = selectedStatusResponse,
 ) {
@@ -622,6 +643,80 @@ describe("DivinePowersPanel API boundary", () => {
       });
     });
     expect(alertMock).toHaveBeenCalledWith("Species not found");
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("blesses a divine follower through the shared HTTP client", async () => {
+    mockSelectedPathRequests(blessStatusResponse);
+    apiMocks.post.mockResolvedValue({
+      success: true,
+      message: "Follower blessed",
+      reward: 5,
+      faith_summary: {
+        ...blessStatusResponse.faith,
+        followers: [{ ...followerResponse, is_blessed: true }],
+      },
+    });
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not bless a follower directly"),
+      );
+    const alertMock = vi.fn();
+    const energyChanged = vi.fn();
+    window.addEventListener("energy-changed", energyChanged, { once: true });
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("信仰"));
+    fireEvent.click(await screen.findByText("显圣"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/faith/bless", {
+        lineage_code: "sp-alpha",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Follower blessed");
+    const statusRequests = apiMocks.get.mock.calls.filter(
+      ([path]) => path === "/api/divine/status",
+    );
+    expect(statusRequests).toHaveLength(2);
+    expect(energyChanged).toHaveBeenCalledTimes(1);
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("shows a bless-follower rejection from the shared HTTP client", async () => {
+    mockSelectedPathRequests(blessStatusResponse);
+    apiMocks.post.mockRejectedValue(
+      Object.assign(new Error("Request failed: Blessing unavailable"), {
+        name: "ApiError",
+        status: 400,
+        statusText: "Bad Request",
+        detail: "Blessing unavailable",
+      }),
+    );
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not bless a follower directly"),
+      );
+    const alertMock = vi.fn();
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("信仰"));
+    fireEvent.click(await screen.findByText("显圣"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/faith/bless", {
+        lineage_code: "sp-alpha",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Blessing unavailable");
     expect(browserFetch).not.toHaveBeenCalled();
   });
 });
