@@ -269,27 +269,27 @@ export function DivinePowersPanel({ onClose }: Props) {
 
     setActionLoading(true);
     try {
-      const res = await fetch("/api/divine/wager/place", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const data = await http.post<{
+        message: string;
+        potential_return: number;
+      }>(
+        "/api/divine/wager/place",
+        {
           wager_type: wagerType,
           target_species: target,
           bet_amount: bet,
           secondary_species: secondary,
           predicted_outcome: predicted,
-        }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        alert(`${data.message}\n潜在回报: ${data.potential_return} 能量`);
-        fetchStatus();
-        dispatchEnergyChanged();
-      } else {
-        alert(data.detail || "下注失败");
-      }
+        },
+      );
+      alert(`${data.message}\n潜在回报: ${data.potential_return} 能量`);
+      fetchStatus();
+      dispatchEnergyChanged();
     } catch (e) {
       console.error(e);
+      if (isApiError(e)) {
+        alert(e.detail || "下注失败");
+      }
     } finally {
       setActionLoading(false);
     }

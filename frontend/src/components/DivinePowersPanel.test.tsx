@@ -100,6 +100,25 @@ const miracleStatusResponse = {
   miracles: [miracleResponse],
 };
 
+const wagerTypeResponse = {
+  type: "dominance",
+  name: "Dominance",
+  icon: "crown",
+  description: "Predict ecological dominance",
+  min_bet: 10,
+  max_bet: 60,
+  duration: 5,
+  multiplier: 2,
+};
+
+const wagerStatusResponse = {
+  ...selectedStatusResponse,
+  wagers: {
+    ...selectedStatusResponse.wagers,
+    wager_types: [wagerTypeResponse],
+  },
+};
+
 function mockSelectedPathRequests(
   statusResponse: unknown = selectedStatusResponse,
 ) {
@@ -440,6 +459,97 @@ describe("DivinePowersPanel API boundary", () => {
       });
     });
     expect(alertMock).toHaveBeenCalledWith("Miracle is cooling down");
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("places a divine wager through the shared HTTP client", async () => {
+    mockSelectedPathRequests(wagerStatusResponse);
+    apiMocks.post.mockResolvedValue({
+      success: true,
+      message: "Wager placed",
+      wager_id: "wager_12_0",
+      wager_type: "Dominance",
+      potential_return: 40,
+      energy_bet: 20,
+      energy_remaining: 80,
+    });
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not place a wager directly"),
+      );
+    const promptMock = vi
+      .fn()
+      .mockReturnValueOnce("sp-alpha")
+      .mockReturnValueOnce("20");
+    const alertMock = vi.fn();
+    const energyChanged = vi.fn();
+    window.addEventListener("energy-changed", energyChanged, { once: true });
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("prompt", promptMock);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("预言"));
+    fireEvent.click(await screen.findByText("下注"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/wager/place", {
+        wager_type: "dominance",
+        target_species: "sp-alpha",
+        bet_amount: 20,
+        secondary_species: null,
+        predicted_outcome: "",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Wager placed\n潜在回报: 40 能量");
+    const statusRequests = apiMocks.get.mock.calls.filter(
+      ([path]) => path === "/api/divine/status",
+    );
+    expect(statusRequests).toHaveLength(2);
+    expect(energyChanged).toHaveBeenCalledTimes(1);
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("shows a divine wager placement rejection from the shared HTTP client", async () => {
+    mockSelectedPathRequests(wagerStatusResponse);
+    apiMocks.post.mockRejectedValue(
+      Object.assign(new Error("Request failed: Not enough energy"), {
+        name: "ApiError",
+        status: 400,
+        statusText: "Bad Request",
+        detail: "Not enough energy",
+      }),
+    );
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not place a wager directly"),
+      );
+    vi.stubGlobal(
+      "prompt",
+      vi.fn().mockReturnValueOnce("sp-alpha").mockReturnValueOnce("20"),
+    );
+    const alertMock = vi.fn();
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("预言"));
+    fireEvent.click(await screen.findByText("下注"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/wager/place", {
+        wager_type: "dominance",
+        target_species: "sp-alpha",
+        bet_amount: 20,
+        secondary_species: null,
+        predicted_outcome: "",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Not enough energy");
     expect(browserFetch).not.toHaveBeenCalled();
   });
 });
