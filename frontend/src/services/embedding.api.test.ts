@@ -218,4 +218,30 @@ describe("Embedding API boundary", () => {
     );
     expect(browserFetch).not.toHaveBeenCalled();
   });
+
+  it("asks questions through the shared HTTP client", async () => {
+    const response = {
+      success: true,
+      question: "Why did Alpha adapt?",
+      answer: "Alpha adapted to sustained warming.",
+      sources: [
+        { type: "species", title: "Alpha", similarity: 0.93 },
+      ],
+      confidence: 0.88,
+      follow_up_questions: ["Which trait changed most?"],
+    };
+    apiMocks.post.mockResolvedValue(response);
+    const browserFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    vi.stubGlobal("fetch", browserFetch);
+
+    const result = await embeddingApi.askQuestion("Why did Alpha adapt?");
+
+    expect(result).toEqual(response);
+    expect(apiMocks.post).toHaveBeenCalledWith("/api/embedding/qa", {
+      question: "Why did Alpha adapt?",
+    });
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
 });

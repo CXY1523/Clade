@@ -269,12 +269,7 @@ export const embeddingApi = {
 
   /** 智能问答 */
   async askQuestion(question: string): Promise<QAResponse> {
-    const response = await fetch(`${API_BASE}/qa`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question })
-    });
-    return response.json();
+    return http.post<QAResponse>(`${API_BASE}/qa`, { question });
   },
 
   // ===== 解释 =====
