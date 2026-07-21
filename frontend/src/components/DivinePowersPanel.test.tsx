@@ -552,4 +552,76 @@ describe("DivinePowersPanel API boundary", () => {
     expect(alertMock).toHaveBeenCalledWith("Not enough energy");
     expect(browserFetch).not.toHaveBeenCalled();
   });
+
+  it("adds a divine follower through the shared HTTP client", async () => {
+    mockSelectedPathRequests();
+    apiMocks.post.mockResolvedValue({
+      success: true,
+      message: "Follower added",
+      faith_summary: selectedStatusResponse.faith,
+    });
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not add a follower directly"),
+      );
+    const alertMock = vi.fn();
+    const energyChanged = vi.fn();
+    window.addEventListener("energy-changed", energyChanged, { once: true });
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("prompt", vi.fn().mockReturnValue("sp-alpha"));
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("信仰"));
+    fireEvent.click(await screen.findByText("添加信徒"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/faith/add", {
+        lineage_code: "sp-alpha",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Follower added");
+    const statusRequests = apiMocks.get.mock.calls.filter(
+      ([path]) => path === "/api/divine/status",
+    );
+    expect(statusRequests).toHaveLength(2);
+    expect(energyChanged).toHaveBeenCalledTimes(1);
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("shows an add-follower rejection from the shared HTTP client", async () => {
+    mockSelectedPathRequests();
+    apiMocks.post.mockRejectedValue(
+      Object.assign(new Error("Request failed: Species not found"), {
+        name: "ApiError",
+        status: 404,
+        statusText: "Not Found",
+        detail: "Species not found",
+      }),
+    );
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not add a follower directly"),
+      );
+    const alertMock = vi.fn();
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("prompt", vi.fn().mockReturnValue("missing"));
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("信仰"));
+    fireEvent.click(await screen.findByText("添加信徒"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/faith/add", {
+        lineage_code: "missing",
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Species not found");
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
 });

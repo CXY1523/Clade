@@ -999,22 +999,20 @@ function FaithTab({ status, onRefresh }: { status: DivineStatus; onRefresh: () =
 
     setActionLoading(true);
     try {
-      const res = await fetch("/api/divine/faith/add", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lineage_code: code }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        alert(data.message || "添加信徒成功");
-        onRefresh();
-        dispatchEnergyChanged();
-      } else {
-        alert(data.detail || "添加失败");
-      }
+      const data = await http.post<{ message?: string }>(
+        "/api/divine/faith/add",
+        { lineage_code: code },
+      );
+      alert(data.message || "添加信徒成功");
+      onRefresh();
+      dispatchEnergyChanged();
     } catch (e) {
       console.error(e);
-      alert("请求失败，请检查网络连接");
+      alert(
+        isApiError(e)
+          ? e.detail || "添加失败"
+          : "请求失败，请检查网络连接",
+      );
     } finally {
       setActionLoading(false);
     }
