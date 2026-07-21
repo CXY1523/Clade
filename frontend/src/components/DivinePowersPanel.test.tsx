@@ -80,10 +80,32 @@ const skillsResponse = {
   current_path: "creator",
 };
 
-function mockSelectedPathRequests() {
+const miracleResponse = {
+  id: "great_prosperity",
+  name: "Great Prosperity",
+  icon: "sparkle",
+  description: "Boost global productivity",
+  cost: 50,
+  cooldown: 15,
+  charge_turns: 1,
+  one_time: false,
+  current_cooldown: 0,
+  is_charging: false,
+  charge_progress: 0,
+  available: true,
+};
+
+const miracleStatusResponse = {
+  ...selectedStatusResponse,
+  miracles: [miracleResponse],
+};
+
+function mockSelectedPathRequests(
+  statusResponse: unknown = selectedStatusResponse,
+) {
   apiMocks.get.mockImplementation(async (path: string) => {
     if (path === "/api/divine/status") {
-      return selectedStatusResponse;
+      return statusResponse;
     }
     if (path === "/api/divine/skills") {
       return skillsResponse;
@@ -333,6 +355,91 @@ describe("DivinePowersPanel API boundary", () => {
       });
     });
     expect(alertMock).toHaveBeenCalledWith("Not enough energy");
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("executes a divine miracle through the shared HTTP client", async () => {
+    mockSelectedPathRequests(miracleStatusResponse);
+    apiMocks.post.mockResolvedValue({
+      success: true,
+      message: "Miracle triggered",
+      effect: {
+        miracle_id: "great_prosperity",
+        miracle_name: "Great Prosperity",
+        miracle_icon: "sparkle",
+        description: "Boost global productivity",
+        cost: 50,
+        turn_executed: 12,
+      },
+      miracle_summary: {
+        all_miracles: [miracleResponse],
+        miracles_cast: 1,
+        charging: null,
+        charge_progress: 0,
+      },
+    });
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not execute a miracle directly"),
+      );
+    const alertMock = vi.fn();
+    const energyChanged = vi.fn();
+    window.addEventListener("energy-changed", energyChanged, { once: true });
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("神迹"));
+    fireEvent.click(await screen.findByText("释放神迹"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/miracle/execute", {
+        miracle_id: "great_prosperity",
+        target: null,
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("神迹释放成功");
+    const statusRequests = apiMocks.get.mock.calls.filter(
+      ([path]) => path === "/api/divine/status",
+    );
+    expect(statusRequests).toHaveLength(2);
+    expect(energyChanged).toHaveBeenCalledTimes(1);
+    expect(browserFetch).not.toHaveBeenCalled();
+  });
+
+  it("shows a divine miracle rejection returned by the shared HTTP client", async () => {
+    mockSelectedPathRequests(miracleStatusResponse);
+    apiMocks.post.mockRejectedValue(
+      Object.assign(new Error("Request failed: Miracle is cooling down"), {
+        name: "ApiError",
+        status: 400,
+        statusText: "Bad Request",
+        detail: "Miracle is cooling down",
+      }),
+    );
+    const browserFetch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("DivinePowersPanel must not execute a miracle directly"),
+      );
+    const alertMock = vi.fn();
+    vi.stubGlobal("fetch", browserFetch);
+    vi.stubGlobal("alert", alertMock);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    render(<DivinePowersPanel onClose={vi.fn()} />);
+
+    fireEvent.click(await screen.findByText("神迹"));
+    fireEvent.click(await screen.findByText("释放神迹"));
+    await waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith("/api/divine/miracle/execute", {
+        miracle_id: "great_prosperity",
+        target: null,
+      });
+    });
+    expect(alertMock).toHaveBeenCalledWith("Miracle is cooling down");
     expect(browserFetch).not.toHaveBeenCalled();
   });
 });

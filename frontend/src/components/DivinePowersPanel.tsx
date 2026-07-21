@@ -235,21 +235,18 @@ export function DivinePowersPanel({ onClose }: Props) {
     
     setActionLoading(true);
     try {
-      const res = await fetch("/api/divine/miracle/execute", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ miracle_id: miracleId, target }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        alert(data.result?.details || "神迹释放成功");
-        fetchStatus();
-        dispatchEnergyChanged();
-      } else {
-        alert(data.detail || "神迹释放失败");
-      }
+      const data = await http.post<{ result?: { details?: string } }>(
+        "/api/divine/miracle/execute",
+        { miracle_id: miracleId, target },
+      );
+      alert(data.result?.details || "神迹释放成功");
+      fetchStatus();
+      dispatchEnergyChanged();
     } catch (e) {
       console.error(e);
+      if (isApiError(e)) {
+        alert(e.detail || "神迹释放失败");
+      }
     } finally {
       setActionLoading(false);
     }
