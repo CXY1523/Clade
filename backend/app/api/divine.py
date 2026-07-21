@@ -949,32 +949,86 @@ def place_wager(
     _: None = Depends(require_not_running),
 ) -> dict:
     """下注预言（模拟运行时禁止）"""
-    from ..services.system.divine_progression import divine_progression_service
+    from ..services.system.divine_progression import (
+        WAGER_TYPES,
+        WagerType,
+        divine_progression_service,
+    )
     from ..services.system.divine_energy import energy_service
-    
-    prediction_type = request.get("type", "")
-    target = request.get("target", "")
-    bet_amount = request.get("amount", 10)
-    
+
+    wager_type_str = request.get("wager_type", request.get("type", ""))
+    target_species = request.get("target_species", request.get("target", ""))
+    bet_amount = request.get("bet_amount", request.get("amount", 0))
+    secondary_species = request.get("secondary_species")
+    predicted_outcome = request.get("predicted_outcome", "")
+
+    try:
+        wager_type = WagerType(wager_type_str)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"未知的预言类型: {wager_type_str}")
+
+    species_repo = container.species_repository
+    species = species_repo.get_by_lineage(target_species)
+    if not species:
+        raise HTTPException(status_code=404, detail=f"物种 {target_species} 不存在")
+    if species.status != "alive":
+        raise HTTPException(status_code=400, detail=f"物种 {target_species} 已灭绝")
+
+    if wager_type == WagerType.DUEL:
+        if not secondary_species:
+            raise HTTPException(status_code=400, detail="对决预言需要指定第二物种")
+        opponent = species_repo.get_by_lineage(secondary_species)
+        if not opponent:
+            raise HTTPException(status_code=404, detail=f"物种 {secondary_species} 不存在")
+        if opponent.status != "alive":
+            raise HTTPException(status_code=400, detail=f"物种 {secondary_species} 已灭绝")
+
     engine = container.simulation_engine
     current_turn = engine.turn_counter
-    
+
     if energy_service.get_state().current < bet_amount:
         raise HTTPException(status_code=400, detail="能量不足")
-    
-    success, message = divine_progression_service.place_wager(
-        prediction_type, target, bet_amount, current_turn
+
+    morph = species.morphology_stats or {}
+    traits = species.abstract_traits or {}
+    calculated_fitness = (
+        traits.get("适应性", 5) / 10.0
+        + sum(morph.values()) / max(1, len(morph))
+    ) / 2 if morph else 0.5
+    initial_state = {
+        "population": morph.get("population", 10000),
+        "fitness": calculated_fitness,
+        "regions": len(species.regions) if getattr(species, "regions", None) else 1,
+    }
+
+    success, message, wager_id = divine_progression_service.place_wager(
+        wager_type=wager_type,
+        target_species=target_species,
+        bet_amount=bet_amount,
+        current_turn=current_turn,
+        secondary_species=secondary_species,
+        predicted_outcome=predicted_outcome,
+        initial_state=initial_state,
     )
-    
     if not success:
         raise HTTPException(status_code=400, detail=message)
-    
-    energy_service.spend_fixed(bet_amount, current_turn, details=f"预言赌注")
-    
+
+    spent, spend_message = energy_service.spend_fixed(
+        bet_amount,
+        current_turn,
+        details=f"预言下注: {WAGER_TYPES[wager_type].name}",
+    )
+    if not spent:
+        raise HTTPException(status_code=400, detail=spend_message)
+
     return {
         "success": True,
         "message": message,
-        "wager_summary": divine_progression_service.get_wager_summary(),
+        "wager_id": wager_id,
+        "wager_type": WAGER_TYPES[wager_type].name,
+        "potential_return": int(bet_amount * WAGER_TYPES[wager_type].multiplier),
+        "energy_bet": bet_amount,
+        "energy_remaining": energy_service.get_state().current,
     }
 
 
