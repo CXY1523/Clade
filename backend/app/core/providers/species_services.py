@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from ...services.species.species_generator import SpeciesGenerator
     from ...ai.model_router import ModelRouter
     from ...services.system.embedding import EmbeddingService
+    from ...repositories.genus_repository import GenusRepository
 
 
 class SpeciesServiceProvider:
@@ -31,6 +32,7 @@ class SpeciesServiceProvider:
     embedding_service: 'EmbeddingService'
     model_router: 'ModelRouter'
     config_service: Any
+    genus_repository: 'GenusRepository'
     
     def _get_or_override(self, name: str, factory: Callable[[], Any]) -> Any:
         """Get service instance, preferring override if set"""
@@ -53,7 +55,8 @@ class SpeciesServiceProvider:
             'speciation_service',
             lambda: SpeciationService(
                 self.model_router,
-                config=self.config_service.get_speciation()
+                config=self.config_service.get_speciation(),
+                genus_repository=self.genus_repository,
             )
         )
     
