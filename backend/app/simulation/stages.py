@@ -1752,8 +1752,6 @@ class GeneFlowStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.species_repository import species_repository
-        
         logger.info("基因流动计算...")
         ctx.emit_event("stage", "🔄 基因流动", "进化")
         
@@ -1782,7 +1780,7 @@ class GeneFlowStage(BaseStage):
             if ctx.gene_flow_count > 0:
                 logger.info(f"[基因流动] 发生了 {ctx.gene_flow_count} 对基因交流")
                 for species in ctx.species_batch:
-                    species_repository.upsert(species)
+                    engine.species_repository.upsert(species)
         except Exception as e:
             logger.warning(f"[基因流动] 失败: {e}")
             ctx.gene_flow_count = 0
