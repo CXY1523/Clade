@@ -3167,7 +3167,7 @@ class DatabaseMaintenanceStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.environment_repository import environment_repository
+        environment_repository = engine.environment_repository
         
         turn = ctx.turn_index
         
