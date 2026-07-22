@@ -30,8 +30,10 @@ from .speciation_lineage import (
     next_lineage_code,
 )
 from .speciation_habitat import (
+    allocate_tiles_from_clusters,
     calculate_initial_habitat_for_child,
     calculate_suitability_for_species,
+    find_connected_clusters,
     inherit_habitat_distribution,
 )
 from .speciation_dormant_genes import (
@@ -3649,42 +3651,7 @@ class SpeciationService:
         Returns:
             连通地块群列表
         """
-        if not tile_ids:
-            return []
-        
-        if not self._tile_adjacency:
-            # 没有邻接信息，假设所有地块连通
-            return [tile_ids]
-        
-        # 并查集
-        parent = {t: t for t in tile_ids}
-        
-        def find(x):
-            if parent[x] != x:
-                parent[x] = find(parent[x])
-            return parent[x]
-        
-        def union(x, y):
-            px, py = find(x), find(y)
-            if px != py:
-                parent[px] = py
-        
-        # 合并相邻地块
-        for tile_id in tile_ids:
-            neighbors = self._tile_adjacency.get(tile_id, set())
-            for neighbor in neighbors:
-                if neighbor in tile_ids:
-                    union(tile_id, neighbor)
-        
-        # 收集各连通分量
-        clusters_map: dict[int, set[int]] = {}
-        for tile_id in tile_ids:
-            root = find(tile_id)
-            if root not in clusters_map:
-                clusters_map[root] = set()
-            clusters_map[root].add(tile_id)
-        
-        return list(clusters_map.values())
+        return find_connected_clusters(tile_ids, self._tile_adjacency)
     
     def _allocate_tiles_from_clusters(
         self,
@@ -3704,69 +3671,11 @@ class SpeciationService:
         Returns:
             每个子代的地块ID集合列表
         """
-        import random
-        
-        if not clusters:
-            # 没有隔离区域，将所有候选地块平均分配
-            if not candidate_tiles:
-                return [set() for _ in range(num_offspring)]
-            
-            tile_list = list(candidate_tiles)
-            random.shuffle(tile_list)
-            allocations = [set() for _ in range(num_offspring)]
-            for i, tile in enumerate(tile_list):
-                allocations[i % num_offspring].add(tile)
-            return allocations
-        
-        # 只保留候选地块中的区域
-        filtered_clusters = []
-        for cluster in clusters:
-            filtered = cluster & candidate_tiles
-            if filtered:
-                filtered_clusters.append(filtered)
-        
-        if not filtered_clusters:
-            # 过滤后没有区域，回退到候选地块平均分配
-            tile_list = list(candidate_tiles)
-            random.shuffle(tile_list)
-            allocations = [set() for _ in range(num_offspring)]
-            for i, tile in enumerate(tile_list):
-                allocations[i % num_offspring].add(tile)
-            return allocations
-        
-        # 按区域大小排序（大的优先）
-        filtered_clusters.sort(key=len, reverse=True)
-        
-        # 策略1：如果隔离区域数 >= 子代数，每个子代获得一个区域
-        if len(filtered_clusters) >= num_offspring:
-            random.shuffle(filtered_clusters)
-            return [filtered_clusters[i] for i in range(num_offspring)]
-        
-        # 策略2：隔离区域不足，需要分割大区域
-        allocations = [set() for _ in range(num_offspring)]
-        
-        # 先分配已有的区域
-        for i, cluster in enumerate(filtered_clusters):
-            if i < num_offspring:
-                allocations[i] = cluster
-        
-        # 从最大区域分割出额外的
-        remaining_slots = [i for i in range(num_offspring) if not allocations[i]]
-        if remaining_slots and allocations[0]:
-            largest = list(allocations[0])
-            random.shuffle(largest)
-            
-            split_size = max(1, len(largest) // (len(remaining_slots) + 1))
-            
-            for slot_idx in remaining_slots:
-                take = set(largest[:split_size])
-                largest = largest[split_size:]
-                allocations[slot_idx] = take
-            
-            # 更新最大区域
-            allocations[0] = set(largest)
-        
-        return allocations
+        return allocate_tiles_from_clusters(
+            clusters,
+            candidate_tiles,
+            num_offspring,
+        )
     
     def _allocate_tiles_to_offspring(
         self, 

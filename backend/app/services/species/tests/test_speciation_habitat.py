@@ -1,4 +1,5 @@
 import logging
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -6,8 +7,10 @@ import pytest
 from ....repositories.environment_repository import environment_repository
 from ..speciation import SpeciationService
 from ..speciation_habitat import (
+    allocate_tiles_from_clusters,
     calculate_initial_habitat_for_child,
     calculate_suitability_for_species,
+    find_connected_clusters,
     inherit_habitat_distribution,
 )
 
@@ -285,3 +288,89 @@ def test_service_inheritance_delegate_preserves_initial_habitat_override(
     )
 
     assert calls == [(2, 1, 15, {10})]
+
+
+def test_connected_clusters_preserves_empty_and_missing_adjacency_behavior() -> None:
+    assert find_connected_clusters(set(), {}) == []
+
+    tile_ids = {1, 2}
+    result = find_connected_clusters(tile_ids, {})
+
+    assert result == [tile_ids]
+    assert result[0] is tile_ids
+
+
+def test_connected_clusters_uses_service_adjacency() -> None:
+    adjacency = {
+        1: {2},
+        2: {1, 3},
+        3: {2},
+        4: set(),
+    }
+
+    result = find_connected_clusters({1, 2, 3, 4}, adjacency)
+
+    assert {frozenset(cluster) for cluster in result} == {
+        frozenset({1, 2, 3}),
+        frozenset({4}),
+    }
+
+
+def test_cluster_allocation_round_robins_candidates_without_clusters(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(random, "shuffle", lambda values: None)
+
+    allocations = allocate_tiles_from_clusters([], {1, 2, 3, 4}, 2)
+
+    assert len(allocations) == 2
+    assert allocations[0].isdisjoint(allocations[1])
+    assert allocations[0] | allocations[1] == {1, 2, 3, 4}
+    assert [len(allocation) for allocation in allocations] == [2, 2]
+
+
+def test_cluster_allocation_filters_candidates_before_selecting_regions(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(random, "shuffle", lambda values: None)
+
+    allocations = allocate_tiles_from_clusters(
+        [{1, 2}, {3, 4}, {5}],
+        {1, 3, 5},
+        2,
+    )
+
+    assert allocations == [{1}, {3}]
+
+
+def test_cluster_allocation_splits_largest_region_without_losing_tiles(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(random, "shuffle", lambda values: None)
+
+    allocations = allocate_tiles_from_clusters(
+        [{1, 2, 3, 4}],
+        {1, 2, 3, 4},
+        3,
+    )
+
+    assert len(allocations) == 3
+    assert all(allocations)
+    assert set().union(*allocations) == {1, 2, 3, 4}
+    assert all(
+        left.isdisjoint(right)
+        for index, left in enumerate(allocations)
+        for right in allocations[index + 1 :]
+    )
+
+
+def test_service_connected_cluster_delegate_uses_current_adjacency() -> None:
+    service = object.__new__(SpeciationService)
+    service._tile_adjacency = {1: {2}, 2: {1}, 3: set()}
+
+    result = service._find_connected_clusters({1, 2, 3})
+
+    assert {frozenset(cluster) for cluster in result} == {
+        frozenset({1, 2}),
+        frozenset({3}),
+    }
