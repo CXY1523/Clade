@@ -523,7 +523,7 @@ class TectonicMovementStage(BaseStage):
         if not engine._use_tectonic_system or not engine.tectonic:
             return
         
-        from ..repositories.environment_repository import environment_repository
+        environment_repository = engine.environment_repository
         from ..services.species.habitat_manager import habitat_manager
         from ..services.species.dispersal_engine import dispersal_engine
         

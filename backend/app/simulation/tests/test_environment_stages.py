@@ -163,17 +163,22 @@ class TestTectonicMovementStage:
         
         assert mock_context.tectonic_result is None
 
-    async def test_uses_engine_species_repository(self, stage, monkeypatch):
-        """板块计算只读取引擎注入的物种仓库。"""
+    async def test_uses_engine_repositories(self, stage, monkeypatch):
+        """板块计算只使用引擎注入的物种和环境仓库。"""
         species_repository_module = importlib.import_module(
             "app.repositories.species_repository"
         )
         environment_repository_module = importlib.import_module(
             "app.repositories.environment_repository"
         )
+        habitat_manager_module = importlib.import_module(
+            "app.services.species.habitat_manager"
+        )
         alive_species = SimpleNamespace(status="alive", habitats=[], id=1)
         extinct_species = SimpleNamespace(status="extinct", habitats=[], id=2)
+        map_tile = SimpleNamespace(x=1, y=2, elevation=10.0, temperature=15.0)
         list_calls = 0
+        environment_calls = []
         tectonic_calls = []
 
         def list_species():
@@ -183,7 +188,15 @@ class TestTectonicMovementStage:
 
         tectonic_result = SimpleNamespace(
             wilson_phase={"phase": "stable", "progress": 0.0},
-            terrain_changes=[],
+            terrain_changes=[
+                {
+                    "x": 1,
+                    "y": 2,
+                    "new_elevation": 20.0,
+                    "new_temperature": 17.0,
+                    "delta": 10.0,
+                }
+            ],
             pressure_feedback={},
             get_major_events_summary=lambda: [],
         )
@@ -192,16 +205,31 @@ class TestTectonicMovementStage:
             tectonic_calls.append(kwargs)
             return tectonic_result
 
+        def list_tiles():
+            environment_calls.append("list_tiles")
+            return [map_tile]
+
+        def upsert_tiles(tiles):
+            environment_calls.append(("upsert_tiles", tiles))
+
         engine = SimpleNamespace(
             _use_tectonic_system=True,
             tectonic=SimpleNamespace(step=tectonic_step),
             species_repository=SimpleNamespace(list_species=list_species),
+            environment_repository=SimpleNamespace(
+                list_tiles=list_tiles,
+                upsert_tiles=upsert_tiles,
+            ),
             resource_manager=SimpleNamespace(),
+            map_manager=SimpleNamespace(
+                reclassify_terrain_by_sea_level=lambda _sea_level: None
+            ),
         )
         context = SimpleNamespace(
             modifiers={},
             tectonic_result=None,
             turn_index=4,
+            current_map_state=SimpleNamespace(sea_level=0.0),
             emit_event=lambda *_args: None,
         )
         monkeypatch.setattr(
@@ -218,7 +246,27 @@ class TestTectonicMovementStage:
         monkeypatch.setattr(
             environment_repository_module,
             "environment_repository",
-            SimpleNamespace(list_tiles=lambda: []),
+            SimpleNamespace(
+                list_tiles=lambda: (_ for _ in ()).throw(
+                    AssertionError(
+                        "TectonicMovementStage must not use the global repository"
+                    )
+                ),
+                upsert_tiles=lambda _tiles: (_ for _ in ()).throw(
+                    AssertionError(
+                        "TectonicMovementStage must not use the global repository"
+                    )
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            habitat_manager_module,
+            "habitat_manager",
+            SimpleNamespace(
+                handle_terrain_type_changes=lambda *_args, **_kwargs: {
+                    "forced_relocations": 0
+                }
+            ),
         )
 
         await stage.execute(context, engine)
@@ -226,6 +274,10 @@ class TestTectonicMovementStage:
         assert list_calls == 1
         assert len(tectonic_calls) == 1
         assert tectonic_calls[0]["species_list"] == [alive_species]
+        assert tectonic_calls[0]["map_tiles"] == [map_tile]
+        assert environment_calls == ["list_tiles", ("upsert_tiles", [map_tile])]
+        assert map_tile.elevation == 20.0
+        assert map_tile.temperature == 17.0
         assert context.tectonic_result is tectonic_result
 
 
