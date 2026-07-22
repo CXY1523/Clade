@@ -109,6 +109,7 @@ async def test_population_update_preserves_bounded_persistence_invariant(monkeyp
     ]
 
     engine = SimpleNamespace(
+        species_repository=species_repository,
         reproduction_service=_ExtremeReproductionService(),
         speciation=SimpleNamespace(_config=None),
         migration_advisor=SimpleNamespace(

@@ -1160,8 +1160,9 @@ class PopulationUpdateStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.species_repository import species_repository
         from ..services.species.habitat_manager import habitat_manager
+
+        species_repository = engine.species_repository
         
         logger.info("计算种群变化（死亡+繁殖并行）...")
         ctx.emit_event("stage", "💀🐣 计算种群变化", "物种")
