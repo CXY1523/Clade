@@ -18,6 +18,11 @@ from ...repositories.species_repository import species_repository
 from ...repositories.environment_repository import environment_repository
 from ...schemas.responses import BranchingEvent
 from .genetic_distance import GeneticDistanceCalculator
+from .speciation_context import (
+    summarize_food_chain_status,
+    summarize_major_events,
+    summarize_map_changes,
+)
 from .trait_config import TraitConfig, PlantTraitConfig
 from .trophic import TrophicLevelCalculator
 from .speciation_rules import SpeciationRules, speciation_rules  # 【新增】规则引擎
@@ -4223,106 +4228,13 @@ class SpeciationService:
         return threshold
     
     def _summarize_food_chain_status(self, trophic_interactions: dict[str, float] | None) -> str:
-        """总结食物链状态，供AI做演化决策参考
-        
-        这是一个关键函数！它告诉AI当前生态系统的营养级状态：
-        - 哪些营养级的食物充足/稀缺
-        - 是否有级联崩溃的风险
-        
-        Args:
-            trophic_interactions: 营养级互动数据，包含 t2_scarcity, t3_scarcity 等
-            
-        Returns:
-            人类可读的食物链状态描述
-        """
-        if not trophic_interactions:
-            return "食物链状态未知"
-        
-        status_parts = []
-        
-        # 检查各级的食物稀缺度
-        # scarcity: 0 = 充足, 1 = 紧张, 2 = 严重短缺
-        t2_scarcity = trophic_interactions.get("t2_scarcity", 0.0)
-        t3_scarcity = trophic_interactions.get("t3_scarcity", 0.0)
-        t4_scarcity = trophic_interactions.get("t4_scarcity", 0.0)
-        t5_scarcity = trophic_interactions.get("t5_scarcity", 0.0)
-        
-        def scarcity_level(value: float) -> str:
-            if value < 0.3:
-                return "充足"
-            elif value < 1.0:
-                return "紧张"
-            elif value < 1.5:
-                return "短缺"
-            else:
-                return "严重短缺"
-        
-        # T1 是生产者，不依赖其他营养级
-        # T2 依赖 T1（生产者）
-        if t2_scarcity > 0.5:
-            status_parts.append(f"生产者(T1){'紧张' if t2_scarcity < 1.0 else '短缺'}，初级消费者(T2)面临食物压力")
-        
-        # T3 依赖 T2
-        if t3_scarcity > 0.5:
-            status_parts.append(f"初级消费者(T2){'紧张' if t3_scarcity < 1.0 else '短缺'}，次级消费者(T3)面临食物压力")
-        
-        # T4 依赖 T3
-        if t4_scarcity > 0.5:
-            status_parts.append(f"次级消费者(T3){'紧张' if t4_scarcity < 1.0 else '短缺'}，三级消费者(T4)面临食物压力")
-        
-        # T5 依赖 T4
-        if t5_scarcity > 0.5:
-            status_parts.append(f"三级消费者(T4){'紧张' if t5_scarcity < 1.0 else '短缺'}，顶级捕食者(T5)面临食物压力")
-        
-        # 检测级联崩溃风险
-        if t2_scarcity > 1.5 and t3_scarcity > 1.0:
-            status_parts.append("⚠️ 食物链底层崩溃，可能引发级联灭绝")
-        
-        if not status_parts:
-            return "食物链稳定，各营养级食物充足"
-        
-        return "；".join(status_parts)
+        return summarize_food_chain_status(trophic_interactions)
     
     def _summarize_map_changes(self, map_changes: list) -> str:
-        """总结地图变化用于分化原因描述。"""
-        if not map_changes:
-            return ""
-        
-        change_types = []
-        for change in map_changes[:3]:  # 最多取3个
-            if isinstance(change, dict):
-                ctype = change.get("change_type", "")
-            else:
-                ctype = getattr(change, "change_type", "")
-            
-            if ctype == "uplift":
-                change_types.append("地壳抬升")
-            elif ctype == "volcanic":
-                change_types.append("火山活动")
-            elif ctype == "glaciation":
-                change_types.append("冰川推进")
-            elif ctype == "subsidence":
-                change_types.append("地壳下沉")
-        
-        return "、".join(change_types) if change_types else "地形变化"
+        return summarize_map_changes(map_changes)
     
     def _summarize_major_events(self, major_events: list) -> str:
-        """总结重大事件用于分化原因描述。"""
-        if not major_events:
-            return ""
-        
-        for event in major_events[:1]:  # 取第一个
-            if isinstance(event, dict):
-                desc = event.get("description", "")
-                severity = event.get("severity", "")
-            else:
-                desc = getattr(event, "description", "")
-                severity = getattr(event, "severity", "")
-            
-            if desc:
-                return f"{severity}级{desc}"
-        
-        return "重大环境事件"
+        return summarize_major_events(major_events)
     
     def _process_ai_activated_genes(
         self,
