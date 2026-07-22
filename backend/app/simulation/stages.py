@@ -2521,7 +2521,6 @@ class BuildReportStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.environment_repository import environment_repository
         from ..schemas.responses import TurnReport
         
         # 【优化】检查是否需要生成报告（自动过回合/随机回合可跳过）
@@ -2555,7 +2554,7 @@ class BuildReportStage(BaseStage):
             # 使用 TurnReportService 构建报告
             turn_report_service = TurnReportService(
                 report_builder=engine.report_builder,
-                environment_repository=environment_repository,
+                environment_repository=engine.environment_repository,
                 trophic_service=engine.trophic_service,
                 emit_event_fn=ctx.emit_event,
             )
