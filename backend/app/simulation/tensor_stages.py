@@ -132,7 +132,7 @@ class TensorStateInitStage(BaseStage):
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
         import numpy as np
-        from ..repositories.environment_repository import environment_repository
+        environment_repository = engine.environment_repository
 
         species_batch = getattr(ctx, "species_batch", []) or []
         if not species_batch:
