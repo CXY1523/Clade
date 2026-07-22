@@ -1,5 +1,6 @@
 """Regression coverage for simulation turn transaction boundaries."""
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,52 @@ from ...schemas.requests import TurnCommand
 from ..engine import SimulationEngine
 from ..pipeline import Pipeline, PipelineConfig
 from ..stages import BuildReportStage, FinalizeStage, MapEvolutionStage, ParsePressuresStage
+
+
+@pytest.mark.asyncio
+async def test_finalize_stage_uses_engine_environment_repository(monkeypatch):
+    """Finalize reads and saves the next turn through the engine repository."""
+
+    class RecordingRepository:
+        def __init__(self, state):
+            self.state = state
+            self.calls = []
+
+        def get_state(self):
+            self.calls.append("get_state")
+            return self.state
+
+        def save_state(self, state):
+            self.calls.append(("save_state", state))
+            return state
+
+    environment_repository_module = importlib.import_module(
+        "app.repositories.environment_repository"
+    )
+    injected_state = SimpleNamespace(turn_index=0)
+    global_state = SimpleNamespace(turn_index=99)
+    injected_repository = RecordingRepository(injected_state)
+    global_repository = RecordingRepository(global_state)
+    monkeypatch.setattr(
+        environment_repository_module,
+        "environment_repository",
+        global_repository,
+    )
+    context = SimpleNamespace(
+        turn_index=4,
+        emit_event=lambda *_args: None,
+    )
+    engine = SimpleNamespace(environment_repository=injected_repository)
+
+    await FinalizeStage().execute(context, engine)
+
+    assert injected_state.turn_index == 5
+    assert injected_repository.calls == [
+        "get_state",
+        ("save_state", injected_state),
+    ]
+    assert global_state.turn_index == 99
+    assert global_repository.calls == []
 
 
 def _database_snapshot(engine) -> dict[str, list[dict]]:
