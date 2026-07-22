@@ -1694,8 +1694,6 @@ class GeneDiversityStage(BaseStage):
         )
 
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.species_repository import species_repository
-
         logger.info("更新基因多样性半径...")
         ctx.emit_event("stage", "🧬 基因多样性", "进化")
 
@@ -1724,7 +1722,7 @@ class GeneDiversityStage(BaseStage):
                             "reason": change["reason"],
                         }
                     )
-                species_repository.upsert(sp)
+                engine.species_repository.upsert(sp)
             except Exception as e:
                 logger.warning(f"[基因多样性] 更新 {sp.lineage_code} 失败: {e}")
 
