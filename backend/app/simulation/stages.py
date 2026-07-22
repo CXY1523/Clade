@@ -2775,7 +2775,6 @@ class VegetationCoverStage(BaseStage):
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
         from ..repositories.environment_repository import environment_repository
-        from ..repositories.species_repository import species_repository
         from ..services.geo.vegetation_cover import vegetation_cover_service
         
         logger.info("更新植被覆盖...")
@@ -2784,7 +2783,7 @@ class VegetationCoverStage(BaseStage):
         try:
             tiles = environment_repository.list_tiles()
             habitats = environment_repository.latest_habitats()
-            all_species = species_repository.list_species()
+            all_species = engine.species_repository.list_species()
             species_map = {sp.id: sp for sp in all_species if sp.id}
             
             updated_tiles = vegetation_cover_service.update_vegetation_cover(
