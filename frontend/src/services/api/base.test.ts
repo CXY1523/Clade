@@ -68,4 +68,27 @@ describe("HTTP API errors", () => {
     expect(isApiError(new Error("plain"))).toBe(false);
     expect(isApiError({ status: 400 })).toBe(false);
   });
+
+  it("returns response metadata and accepts explicitly listed statuses", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, {
+      status: 304,
+      headers: { ETag: '"lineage-v1"' },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await http.getResponse("/api/lineage", {
+      acceptedStatuses: [304],
+      headers: { "If-None-Match": '"lineage-v1"' },
+    });
+
+    expect(response.data).toBeUndefined();
+    expect(response.status).toBe(304);
+    expect(response.headers.get("ETag")).toBe('"lineage-v1"');
+    expect(fetchMock).toHaveBeenCalledWith("/api/lineage", expect.objectContaining({
+      headers: {
+        "Content-Type": "application/json",
+        "If-None-Match": '"lineage-v1"',
+      },
+    }));
+  });
 });
