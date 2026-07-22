@@ -1485,7 +1485,7 @@ class PostMigrationNicheStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.environment_repository import environment_repository
+        environment_repository = engine.environment_repository
         
         if ctx.migration_count > 0:
             logger.info("重新分析生态位（迁徙后）...")

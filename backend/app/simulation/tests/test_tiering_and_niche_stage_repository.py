@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ..stages import TieringAndNicheStage
+from ..stages import PostMigrationNicheStage, TieringAndNicheStage
 
 
 class _RecordingEnvironmentRepository:
@@ -77,5 +77,42 @@ async def test_tiering_and_niche_uses_engine_environment_repository(
     assert context.all_tiles is tiles
     assert context.niche_metrics is niche_metrics
     assert injected_repository.calls == ["latest_habitats", "list_tiles"]
+    assert global_repository.calls == []
+    assert niche_analyzer.calls == [(species_batch, habitats)]
+
+
+@pytest.mark.asyncio
+async def test_post_migration_niche_uses_engine_environment_repository(
+    monkeypatch,
+) -> None:
+    environment_repository_module = importlib.import_module(
+        "app.repositories.environment_repository"
+    )
+    habitats = [object()]
+    injected_repository = _RecordingEnvironmentRepository(habitats, [])
+    global_repository = _RecordingEnvironmentRepository([object()], [])
+    monkeypatch.setattr(
+        environment_repository_module,
+        "environment_repository",
+        global_repository,
+    )
+    species_batch = [object()]
+    niche_metrics = object()
+    niche_analyzer = _RecordingNicheAnalyzer(niche_metrics)
+    context = SimpleNamespace(
+        migration_count=1,
+        species_batch=species_batch,
+        emit_event=lambda *_args: None,
+    )
+    engine = SimpleNamespace(
+        environment_repository=injected_repository,
+        niche_analyzer=niche_analyzer,
+    )
+
+    await PostMigrationNicheStage().execute(context, engine)
+
+    assert context.all_habitats is habitats
+    assert context.niche_metrics is niche_metrics
+    assert injected_repository.calls == ["latest_habitats"]
     assert global_repository.calls == []
     assert niche_analyzer.calls == [(species_batch, habitats)]
