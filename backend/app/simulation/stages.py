@@ -432,8 +432,6 @@ class ParsePressuresStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.environment_repository import environment_repository
-        
         logger.info("解析压力...")
         ctx.emit_event("stage", "🌡️ 解析环境压力", "环境")
         
