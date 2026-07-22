@@ -2201,8 +2201,6 @@ class SubspeciesPromotionStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.species_repository import species_repository
-        
         logger.debug("亚种晋升检查...")
         
         ctx.promotion_count = 0
