@@ -25,6 +25,10 @@ from .speciation_context import (
     summarize_organs,
 )
 from .speciation_naming import fallback_common_name, fallback_latin_name
+from .speciation_lineage import (
+    generate_multiple_lineage_codes,
+    next_lineage_code,
+)
 from .trait_config import TraitConfig, PlantTraitConfig
 from .trophic import TrophicLevelCalculator
 from .speciation_rules import SpeciationRules, speciation_rules  # 【新增】规则引擎
@@ -2653,53 +2657,14 @@ class SpeciationService:
         return base_name
 
     def _next_lineage_code(self, parent_code: str, existing_codes: set[str]) -> str:
-        """生成单个子代编码（保留用于向后兼容）"""
-        base = f"{parent_code}a"
-        idx = 1
-        new_code = f"{base}{idx}"
-        while new_code in existing_codes:
-            idx += 1
-            new_code = f"{base}{idx}"
-        return new_code
+        return next_lineage_code(parent_code, existing_codes)
     
     def _generate_multiple_lineage_codes(
         self, parent_code: str, existing_codes: set[str], num_offspring: int
     ) -> list[str]:
-        """生成多个子代编码，使用字母后缀 (A1→A1a, A1b, A1c)
-        
-        Args:
-            parent_code: 父代编码 (如 "A1")
-            existing_codes: 已存在的编码集合
-            num_offspring: 需要生成的子代数量
-            
-        Returns:
-            子代编码列表 (如 ["A1a", "A1b", "A1c"])
-        """
-        letters = "abcdefghijklmnopqrstuvwxyz"
-        codes = []
-        
-        for i in range(num_offspring):
-            if i < len(letters):
-                letter = letters[i]
-                new_code = f"{parent_code}{letter}"
-            else:
-                # 超过26个子代，添加重复标记
-                repeat_idx = i // len(letters) - 1
-                letter_idx = i % len(letters)
-                letter = letters[letter_idx]
-                repeat = '#' * repeat_idx
-                new_code = f"{parent_code}{repeat}{letter}"
-            
-            # 如果编码已存在，添加数字后缀
-            if new_code in existing_codes:
-                idx = 1
-                while f"{new_code}{idx}" in existing_codes:
-                    idx += 1
-                new_code = f"{new_code}{idx}"
-            
-            codes.append(new_code)
-        
-        return codes
+        return generate_multiple_lineage_codes(
+            parent_code, existing_codes, num_offspring
+        )
     
     def _allocate_offspring_population(self, total_population: int, num_offspring: int) -> list[int]:
         """随机划分子代种群，并确保每个子种至少拥有最小种群门槛。
