@@ -2739,12 +2739,10 @@ class SaveMapSnapshotStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.species_repository import species_repository
-        
         logger.info("保存地图栖息地快照...")
         ctx.emit_event("stage", "💾 保存地图快照", "系统")
         
-        all_species_final = species_repository.list_species()
+        all_species_final = engine.species_repository.list_species()
         
         # 获取地块级存活数据
         tile_survivors = {}
