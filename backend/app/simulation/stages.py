@@ -972,7 +972,7 @@ class TieringAndNicheStage(BaseStage):
         super().__init__(StageOrder.TIERING_AND_NICHE.value, "物种分层与生态位")
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.environment_repository import environment_repository
+        environment_repository = engine.environment_repository
         
         logger.info("物种分层...")
         ctx.emit_event("stage", "📊 物种分层与生态位分析", "生态")
