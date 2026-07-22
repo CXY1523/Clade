@@ -1802,7 +1802,6 @@ class GeneticDriftStage(BaseStage):
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
         import random
-        from ..repositories.species_repository import species_repository
         
         logger.debug("遗传漂变检查...")
         
@@ -1828,7 +1827,7 @@ class GeneticDriftStage(BaseStage):
         if ctx.genetic_drift_count > 0:
             logger.info(f"[遗传漂变] {ctx.genetic_drift_count} 个物种发生漂变")
             for sp in ctx.species_batch:
-                species_repository.upsert(sp)
+                engine.species_repository.upsert(sp)
 
 
 class AutoHybridizationStage(BaseStage):
