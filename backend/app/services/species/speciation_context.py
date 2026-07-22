@@ -90,3 +90,40 @@ def summarize_major_events(major_events: list) -> str:
             return f"{severity}级{description}"
 
     return "重大环境事件"
+
+
+def summarize_organs(organs: dict | None) -> str:
+    """生成器官系统的文本摘要，包含进化阶段信息。"""
+    organs = organs or {}
+    if not organs:
+        return "无已记录的器官系统"
+
+    summaries = []
+    for category, organ_data in organs.items():
+        if not organ_data.get("is_active", True):
+            continue
+
+        organ_type = organ_data.get("type", "未知")
+        stage = organ_data.get("evolution_stage", 4)
+        progress = organ_data.get("evolution_progress", 1.0)
+        stage_names = {0: "无", 1: "原基", 2: "初级", 3: "功能化", 4: "完善"}
+        stage_name = stage_names.get(stage, "完善")
+        category_names = {
+            "locomotion": "运动系统",
+            "sensory": "感觉系统",
+            "metabolic": "代谢系统",
+            "digestive": "消化系统",
+            "defense": "防御系统",
+            "reproductive": "生殖系统",
+        }
+        category_name = category_names.get(category, category)
+
+        if stage < 4:
+            summaries.append(
+                f"- {category_name}: {organ_type}（阶段{stage}/{stage_name}，"
+                f"进度{progress * 100:.0f}%）"
+            )
+        else:
+            summaries.append(f"- {category_name}: {organ_type}（完善）")
+
+    return "\n".join(summaries) if summaries else "无已记录的器官系统"

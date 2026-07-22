@@ -5,6 +5,7 @@ from ..speciation_context import (
     summarize_food_chain_status,
     summarize_major_events,
     summarize_map_changes,
+    summarize_organs,
 )
 
 
@@ -71,3 +72,39 @@ def test_speciation_service_keeps_compatibility_methods() -> None:
     assert service._summarize_major_events(events) == summarize_major_events(
         events
     )
+
+
+def test_organ_summary_preserves_stage_order_and_inactive_filter() -> None:
+    organs = {
+        "locomotion": {
+            "type": "鳍",
+            "evolution_stage": 2,
+            "evolution_progress": 0.456,
+        },
+        "defense": {"type": "甲壳", "is_active": False},
+        "sensory": {"type": "复眼", "evolution_stage": 4},
+    }
+
+    assert summarize_organs(organs) == (
+        "- 运动系统: 鳍（阶段2/初级，进度46%）\n"
+        "- 感觉系统: 复眼（完善）"
+    )
+
+
+def test_organ_summary_preserves_fallbacks() -> None:
+    assert summarize_organs(None) == "无已记录的器官系统"
+    assert summarize_organs({}) == "无已记录的器官系统"
+    assert summarize_organs(
+        {"defense": {"type": "甲壳", "is_active": False}}
+    ) == "无已记录的器官系统"
+    assert summarize_organs(
+        {"custom": {"evolution_stage": 3, "evolution_progress": 0.5}}
+    ) == "- custom: 未知（阶段3/功能化，进度50%）"
+
+
+def test_speciation_service_keeps_organ_summary_method() -> None:
+    service = object.__new__(SpeciationService)
+    organs = {"metabolic": {"type": "线粒体", "evolution_stage": 4}}
+    species = SimpleNamespace(organs=organs)
+
+    assert service._summarize_organs(species) == summarize_organs(organs)

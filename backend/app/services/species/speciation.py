@@ -22,6 +22,7 @@ from .speciation_context import (
     summarize_food_chain_status,
     summarize_major_events,
     summarize_map_changes,
+    summarize_organs,
 )
 from .speciation_naming import fallback_common_name, fallback_latin_name
 from .trait_config import TraitConfig, PlantTraitConfig
@@ -6152,42 +6153,7 @@ class SpeciationService:
             }
     
     def _summarize_organs(self, species: Species) -> str:
-        """生成器官系统的文本摘要，包含进化阶段信息"""
-        organs = species.organs or {}
-        
-        if not organs:
-            return "无已记录的器官系统"
-        
-        summaries = []
-        for category, organ_data in organs.items():
-            if not organ_data.get("is_active", True):
-                continue
-            
-            organ_type = organ_data.get("type", "未知")
-            stage = organ_data.get("evolution_stage", 4)  # 默认已完善
-            progress = organ_data.get("evolution_progress", 1.0)
-            
-            # 阶段描述
-            stage_names = {0: "无", 1: "原基", 2: "初级", 3: "功能化", 4: "完善"}
-            stage_name = stage_names.get(stage, "完善")
-            
-            # 构建摘要
-            category_names = {
-                "locomotion": "运动系统",
-                "sensory": "感觉系统", 
-                "metabolic": "代谢系统",
-                "digestive": "消化系统",
-                "defense": "防御系统",
-                "reproductive": "生殖系统"
-            }
-            cat_name = category_names.get(category, category)
-            
-            if stage < 4:
-                summaries.append(f"- {cat_name}: {organ_type}（阶段{stage}/{stage_name}，进度{progress*100:.0f}%）")
-            else:
-                summaries.append(f"- {cat_name}: {organ_type}（完善）")
-        
-        return "\n".join(summaries) if summaries else "无已记录的器官系统"
+        return summarize_organs(species.organs)
     
     def _summarize_prey_species(self, species: Species) -> str:
         """生成捕食关系的文本摘要，用于AI提示词
