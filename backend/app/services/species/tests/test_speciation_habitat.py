@@ -8,8 +8,10 @@ from ....repositories.environment_repository import environment_repository
 from ..speciation import SpeciationService
 from ..speciation_habitat import (
     allocate_tiles_from_clusters,
+    allocate_tiles_to_offspring,
     calculate_initial_habitat_for_child,
     calculate_suitability_for_species,
+    detect_geographic_isolation,
     find_connected_clusters,
     inherit_habitat_distribution,
 )
@@ -374,3 +376,122 @@ def test_service_connected_cluster_delegate_uses_current_adjacency() -> None:
         frozenset({1, 2}),
         frozenset({3}),
     }
+
+
+def test_geographic_isolation_handles_insufficient_tile_rates() -> None:
+    result = detect_geographic_isolation(
+        "A",
+        {"A": {7: 0.2}},
+        lambda tiles: [],
+    )
+
+    assert result == {
+        "is_isolated": False,
+        "num_clusters": 1,
+        "mortality_gradient": 0.0,
+        "clusters": [{7}],
+        "best_cluster": {7},
+    }
+
+
+def test_geographic_isolation_detects_physical_isolation_and_best_cluster() -> None:
+    result = detect_geographic_isolation(
+        "A",
+        {"A": {1: 0.1, 2: 0.2, 3: 0.7}},
+        lambda tiles: [{1, 2}, {3}],
+    )
+
+    assert result["is_isolated"] is True
+    assert result["num_clusters"] == 2
+    assert result["mortality_gradient"] == pytest.approx(0.6)
+    assert result["best_cluster"] == {1, 2}
+
+
+def test_geographic_isolation_detects_ecological_isolation_in_one_cluster() -> None:
+    result = detect_geographic_isolation(
+        "A",
+        {"A": {1: 0.1, 2: 0.4}},
+        lambda tiles: [{1, 2}],
+    )
+
+    assert result["is_isolated"] is True
+    assert result["num_clusters"] == 1
+    assert result["best_cluster"] == {1, 2}
+
+
+def test_legacy_offspring_allocation_handles_no_clusters() -> None:
+    result = allocate_tiles_to_offspring(
+        "A",
+        3,
+        lambda lineage: {"clusters": []},
+    )
+
+    assert result == [set(), set(), set()]
+
+
+def test_legacy_offspring_allocation_spreads_too_few_tiles(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(random, "shuffle", lambda values: None)
+
+    result = allocate_tiles_to_offspring(
+        "A",
+        3,
+        lambda lineage: {"clusters": [{1}, {2}]},
+    )
+
+    assert len(result) == 3
+    assert set().union(*result) == {1, 2}
+    assert sorted(len(group) for group in result) == [0, 1, 1]
+
+
+def test_legacy_offspring_allocation_splits_large_region_without_loss(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(random, "shuffle", lambda values: None)
+
+    result = allocate_tiles_to_offspring(
+        "A",
+        3,
+        lambda lineage: {"clusters": [{1, 2, 3, 4}]},
+    )
+
+    assert len(result) == 3
+    assert all(result)
+    assert set().union(*result) == {1, 2, 3, 4}
+    assert all(
+        left.isdisjoint(right)
+        for index, left in enumerate(result)
+        for right in result[index + 1 :]
+    )
+
+
+def test_service_legacy_allocator_preserves_isolation_override(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(random, "shuffle", lambda values: None)
+
+    class OverriddenSpeciationService(SpeciationService):
+        def __init__(self) -> None:
+            pass
+
+        def _detect_geographic_isolation(self, lineage_code):
+            return {"clusters": [{1}, {2}]}
+
+    result = OverriddenSpeciationService()._allocate_tiles_to_offspring("A", 2)
+
+    assert result == [{1}, {2}]
+
+
+def test_service_isolation_delegate_preserves_cluster_finder_override() -> None:
+    class OverriddenSpeciationService(SpeciationService):
+        def __init__(self) -> None:
+            self._tile_mortality_cache = {"A": {1: 0.1, 2: 0.1}}
+
+        def _find_connected_clusters(self, tile_ids):
+            return [{1}, {2}]
+
+    result = OverriddenSpeciationService()._detect_geographic_isolation("A")
+
+    assert result["is_isolated"] is True
+    assert result["clusters"] == [{1}, {2}]

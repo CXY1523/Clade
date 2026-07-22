@@ -13,6 +13,8 @@ InitialHabitatCalculator = Callable[
     [Species, Species, int, set[int] | None],
     None,
 ]
+ConnectedClusterFinder = Callable[[set[int]], list[set[int]]]
+IsolationDetector = Callable[[str], dict]
 
 
 def find_connected_clusters(
@@ -146,6 +148,164 @@ def allocate_tiles_from_clusters(
         allocations[0] = set(largest)
 
     return allocations
+
+
+def detect_geographic_isolation(
+    lineage_code: str,
+    tile_mortality_cache: dict[str, dict[int, float]],
+    connected_cluster_finder: ConnectedClusterFinder,
+) -> dict:
+    """检测物种是否存在地理隔离
+
+    【核心功能】基于地块死亡率差异判断是否存在地理隔离
+
+    地理隔离判定条件：
+    1. 物种分布在多个不连通的地块群（物理隔离）
+    2. 或者不同地块的死亡率差异显著（生态隔离）
+
+    Returns:
+        {
+            "is_isolated": bool,  # 是否存在隔离
+            "num_clusters": int,  # 隔离区域数量
+            "mortality_gradient": float,  # 死亡率梯度
+            "clusters": list[set[int]],  # 各区域的地块ID集合
+            "best_cluster": set[int],  # 最适宜分化的区域
+        }
+    """
+    tile_rates = tile_mortality_cache.get(lineage_code, {})
+
+    if len(tile_rates) < 2:
+        return {
+            "is_isolated": False,
+            "num_clusters": 1,
+            "mortality_gradient": 0.0,
+            "clusters": [set(tile_rates.keys())],
+            "best_cluster": set(tile_rates.keys()),
+        }
+
+    # 1. 计算死亡率梯度
+    rates = list(tile_rates.values())
+    mortality_gradient = max(rates) - min(rates)
+
+    # 2. 基于连通性检测物理隔离
+    clusters = connected_cluster_finder(set(tile_rates.keys()))
+
+    # 3. 基于死亡率差异检测生态隔离
+    # 如果连通但死亡率差异大，也算隔离
+    ecological_isolation = mortality_gradient > 0.25
+    physical_isolation = len(clusters) >= 2
+
+    is_isolated = physical_isolation or ecological_isolation
+
+    # 4. 确定最佳分化区域（死亡率最低的地块群）
+    if clusters:
+        # 计算每个群的平均死亡率
+        cluster_avg_rates = []
+        for cluster in clusters:
+            avg_rate = sum(tile_rates.get(t, 0.5) for t in cluster) / len(cluster)
+            cluster_avg_rates.append((cluster, avg_rate))
+
+        # 选择死亡率最低的群作为分化起源地
+        cluster_avg_rates.sort(key=lambda x: x[1])
+        best_cluster = cluster_avg_rates[0][0]
+    else:
+        best_cluster = set(tile_rates.keys())
+
+    return {
+        "is_isolated": is_isolated,
+        "num_clusters": len(clusters),
+        "mortality_gradient": mortality_gradient,
+        "clusters": clusters,
+        "best_cluster": best_cluster,
+    }
+
+
+def allocate_tiles_to_offspring(
+    parent_lineage_code: str,
+    num_offspring: int,
+    isolation_detector: IsolationDetector,
+) -> list[set[int]]:
+    """为子代分配地块（旧方法，用于回退）
+
+    【核心功能】实现基于地块的分化：
+    - 每个子代只获得部分地块
+    - 优先按地理隔离区域分配
+    - 如果没有隔离，则随机划分
+
+    Args:
+        parent_lineage_code: 父代谱系编码
+        num_offspring: 子代数量
+
+    Returns:
+        每个子代的地块ID集合列表
+    """
+    import random
+
+    geo_data = isolation_detector(parent_lineage_code)
+    clusters = geo_data["clusters"]
+
+    if not clusters:
+        return [set() for _ in range(num_offspring)]
+
+    # 所有地块
+    all_tiles = set()
+    for cluster in clusters:
+        all_tiles.update(cluster)
+
+    if len(all_tiles) < num_offspring:
+        # 地块太少，每个子代至少分一个
+        tile_list = list(all_tiles)
+        random.shuffle(tile_list)
+        allocations = [set() for _ in range(num_offspring)]
+        for i, tile in enumerate(tile_list):
+            allocations[i % num_offspring].add(tile)
+        return allocations
+
+    # 策略1：如果存在物理隔离，按隔离区域分配
+    if len(clusters) >= num_offspring:
+        # 每个子代获得一个独立区域
+        random.shuffle(clusters)
+        allocations = [clusters[i] for i in range(num_offspring)]
+        return allocations
+
+    # 策略2：如果隔离区域不足，在大区域内随机划分
+    if len(clusters) < num_offspring:
+        allocations = [set() for _ in range(num_offspring)]
+
+        # 先分配已有的隔离区域
+        for i, cluster in enumerate(clusters):
+            if i < num_offspring:
+                allocations[i] = cluster
+
+        # 从最大区域中分割出额外的区域
+        largest_idx = max(
+            range(len(allocations)),
+            key=lambda i: len(allocations[i]),
+        )
+        largest_cluster = list(allocations[largest_idx])
+
+        # 需要分割出的区域数量
+        need_more = num_offspring - len(clusters)
+        if need_more > 0 and len(largest_cluster) > 1:
+            random.shuffle(largest_cluster)
+            split_size = max(1, len(largest_cluster) // (need_more + 1))
+
+            # 从最大区域中分割
+            remaining = set(largest_cluster)
+            for i in range(num_offspring):
+                if not allocations[i]:  # 空的slot
+                    take = set(list(remaining)[:split_size])
+                    allocations[i] = take
+                    remaining -= take
+                    if not remaining:
+                        break
+
+            # 更新最大区域
+            allocations[largest_idx] = remaining
+
+        return allocations
+
+    return [all_tiles.copy() for _ in range(num_offspring)]
 
 
 def inherit_habitat_distribution(
