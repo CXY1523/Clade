@@ -2775,7 +2775,7 @@ class VegetationCoverStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.environment_repository import environment_repository
+        environment_repository = engine.environment_repository
         from ..services.geo.vegetation_cover import vegetation_cover_service
         
         logger.info("更新植被覆盖...")
