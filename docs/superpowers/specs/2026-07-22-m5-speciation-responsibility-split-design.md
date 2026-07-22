@@ -47,6 +47,19 @@ The dormant-gene subsystem contains three consecutive methods totaling about 502
 
 Move them to `speciation_dormant_genes.py` in three independently tested batches, from read-only to state-mutating. Preserve logger category, input defaults, sorting stability, mutation order, output text, data shapes, and existing exceptions.
 
+## Second Responsibility: Habitat and Geography
+
+Split habitat and geographic allocation into four independently testable behaviors, in this order:
+
+1. habitat suitability scoring and initial child-habitat selection;
+2. parent-habitat inheritance;
+3. connected-cluster discovery and cluster allocation;
+4. geographic-isolation detection and offspring tile allocation.
+
+The first batch moves suitability scoring and initial child-habitat selection to `speciation_habitat.py`. The existing service methods remain compatibility delegates. The initial-selection function accepts the existing service suitability method as an internal callback so subclass overrides keep working exactly as before.
+
+Preserve habitat filters, score constants, thresholds, stable sorting, top-ten limit, fallback order, normalization, repository calls, log text and logger category. Keep the repository singleton and current model construction; do not introduce dependency injection, schema changes, or new error handling.
+
 ## Testing and Error Handling
 
 Characterize outputs and state mutations before each move. A missing new boundary must produce the initial red test; then direct speciation regressions and one full backend/frontend gate must pass. Introduce no new catch, fallback, normalization, or error translation.
