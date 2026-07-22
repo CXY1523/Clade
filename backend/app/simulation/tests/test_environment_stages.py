@@ -311,3 +311,55 @@ class TestSimpleWeatherStage:
         # 由于仓储导入在 execute 中，我们跳过真正的执行
         # 这里仅测试阶段可以正确初始化
         assert stage_always_trigger is not None
+
+    async def test_uses_engine_environment_repository(
+        self,
+        stage_always_trigger,
+        monkeypatch,
+    ):
+        """天气地块读取和写入只使用引擎注入的环境仓库。"""
+        environment_repository_module = importlib.import_module(
+            "app.repositories.environment_repository"
+        )
+
+        class RecordingRepository:
+            def __init__(self, tiles):
+                self.tiles = tiles
+                self.calls = []
+
+            def list_tiles(self):
+                self.calls.append("list_tiles")
+                return self.tiles
+
+            def upsert_tiles(self, tiles):
+                self.calls.append(("upsert_tiles", tiles))
+
+        injected_tile = SimpleNamespace(id=1, temperature=10.0)
+        global_tile = SimpleNamespace(id=99, temperature=30.0)
+        injected_repository = RecordingRepository([injected_tile])
+        global_repository = RecordingRepository([global_tile])
+        monkeypatch.setattr(
+            environment_repository_module,
+            "environment_repository",
+            global_repository,
+        )
+        monkeypatch.setattr(random, "random", lambda: 0.0)
+        monkeypatch.setattr(random, "choice", lambda options: options[0])
+        monkeypatch.setattr(random, "sample", lambda tiles, count: tiles[:count])
+        monkeypatch.setattr(random, "uniform", lambda _minimum, _maximum: 2.0)
+
+        context = SimpleNamespace(
+            all_tiles=[],
+            emit_event=lambda *_args: None,
+        )
+        engine = SimpleNamespace(environment_repository=injected_repository)
+
+        await stage_always_trigger.execute(context, engine)
+
+        assert injected_repository.calls == [
+            "list_tiles",
+            ("upsert_tiles", [injected_tile]),
+        ]
+        assert global_repository.calls == []
+        assert injected_tile.temperature == 12.0
+        assert global_tile.temperature == 30.0
