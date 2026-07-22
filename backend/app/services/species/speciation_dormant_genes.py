@@ -1,6 +1,173 @@
 from __future__ import annotations
 
+import logging
+
 from ...models.species import Species
+
+logger = logging.getLogger(f"{__package__}.speciation")
+
+
+def process_ai_activated_genes(
+    species: Species,
+    activated_genes: list[str],
+    turn_index: int,
+) -> int:
+    """处理 AI 指定要激活的休眠基因 v2.0。"""
+    if not activated_genes:
+        return 0
+
+    if not species.dormant_genes:
+        return 0
+
+    # 导入显隐性系数
+    try:
+        from .gene_constants import (
+            DOMINANCE_EXPRESSION_FACTOR,
+            DominanceType,
+            OrganStage,
+        )
+    except ImportError:
+        DOMINANCE_EXPRESSION_FACTOR = {
+            "recessive": 0.25,
+            "codominant": 0.60,
+            "dominant": 1.0,
+            "overdominant": 1.15,
+        }
+        DominanceType = None
+        OrganStage = None
+
+    activated_count = 0
+
+    for gene_name in activated_genes:
+        # 尝试在休眠特质中查找
+        if "traits" in species.dormant_genes:
+            for trait_name, gene_data in species.dormant_genes[
+                "traits"
+            ].items():
+                # 模糊匹配：基因名包含或被包含
+                if (
+                    gene_name in trait_name or trait_name in gene_name
+                ) and not gene_data.get("activated", False):
+                    # 阻止 AI 激活有害突变
+                    mutation_effect = gene_data.get(
+                        "mutation_effect", "beneficial"
+                    )
+                    if mutation_effect in (
+                        "mildly_harmful",
+                        "harmful",
+                        "lethal",
+                    ):
+                        logger.warning(
+                            f"[AI基因激活] 阻止激活有害突变: {trait_name}"
+                        )
+                        continue
+
+                    potential_value = gene_data.get("potential_value", 8.0)
+                    dominance = gene_data.get("dominance", "codominant")
+
+                    # 应用显隐性效果
+                    if DominanceType:
+                        try:
+                            dom_type = DominanceType(dominance)
+                            expression_factor = (
+                                DOMINANCE_EXPRESSION_FACTOR.get(dom_type, 0.6)
+                            )
+                        except ValueError:
+                            expression_factor = (
+                                DOMINANCE_EXPRESSION_FACTOR.get(
+                                    dominance, 0.6
+                                )
+                            )
+                    else:
+                        expression_factor = DOMINANCE_EXPRESSION_FACTOR.get(
+                            dominance, 0.6
+                        )
+
+                    expressed_value = potential_value * expression_factor
+
+                    species.abstract_traits[trait_name] = min(
+                        15.0, expressed_value
+                    )
+                    gene_data["activated"] = True
+                    gene_data["activation_turn"] = turn_index
+                    gene_data["expressed_value"] = expressed_value
+                    activated_count += 1
+
+                    dom_label = {
+                        "dominant": "显性",
+                        "recessive": "隐性",
+                        "codominant": "共显性",
+                        "overdominant": "超显性",
+                    }.get(dominance, "")
+                    logger.info(
+                        f"[AI基因激活] {species.common_name} 激活特质: "
+                        f"{trait_name} = {expressed_value:.1f} "
+                        f"(潜力{potential_value:.1f}, {dom_label})"
+                    )
+                    break
+
+        # 尝试在休眠器官中查找
+        if "organs" in species.dormant_genes:
+            for organ_name, gene_data in species.dormant_genes[
+                "organs"
+            ].items():
+                # 检查是否正在发育或已成熟
+                dev_stage = gene_data.get("development_stage")
+                is_already_active = (
+                    gene_data.get("activated", False) and dev_stage == 3
+                )
+
+                if (
+                    gene_name in organ_name or organ_name in gene_name
+                ) and not is_already_active:
+                    organ_data = gene_data.get("organ_data", {})
+                    organ_category = organ_data.get("category", "sensory")
+
+                    # AI 激活直接跳到功能原型阶段（60%效率）
+                    if dev_stage is None or dev_stage < 2:
+                        gene_data["development_stage"] = 2
+                        gene_data["stage_start_turn"] = turn_index
+                        efficiency = 0.60
+                    else:
+                        efficiency = {
+                            0: 0.0,
+                            1: 0.25,
+                            2: 0.60,
+                            3: 1.0,
+                        }.get(dev_stage, 0.6)
+
+                    species.organs[organ_category] = {
+                        "type": organ_data.get("type", organ_name),
+                        "parameters": {
+                            **organ_data.get("parameters", {}),
+                            "efficiency_modifier": efficiency,
+                        },
+                        "acquired_turn": turn_index,
+                        "is_active": True,
+                        "maturity": efficiency,
+                        "development_stage": gene_data.get(
+                            "development_stage", 2
+                        ),
+                    }
+                    gene_data["activated"] = True
+                    gene_data["activation_turn"] = turn_index
+                    activated_count += 1
+
+                    stage_names = {
+                        0: "原基",
+                        1: "初级",
+                        2: "功能原型",
+                        3: "成熟",
+                    }
+                    logger.info(
+                        f"[AI基因激活] {species.common_name} 激活器官: "
+                        f"{organ_name} "
+                        f"({stage_names.get(gene_data.get('development_stage'), '未知')}, "
+                        f"效率{efficiency:.0%})"
+                    )
+                    break
+
+    return activated_count
 
 
 def summarize_dormant_genes(

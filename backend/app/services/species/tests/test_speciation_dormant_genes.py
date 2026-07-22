@@ -1,11 +1,48 @@
+import copy
+import logging
 from types import SimpleNamespace
 
 from ..speciation import SpeciationService
-from ..speciation_dormant_genes import summarize_dormant_genes
+from ..speciation_dormant_genes import (
+    process_ai_activated_genes,
+    summarize_dormant_genes,
+)
 
 
 def _species_with(dormant_genes: dict) -> SimpleNamespace:
     return SimpleNamespace(dormant_genes=dormant_genes)
+
+
+def _activation_species() -> SimpleNamespace:
+    return SimpleNamespace(
+        common_name="测试物种",
+        abstract_traits={},
+        organs={},
+        dormant_genes={
+            "traits": {
+                "耐寒增强": {
+                    "activated": False,
+                    "potential_value": 12.0,
+                    "dominance": "recessive",
+                },
+                "有害甲": {
+                    "activated": False,
+                    "mutation_effect": "harmful",
+                },
+            },
+            "organs": {
+                "厚甲": {
+                    "activated": False,
+                    "development_stage": 1,
+                    "organ_data": {
+                        "category": "defense",
+                        "type": "shell",
+                        "parameters": {"hardness": 2.0},
+                    },
+                }
+            },
+        },
+    )
 
 
 def test_dormant_gene_summary_reports_empty_library() -> None:
@@ -68,3 +105,84 @@ def test_speciation_service_keeps_dormant_gene_summary_method() -> None:
     assert service._summarize_dormant_genes(species) == summarize_dormant_genes(
         species
     )
+
+
+def test_ai_activated_genes_preserve_trait_and_organ_mutations() -> None:
+    species = _activation_species()
+
+    result = process_ai_activated_genes(
+        species, ["耐寒", "有害甲", "厚甲"], turn_index=9
+    )
+
+    assert result == 2
+    assert species.abstract_traits == {"耐寒增强": 3.0}
+    assert species.dormant_genes["traits"]["耐寒增强"] == {
+        "activated": True,
+        "potential_value": 12.0,
+        "dominance": "recessive",
+        "activation_turn": 9,
+        "expressed_value": 3.0,
+    }
+    assert species.dormant_genes["traits"]["有害甲"] == {
+        "activated": False,
+        "mutation_effect": "harmful",
+    }
+    assert species.dormant_genes["organs"]["厚甲"] == {
+        "activated": True,
+        "development_stage": 2,
+        "stage_start_turn": 9,
+        "activation_turn": 9,
+        "organ_data": {
+            "category": "defense",
+            "type": "shell",
+            "parameters": {"hardness": 2.0},
+        },
+    }
+    assert species.organs == {
+        "defense": {
+            "type": "shell",
+            "parameters": {
+                "hardness": 2.0,
+                "efficiency_modifier": 0.60,
+            },
+            "acquired_turn": 9,
+            "is_active": True,
+            "maturity": 0.60,
+            "development_stage": 2,
+        }
+    }
+
+
+def test_ai_activated_genes_preserve_warning_logger_category(caplog) -> None:
+    species = _activation_species()
+
+    with caplog.at_level(
+        logging.WARNING, logger="app.services.species.speciation"
+    ):
+        result = process_ai_activated_genes(species, ["有害甲"], 9)
+
+    assert result == 0
+    assert [
+        (record.name, record.getMessage()) for record in caplog.records
+    ] == [
+        (
+            "app.services.species.speciation",
+            "[AI基因激活] 阻止激活有害突变: 有害甲",
+        )
+    ]
+
+
+def test_speciation_service_keeps_ai_activated_genes_method() -> None:
+    direct_species = _activation_species()
+    service_species = copy.deepcopy(direct_species)
+    service = object.__new__(SpeciationService)
+
+    direct_result = process_ai_activated_genes(
+        direct_species, ["耐寒", "厚甲"], 9
+    )
+    service_result = service._process_ai_activated_genes(
+        service_species, ["耐寒", "厚甲"], 9
+    )
+
+    assert service_result == direct_result
+    assert vars(service_species) == vars(direct_species)
