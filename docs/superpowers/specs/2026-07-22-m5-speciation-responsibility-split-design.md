@@ -22,8 +22,8 @@ Line counts are guardrails, not the architecture by themselves. A responsibility
 Keep `SpeciationService` as the existing caller-facing facade. Extract cohesive internal function modules in increasing risk order:
 
 1. context formatting, fallback naming, and lineage-code utilities — completed;
-2. dormant-gene summarization, activation, and new-gene construction;
-3. habitat and geographic allocation;
+2. dormant-gene summarization, activation, and new-gene construction — completed;
+3. habitat and geographic allocation — completed;
 4. organ evolution and complexity handling;
 5. trait validation, trade-offs, and differentiation;
 6. batch AI payload, invocation, parsing, and fallback creation;
@@ -59,6 +59,22 @@ Split habitat and geographic allocation into four independently testable behavio
 The first batch moves suitability scoring and initial child-habitat selection to `speciation_habitat.py`. The existing service methods remain compatibility delegates. The initial-selection function accepts the existing service suitability method as an internal callback so subclass overrides keep working exactly as before.
 
 Preserve habitat filters, score constants, thresholds, stable sorting, top-ten limit, fallback order, normalization, repository calls, log text and logger category. Keep the repository singleton and current model construction; do not introduce dependency injection, schema changes, or new error handling.
+
+## Third Responsibility: Organ Evolution and Complexity
+
+Move organ and complexity handling to `speciation_organs.py` in increasing risk order:
+
+1. capability-label derivation;
+2. deterministic complexity rules and constraint lookup;
+3. gradual-evolution validation;
+4. plant organ changes;
+5. organ-evolution normalization and deduplication;
+6. embedding-based complexity inference and domain selection;
+7. organ inheritance and update orchestration.
+
+Keep the existing service methods as compatibility delegates and pass current service methods or data as internal callbacks where subclass overrides or lazy state must remain effective. Do not add an injected service, constructor dependency, public abstraction or a second organ module.
+
+The first batch extracts only capability-label derivation. Preserve the legacy English-to-Chinese mapping, inherited unknown labels, inactive-organ filtering, category priority, keyword tests, set-based deduplication and resulting list behavior. It must not change organ data or species state.
 
 ## Testing and Error Handling
 
