@@ -1659,8 +1659,6 @@ class GeneActivationStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.species_repository import species_repository
-        
         logger.info("基因激活检查...")
         ctx.emit_event("stage", "🧬 基因激活", "进化")
         
@@ -1675,7 +1673,7 @@ class GeneActivationStage(BaseStage):
             if ctx.activation_events:
                 logger.info(f"[基因激活] {len(ctx.activation_events)} 个物种发生基因激活")
                 for species in ctx.species_batch:
-                    species_repository.upsert(species)
+                    engine.species_repository.upsert(species)
         except Exception as e:
             logger.warning(f"[基因激活] 失败: {e}")
             ctx.activation_events = []
