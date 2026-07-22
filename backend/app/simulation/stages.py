@@ -2812,12 +2812,11 @@ class SavePopulationSnapshotStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.species_repository import species_repository
-        
         logger.info("保存人口快照...")
         ctx.emit_event("stage", "💾 保存种群快照", "系统")
         
         # 使用 PopulationSnapshotService 保存快照
+        species_repository = engine.species_repository
         all_species_final = species_repository.list_species()
         snapshot_service = PopulationSnapshotService(species_repository)
         snapshot_service.save_snapshots(all_species_final, ctx.turn_index)
