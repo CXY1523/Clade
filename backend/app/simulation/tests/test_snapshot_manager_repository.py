@@ -3,7 +3,7 @@
 import importlib
 from types import SimpleNamespace
 
-from ..snapshot import SnapshotManager
+from ..snapshot import SnapshotManager, SnapshotMetadata, WorldSnapshot
 
 
 class _RecordingEnvironmentRepository:
@@ -12,6 +12,7 @@ class _RecordingEnvironmentRepository:
         self.habitats = list(habitats or [])
         self.list_tiles_calls = 0
         self.latest_habitats_calls = 0
+        self.saved_states = []
 
     def list_tiles(self):
         self.list_tiles_calls += 1
@@ -20,6 +21,9 @@ class _RecordingEnvironmentRepository:
     def latest_habitats(self):
         self.latest_habitats_calls += 1
         return self.habitats
+
+    def save_state(self, state):
+        self.saved_states.append(state)
 
 
 class _RecordingSpeciesRepository:
@@ -95,3 +99,39 @@ def test_create_snapshot_uses_engine_repositories(tmp_path, monkeypatch):
     assert snapshot.tiles[0]["id"] == 11
     assert snapshot.habitats[0]["population"] == 25
     assert snapshot.species[0]["lineage_code"] == "SP007"
+
+
+def test_restore_snapshot_uses_engine_environment_repository(tmp_path, monkeypatch):
+    """Restored map state must be written through this engine's repository."""
+    environment_repository_module = importlib.import_module(
+        "app.repositories.environment_repository"
+    )
+    injected_environment_repository = _RecordingEnvironmentRepository()
+    global_environment_repository = _RecordingEnvironmentRepository()
+    monkeypatch.setattr(
+        environment_repository_module,
+        "environment_repository",
+        global_environment_repository,
+    )
+    map_state = {"sea_level": 3.5, "turn_index": 8}
+    snapshot = WorldSnapshot(
+        metadata=SnapshotMetadata(
+            snapshot_id="restore-repository-isolation",
+            created_at="2026-07-22T00:00:00",
+            turn_index=8,
+            random_seed=321,
+            mode="standard",
+        ),
+        map_state=map_state,
+    )
+    engine = SimpleNamespace(
+        environment_repository=injected_environment_repository,
+        _random_seed=0,
+        _current_mode="standard",
+    )
+
+    context = SnapshotManager(tmp_path).restore_snapshot(snapshot, engine)
+
+    assert injected_environment_repository.saved_states == [map_state]
+    assert global_environment_repository.saved_states == []
+    assert context.turn_index == 8

@@ -369,8 +369,7 @@ class SnapshotManager:
         Returns:
             恢复后的上下文
         """
-        from ..repositories.environment_repository import environment_repository
-        from ..repositories.species_repository import species_repository
+        environment_repository = engine.environment_repository
         from .context import SimulationContext
         
         logger.info(f"[Snapshot] 开始恢复快照: {snapshot.metadata.snapshot_id}")
