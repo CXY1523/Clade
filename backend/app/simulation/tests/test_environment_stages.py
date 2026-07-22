@@ -88,6 +88,62 @@ class TestMapEvolutionStage:
         assert "解析环境压力" in dep.requires_stages
         assert "modifiers" in dep.requires_fields
 
+    async def test_uses_engine_environment_repository(self, stage, monkeypatch):
+        """Map state reads and writes use only the engine repository."""
+        environment_repository_module = importlib.import_module(
+            "app.repositories.environment_repository"
+        )
+
+        class RecordingRepository:
+            def __init__(self, saved_state):
+                self.saved_state = saved_state
+                self.calls = []
+
+            def get_state(self):
+                self.calls.append("get_state")
+                return None
+
+            def save_state(self, state):
+                self.calls.append("save_state")
+                return self.saved_state
+
+        injected_state = SimpleNamespace(
+            global_avg_temperature=15.0,
+            sea_level=0.0,
+            turn_index=0,
+        )
+        module_global_state = SimpleNamespace(
+            global_avg_temperature=99.0,
+            sea_level=99.0,
+            turn_index=99,
+        )
+        injected_repository = RecordingRepository(injected_state)
+        module_global_repository = RecordingRepository(module_global_state)
+        monkeypatch.setattr(
+            environment_repository_module,
+            "environment_repository",
+            module_global_repository,
+        )
+
+        context = SimpleNamespace(
+            current_map_state=None,
+            major_events=[],
+            modifiers={},
+            turn_index=3,
+            emit_event=lambda *_args: None,
+        )
+        engine = SimpleNamespace(
+            environment_repository=injected_repository,
+            map_evolution=SimpleNamespace(advance=lambda *_args: []),
+            _use_tectonic_system=False,
+        )
+
+        await stage.execute(context, engine)
+
+        assert context.current_map_state is injected_state
+        assert injected_repository.calls == ["get_state", "save_state"]
+        assert module_global_repository.calls == []
+
 
 class TestTectonicMovementStage:
     """板块构造阶段测试"""

@@ -458,7 +458,7 @@ class MapEvolutionStage(BaseStage):
         )
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.environment_repository import environment_repository
+        environment_repository = engine.environment_repository
         
         logger.info("地图演化...")
         ctx.emit_event("stage", "🗺️ 地图演化与海平面变化", "地质")

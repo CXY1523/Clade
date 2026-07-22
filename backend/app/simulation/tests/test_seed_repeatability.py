@@ -11,6 +11,7 @@ from sqlmodel import SQLModel, Session, create_engine
 
 from ...core import database
 from ...models.environment import MapState
+from ...repositories.environment_repository import EnvironmentRepository
 from ...schemas.requests import TurnCommand
 from ...services.geo.map_evolution import MapEvolutionService
 from ..engine import SimulationEngine
@@ -52,6 +53,7 @@ async def _run_seeded_core_scenario(
         session.commit()
 
     simulation_engine = SimulationEngine.__new__(SimulationEngine)
+    simulation_engine.environment_repository = EnvironmentRepository()
     simulation_engine.turn_counter = 0
     simulation_engine._event_callback = None
     simulation_engine.environment = SimpleNamespace(

@@ -9,6 +9,7 @@ from sqlmodel import SQLModel, Session, create_engine
 
 from ...core import database
 from ...models.environment import MapState
+from ...repositories.environment_repository import EnvironmentRepository
 from ...schemas.requests import TurnCommand
 from ..engine import SimulationEngine
 from ..pipeline import Pipeline, PipelineConfig
@@ -45,6 +46,7 @@ async def test_core_stage_failure_keeps_turn_counter_and_database_unchanged(monk
         session.commit()
 
     simulation_engine = SimulationEngine.__new__(SimulationEngine)
+    simulation_engine.environment_repository = EnvironmentRepository()
     simulation_engine.turn_counter = 4
     simulation_engine._event_callback = None
     simulation_engine.environment = SimpleNamespace(
@@ -108,6 +110,7 @@ async def test_successful_turn_commits_database_and_advances_counter_once(monkey
         session.commit()
 
     simulation_engine = SimulationEngine.__new__(SimulationEngine)
+    simulation_engine.environment_repository = EnvironmentRepository()
     simulation_engine.turn_counter = 4
     simulation_engine._event_callback = None
     simulation_engine.environment = SimpleNamespace(
@@ -171,6 +174,7 @@ async def test_degradable_failure_commits_core_state_and_advances_counter(monkey
         session.commit()
 
     simulation_engine = SimulationEngine.__new__(SimulationEngine)
+    simulation_engine.environment_repository = EnvironmentRepository()
     simulation_engine.turn_counter = 4
     simulation_engine._event_callback = None
     simulation_engine.environment = SimpleNamespace(
