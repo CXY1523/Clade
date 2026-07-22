@@ -2340,8 +2340,7 @@ class SpeciationStage(BaseStage):
                 logger.info(f"[物种分化] 发生了 {len(ctx.branching_events)} 次分化")
                 
                 # 将新物种加入列表
-                from ..repositories.species_repository import species_repository
-                all_species_updated = species_repository.list_species()
+                all_species_updated = engine.species_repository.list_species()
                 new_species = [
                     sp for sp in all_species_updated
                     if sp.status == "alive" and sp.lineage_code not in {s.lineage_code for s in ctx.species_batch}
@@ -2371,7 +2370,7 @@ class SpeciationStage(BaseStage):
                 # 将新生产者/初级消费者立即集成到食物网，不等下一回合全量扫描
                 if new_species:
                     self._integrate_new_species_to_food_web(
-                        new_species, ctx, engine, species_repository
+                        new_species, ctx, engine, engine.species_repository
                     )
         
         except asyncio.TimeoutError:
