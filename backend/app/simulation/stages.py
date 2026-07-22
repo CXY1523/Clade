@@ -873,8 +873,6 @@ class FoodWebStage(BaseStage):
         self._previous_species_codes: set[str] | None = None
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.species_repository import species_repository
-        
         logger.info("维护食物网...")
         ctx.emit_event("stage", "🕸️ 维护食物网", "生态")
         
@@ -889,7 +887,7 @@ class FoodWebStage(BaseStage):
             
             # 执行食物网维护（v2增强版）
             ctx.food_web_analysis = engine.food_web_manager.maintain_food_web(
-                ctx.all_species, species_repository, ctx.turn_index,
+                ctx.all_species, engine.species_repository, ctx.turn_index,
                 tile_species_map=tile_species_map,
                 species_tiles=species_tiles,
                 previous_species_codes=previous_codes,
@@ -902,7 +900,7 @@ class FoodWebStage(BaseStage):
                     f"🍽️ 更新了 {len(food_web_changes)} 个物种的食物关系",
                     "生态"
                 )
-                ctx.all_species = species_repository.list_species()
+                ctx.all_species = engine.species_repository.list_species()
                 ctx.species_batch = [sp for sp in ctx.all_species if sp.status == "alive"]
             
             # 【新增】生成 trophic_interactions 反馈信号
