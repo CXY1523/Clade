@@ -1393,13 +1393,13 @@ class PopulationUpdateStage(BaseStage):
     def _update_resource_dynamics(self, ctx: "SimulationContext", engine: "SimulationEngine"):
         """更新资源系统动态（计算消耗并触发再生）"""
         try:
-            from ..repositories.environment_repository import environment_repository
-            
             # 使用 engine 注入的 resource_manager，避免全局单例
             resource_mgr = engine.resource_manager if engine else None
             if resource_mgr is None:
                 logger.warning("[资源动态] 资源管理器未注入，跳过资源更新")
                 return
+
+            environment_repository = engine.environment_repository
             
             # 获取所有地块
             all_tiles = environment_repository.list_tiles()
