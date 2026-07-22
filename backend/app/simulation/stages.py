@@ -1073,7 +1073,7 @@ class FinalMortalityStage(BaseStage):
         super().__init__(StageOrder.FINAL_MORTALITY.value, "最终死亡率评估")
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
-        from ..repositories.environment_repository import environment_repository
+        environment_repository = engine.environment_repository
         
         # 重新分析生态位（如有迁徙）
         if ctx.migration_count > 0:
