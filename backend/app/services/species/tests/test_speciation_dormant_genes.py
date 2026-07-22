@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from ..speciation import SpeciationService
 from ..speciation_dormant_genes import (
     process_ai_activated_genes,
+    process_ai_new_dormant_genes,
     summarize_dormant_genes,
 )
 
@@ -41,6 +42,17 @@ def _activation_species() -> SimpleNamespace:
                     },
                 }
             },
+        },
+    )
+
+
+def _new_gene_species() -> SimpleNamespace:
+    return SimpleNamespace(
+        common_name="测试物种",
+        abstract_traits={"现有特质": 8.0},
+        dormant_genes={
+            "traits": {"已有休眠": {"sentinel": True}},
+            "organs": {"已有器官": {"sentinel": True}},
         },
     )
 
@@ -182,6 +194,160 @@ def test_speciation_service_keeps_ai_activated_genes_method() -> None:
     )
     service_result = service._process_ai_activated_genes(
         service_species, ["耐寒", "厚甲"], 9
+    )
+
+    assert service_result == direct_result
+    assert vars(service_species) == vars(direct_species)
+
+
+def test_ai_new_dormant_genes_preserve_normalization_and_shapes() -> None:
+    species = _new_gene_species()
+    new_genes_data = {
+        "traits": [
+            {
+                "name": "耐寒增强",
+                "potential_value": "20",
+                "pressure_types": "cold",
+                "dominance": "invalid",
+                "mutation_effect": "invalid",
+                "description": "更耐寒",
+            },
+            {
+                "name": "脆弱性",
+                "potential_value": "bad",
+                "pressure_types": ["cold"],
+                "dominance": "dominant",
+                "mutation_effect": "harmful",
+                "target_trait": "现有特质",
+                "value_modifier": "-2.5",
+            },
+            {"name": "已有休眠"},
+            {"name": "现有特质"},
+            "invalid",
+            {"name": ""},
+        ],
+        "organs": [
+            {
+                "name": "厚甲",
+                "organ_data": {
+                    "category": "defense",
+                    "type": "shell",
+                    "parameters": ["invalid"],
+                },
+                "pressure_types": "predation",
+                "dominance": "invalid",
+                "description": "防御结构",
+            },
+            {"name": "已有器官"},
+            "invalid",
+            {"name": ""},
+        ],
+    }
+
+    result = process_ai_new_dormant_genes(species, new_genes_data, 9)
+
+    assert result == 3
+    assert species.dormant_genes["traits"]["已有休眠"] == {
+        "sentinel": True
+    }
+    assert species.dormant_genes["traits"]["耐寒增强"] == {
+        "potential_value": 15.0,
+        "activation_threshold": 0.20,
+        "pressure_types": ["competition"],
+        "exposure_count": 0,
+        "activated": False,
+        "inherited_from": "llm_speciation",
+        "dominance": "codominant",
+        "mutation_effect": "beneficial",
+        "description": "更耐寒",
+        "created_turn": 9,
+    }
+    assert species.dormant_genes["traits"]["脆弱性"] == {
+        "potential_value": 6.0,
+        "activation_threshold": 0.20,
+        "pressure_types": ["cold"],
+        "exposure_count": 0,
+        "activated": False,
+        "inherited_from": "llm_speciation",
+        "dominance": "recessive",
+        "mutation_effect": "harmful",
+        "description": "",
+        "created_turn": 9,
+        "target_trait": "现有特质",
+        "value_modifier": -2.5,
+    }
+    assert "现有特质" not in species.dormant_genes["traits"]
+    assert species.dormant_genes["organs"]["已有器官"] == {
+        "sentinel": True
+    }
+    assert species.dormant_genes["organs"]["厚甲"] == {
+        "organ_data": {
+            "category": "defense",
+            "type": "shell",
+            "parameters": {},
+        },
+        "activation_threshold": 0.25,
+        "pressure_types": ["competition", "predation"],
+        "exposure_count": 0,
+        "activated": False,
+        "inherited_from": "llm_speciation",
+        "dominance": "codominant",
+        "development_stage": None,
+        "stage_start_turn": None,
+        "description": "防御结构",
+        "created_turn": 9,
+    }
+
+
+def test_ai_new_dormant_genes_preserve_empty_input_initialization() -> None:
+    species = SimpleNamespace(
+        common_name="测试物种", abstract_traits={}, dormant_genes={}
+    )
+
+    assert process_ai_new_dormant_genes(species, {}, 4) == 0
+    assert species.dormant_genes == {}
+
+    assert process_ai_new_dormant_genes(species, {"traits": []}, 4) == 0
+    assert species.dormant_genes == {"traits": {}, "organs": {}}
+
+
+def test_ai_new_dormant_genes_preserve_logger_and_raw_list_counts(
+    caplog,
+) -> None:
+    species = SimpleNamespace(
+        common_name="测试物种", abstract_traits={}, dormant_genes={}
+    )
+    new_genes_data = {
+        "traits": [{"name": "有效特质"}, "invalid"],
+        "organs": [{"name": "眼点"}],
+    }
+
+    with caplog.at_level(
+        logging.INFO, logger="app.services.species.speciation"
+    ):
+        result = process_ai_new_dormant_genes(species, new_genes_data, 5)
+
+    assert result == 2
+    assert [
+        (record.name, record.getMessage()) for record in caplog.records
+    ] == [
+        (
+            "app.services.species.speciation",
+            "[LLM新基因] 测试物种 成功添加 2 个LLM生成的休眠基因 "
+            "(特质: 2, 器官: 1)",
+        )
+    ]
+
+
+def test_speciation_service_keeps_ai_new_dormant_genes_method() -> None:
+    data = {"traits": [{"name": "新特质"}]}
+    direct_species = _new_gene_species()
+    service_species = copy.deepcopy(direct_species)
+    service = object.__new__(SpeciationService)
+
+    direct_result = process_ai_new_dormant_genes(direct_species, data, 9)
+    service_result = service._process_ai_new_dormant_genes(
+        service_species, data, 9
     )
 
     assert service_result == direct_result
