@@ -8,6 +8,7 @@ from ..speciation import SpeciationService
 from ..speciation_habitat import (
     calculate_initial_habitat_for_child,
     calculate_suitability_for_species,
+    inherit_habitat_distribution,
 )
 
 
@@ -37,6 +38,20 @@ def _tile(
         humidity=humidity,
         resources=resources,
         is_lake=is_lake,
+    )
+
+
+def _habitat(
+    tile_id: int,
+    species_id: int,
+    population: int,
+    suitability: float,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        tile_id=tile_id,
+        species_id=species_id,
+        population=population,
+        suitability=suitability,
     )
 
 
@@ -126,3 +141,147 @@ def test_service_delegate_preserves_overridden_suitability_method(
 
     assert [row.tile_id for row in written] == [2, 1]
     assert [row.suitability for row in written] == pytest.approx([0.8, 0.2])
+
+
+def test_inheritance_transfers_assigned_population_and_writes_parent_second(
+    monkeypatch,
+) -> None:
+    parent = _species(id=1, common_name="父代")
+    child = _species(id=2, common_name="子代")
+    habitats = [
+        _habitat(10, 1, 100, 0.8),
+        _habitat(20, 1, 40, 0.5),
+    ]
+    batches = []
+    monkeypatch.setattr(
+        environment_repository,
+        "latest_habitats",
+        lambda: habitats,
+    )
+    monkeypatch.setattr(
+        environment_repository,
+        "write_habitats",
+        lambda rows: batches.append(list(rows)),
+    )
+
+    inherit_habitat_distribution(
+        parent,
+        child,
+        15,
+        assigned_tiles={10},
+        reproduction_bonus=0.4,
+    )
+
+    assert len(batches) == 2
+    assert [
+        (
+            row.tile_id,
+            row.species_id,
+            row.population,
+            row.suitability,
+            row.turn_index,
+        )
+        for row in batches[0]
+    ] == [(10, 2, 132, 0.8, 15)]
+    assert [
+        (
+            row.tile_id,
+            row.species_id,
+            row.population,
+            row.suitability,
+            row.turn_index,
+        )
+        for row in batches[1]
+    ] == [(10, 1, 0, 0.8, 15)]
+
+
+def test_inheritance_without_assignment_splits_population_without_parent_write(
+    monkeypatch,
+) -> None:
+    parent = _species(id=1, common_name="父代")
+    child = _species(id=2, common_name="子代")
+    batches = []
+    monkeypatch.setattr(
+        environment_repository,
+        "latest_habitats",
+        lambda: [_habitat(10, 1, 101, 0.5)],
+    )
+    monkeypatch.setattr(
+        environment_repository,
+        "write_habitats",
+        lambda rows: batches.append(list(rows)),
+    )
+
+    inherit_habitat_distribution(
+        parent,
+        child,
+        15,
+        reproduction_bonus=0.2,
+    )
+
+    assert len(batches) == 1
+    assert batches[0][0].population == 55
+    assert batches[0][0].species_id == 2
+
+
+def test_inheritance_uses_assigned_tiles_when_parent_tiles_do_not_overlap(
+    monkeypatch,
+) -> None:
+    parent = _species(id=1, common_name="父代")
+    child = _species(
+        id=2,
+        common_name="子代",
+        morphology_stats={"population": 9},
+    )
+    batches = []
+    monkeypatch.setattr(
+        environment_repository,
+        "latest_habitats",
+        lambda: [_habitat(10, 1, 100, 0.8)],
+    )
+    monkeypatch.setattr(
+        environment_repository,
+        "write_habitats",
+        lambda rows: batches.append(list(rows)),
+    )
+
+    inherit_habitat_distribution(
+        parent,
+        child,
+        15,
+        assigned_tiles={30, 40},
+    )
+
+    assert len(batches) == 1
+    assert {row.tile_id for row in batches[0]} == {30, 40}
+    assert {row.population for row in batches[0]} == {4}
+    assert {row.suitability for row in batches[0]} == {0.5}
+
+
+def test_service_inheritance_delegate_preserves_initial_habitat_override(
+    monkeypatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(environment_repository, "latest_habitats", lambda: [])
+
+    class OverriddenSpeciationService(SpeciationService):
+        def __init__(self) -> None:
+            pass
+
+        def _calculate_initial_habitat_for_child(
+            self,
+            child,
+            parent,
+            turn_index,
+            assigned_tiles=None,
+        ) -> None:
+            calls.append((child.id, parent.id, turn_index, assigned_tiles))
+
+    OverriddenSpeciationService()._inherit_habitat_distribution(
+        _species(id=1),
+        _species(id=2),
+        15,
+        assigned_tiles={10},
+    )
+
+    assert calls == [(2, 1, 15, {10})]

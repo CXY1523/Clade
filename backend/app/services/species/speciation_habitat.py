@@ -9,6 +9,168 @@ from ...models.species import Species
 logger = logging.getLogger(f"{__package__}.speciation")
 
 SuitabilityCalculator = Callable[[Species, Any], float]
+InitialHabitatCalculator = Callable[
+    [Species, Species, int, set[int] | None],
+    None,
+]
+
+
+def inherit_habitat_distribution(
+    parent: Species,
+    child: Species,
+    turn_index: int,
+    assigned_tiles: set[int] | None = None,
+    reproduction_bonus: float = 0.0,
+    initial_habitat_calculator: InitialHabitatCalculator | None = None,
+) -> None:
+    """子代继承父代的栖息地分布
+
+    【v3.1核心改进】基于地块的真实种群分配：
+    - 如果指定了 assigned_tiles，子代直接获得这些地块上父代的种群（地理隔离分化）
+    - 父代在这些地块上的种群会被减少
+    - 这模拟了"因地理隔离，某个区域的种群独立演化成新物种"
+    - 【v3.1新增】繁殖补偿：给新物种补偿当前回合的繁殖增长
+
+    Args:
+        parent: 父代物种
+        child: 子代物种
+        turn_index: 当前回合
+        assigned_tiles: 分配给该子代的地块集合（可选）
+        reproduction_bonus: 繁殖补偿因子（0.0-1.0），用于补偿新物种在当前回合未能繁殖的损失
+        initial_habitat_calculator: 现有服务的初始栖息地计算入口
+    """
+    from ...models.environment import HabitatPopulation
+    from ...repositories.environment_repository import environment_repository
+
+    if initial_habitat_calculator is None:
+        initial_habitat_calculator = calculate_initial_habitat_for_child
+
+    # 获取父代的栖息地分布
+    all_habitats = environment_repository.latest_habitats()
+    parent_habitats = [h for h in all_habitats if h.species_id == parent.id]
+
+    if not parent_habitats:
+        logger.warning(
+            f"[栖息地继承] 父代 {parent.common_name} 没有栖息地数据，立即为子代计算初始栖息地"
+        )
+        # 【风险修复】立即计算子代的初始栖息地，而不是等待下次快照
+        initial_habitat_calculator(child, parent, turn_index, assigned_tiles)
+        return
+
+    if child.id is None:
+        logger.error(
+            f"[栖息地继承] 严重错误：子代 {child.common_name} 没有 ID，无法继承栖息地"
+        )
+        return
+
+    # 【v3.1核心改进】根据 assigned_tiles 过滤并分配地块种群
+    child_habitats = []
+    parent_updated_habitats = []
+    inherited_count = 0
+    total_inherited_pop = 0
+    total_parent_reduced = 0
+
+    for parent_hab in parent_habitats:
+        # 如果指定了分配地块，只继承在分配范围内的地块
+        if assigned_tiles and parent_hab.tile_id not in assigned_tiles:
+            continue
+
+        # 【v3.1改进】子代直接获得该地块上的种群（地理隔离分化）
+        # 地理隔离意味着这个区域的种群"属于"新物种了
+        tile_pop = parent_hab.population if parent_hab.population else 0
+
+        if assigned_tiles:
+            # 地理隔离分化：子代获得该地块的全部种群，父代退出
+            base_child_pop = tile_pop
+            parent_remaining_pop = 0
+        else:
+            # 非地理隔离（回退到旧行为）：种群平分
+            base_child_pop = int(tile_pop * 0.5)
+            parent_remaining_pop = tile_pop - base_child_pop
+
+        # 【v3.1新增】应用繁殖补偿
+        # 新物种分化时父代已经繁殖过了，给新物种补偿这个增长
+        if reproduction_bonus > 0 and base_child_pop > 0:
+            # 补偿因子应用：new_pop = base_pop * (1 + bonus * suitability)
+            # 考虑适宜度：适宜度高的地块繁殖补偿更多
+            suitability_factor = (
+                parent_hab.suitability if parent_hab.suitability else 0.5
+            )
+            effective_bonus = reproduction_bonus * suitability_factor
+            child_pop = int(base_child_pop * (1 + effective_bonus))
+        else:
+            child_pop = base_child_pop
+
+        child_habitats.append(
+            HabitatPopulation(
+                tile_id=parent_hab.tile_id,
+                species_id=child.id,
+                population=child_pop,  # 【v3.1】直接获得该地块种群 + 繁殖补偿
+                suitability=parent_hab.suitability,  # 继承父代的适宜度
+                turn_index=turn_index,
+            )
+        )
+
+        # 【v3.1】同步减少父代在该地块的种群
+        if assigned_tiles and tile_pop > 0:
+            parent_updated_habitats.append(
+                HabitatPopulation(
+                    tile_id=parent_hab.tile_id,
+                    species_id=parent.id,
+                    population=parent_remaining_pop,
+                    suitability=parent_hab.suitability,
+                    turn_index=turn_index,
+                )
+            )
+            total_parent_reduced += tile_pop
+
+        inherited_count += 1
+        total_inherited_pop += child_pop
+
+    # 如果分配了地块但一个都没继承到（可能父代不在这些地块），使用分配的地块
+    if assigned_tiles and not child_habitats:
+        logger.warning(
+            f"[栖息地继承] {child.common_name} 分配的地块与父代不重叠，"
+            f"将使用分配的地块: {assigned_tiles}"
+        )
+        # 从 child.morphology_stats 获取分配的种群，按地块均分
+        child_total_pop = int(child.morphology_stats.get("population", 0) or 0)
+        pop_per_tile = (
+            max(1, child_total_pop // len(assigned_tiles))
+            if assigned_tiles
+            else 0
+        )
+
+        for tile_id in assigned_tiles:
+            child_habitats.append(
+                HabitatPopulation(
+                    tile_id=tile_id,
+                    species_id=child.id,
+                    population=pop_per_tile,  # 【v3.1】均分分配的种群
+                    suitability=0.5,  # 默认适宜度
+                    turn_index=turn_index,
+                )
+            )
+
+    if child_habitats:
+        environment_repository.write_habitats(child_habitats)
+        if assigned_tiles:
+            logger.info(
+                f"[基于地块分化] {child.common_name} 继承了 {len(child_habitats)}/{len(parent_habitats)} 个地块 "
+                f"(种群:{total_inherited_pop:,}, 地理隔离分化)"
+            )
+        else:
+            logger.info(
+                f"[栖息地继承] {child.common_name} 继承了 {len(child_habitats)} 个栖息地"
+            )
+
+    # 【v3.1】更新父代在分配地块上的种群（清零）
+    if parent_updated_habitats:
+        environment_repository.write_habitats(parent_updated_habitats)
+        logger.debug(
+            f"[地块分化] 父代 {parent.common_name} 在 {len(parent_updated_habitats)} 个地块上"
+            f"减少种群 {total_parent_reduced:,}（已转移给子代）"
+        )
 
 
 def calculate_initial_habitat_for_child(
