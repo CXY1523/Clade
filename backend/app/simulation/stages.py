@@ -1863,7 +1863,7 @@ class AutoHybridizationStage(BaseStage):
     
     async def execute(self, ctx: SimulationContext, engine: SimulationEngine) -> None:
         import random
-        from ..repositories.species_repository import species_repository
+        species_repository = engine.species_repository
         from ..services.species.hybridization import HybridizationService
         from ..services.species.genetic_distance import GeneticDistanceCalculator
         
