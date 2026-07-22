@@ -524,7 +524,6 @@ class TectonicMovementStage(BaseStage):
             return
         
         from ..repositories.environment_repository import environment_repository
-        from ..repositories.species_repository import species_repository
         from ..services.species.habitat_manager import habitat_manager
         from ..services.species.dispersal_engine import dispersal_engine
         
@@ -532,7 +531,7 @@ class TectonicMovementStage(BaseStage):
             ctx.emit_event("stage", "🌍 板块构造运动", "地质")
             
             # 获取物种和栖息地数据
-            all_species_for_tectonic = species_repository.list_species()
+            all_species_for_tectonic = engine.species_repository.list_species()
             alive_species = [sp for sp in all_species_for_tectonic if sp.status == "alive"]
             
             # 获取栖息地数据

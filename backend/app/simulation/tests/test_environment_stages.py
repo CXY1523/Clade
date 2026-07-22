@@ -4,9 +4,12 @@ Environment Stages Tests - 环境相关阶段测试
 测试压力解析、地图演化、板块构造等阶段。
 """
 
-import pytest
+import importlib
 import random
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
+
+import pytest
 
 
 # 标记整个模块使用 asyncio
@@ -103,6 +106,71 @@ class TestTectonicMovementStage:
         await stage.execute(mock_context, mock_engine)
         
         assert mock_context.tectonic_result is None
+
+    async def test_uses_engine_species_repository(self, stage, monkeypatch):
+        """板块计算只读取引擎注入的物种仓库。"""
+        species_repository_module = importlib.import_module(
+            "app.repositories.species_repository"
+        )
+        environment_repository_module = importlib.import_module(
+            "app.repositories.environment_repository"
+        )
+        alive_species = SimpleNamespace(status="alive", habitats=[], id=1)
+        extinct_species = SimpleNamespace(status="extinct", habitats=[], id=2)
+        list_calls = 0
+        tectonic_calls = []
+
+        def list_species():
+            nonlocal list_calls
+            list_calls += 1
+            return [alive_species, extinct_species]
+
+        tectonic_result = SimpleNamespace(
+            wilson_phase={"phase": "stable", "progress": 0.0},
+            terrain_changes=[],
+            pressure_feedback={},
+            get_major_events_summary=lambda: [],
+        )
+
+        def tectonic_step(**kwargs):
+            tectonic_calls.append(kwargs)
+            return tectonic_result
+
+        engine = SimpleNamespace(
+            _use_tectonic_system=True,
+            tectonic=SimpleNamespace(step=tectonic_step),
+            species_repository=SimpleNamespace(list_species=list_species),
+            resource_manager=SimpleNamespace(),
+        )
+        context = SimpleNamespace(
+            modifiers={},
+            tectonic_result=None,
+            turn_index=4,
+            emit_event=lambda *_args: None,
+        )
+        monkeypatch.setattr(
+            species_repository_module,
+            "species_repository",
+            SimpleNamespace(
+                list_species=lambda: (_ for _ in ()).throw(
+                    AssertionError(
+                        "TectonicMovementStage must not use the global repository"
+                    )
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            environment_repository_module,
+            "environment_repository",
+            SimpleNamespace(list_tiles=lambda: []),
+        )
+
+        await stage.execute(context, engine)
+
+        assert list_calls == 1
+        assert len(tectonic_calls) == 1
+        assert tectonic_calls[0]["species_list"] == [alive_species]
+        assert context.tectonic_result is tectonic_result
 
 
 class TestSimpleWeatherStage:
