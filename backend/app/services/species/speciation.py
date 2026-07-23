@@ -49,7 +49,7 @@ from .speciation_organs import (
     update_capabilities,
     validate_gradual_evolution,
 )
-from .speciation_traits import validate_trait_changes
+from .speciation_traits import apply_tradeoff_penalties, validate_trait_changes
 from .speciation_dormant_genes import (
     process_ai_activated_genes,
     process_ai_new_dormant_genes,
@@ -4551,27 +4551,11 @@ class SpeciationService:
         current_traits: dict[str, float],
     ) -> dict[str, float]:
         """基于自动代价计算器为增益添加权衡代价。"""
-        if not proposed_changes or not self.tradeoff_calculator:
-            return proposed_changes
-        
-        gains = {k: v for k, v in proposed_changes.items() if v > 0}
-        if not gains:
-            return proposed_changes
-        
-        try:
-            penalties = self.tradeoff_calculator.calculate_penalties(gains, current_traits or {})
-        except Exception as e:
-            logger.debug(f"[权衡计算] 计算失败，跳过自动代价: {e}")
-            return proposed_changes
-        
-        if not penalties:
-            return proposed_changes
-        
-        merged = dict(proposed_changes)
-        for trait, delta in penalties.items():
-            merged[trait] = merged.get(trait, 0.0) + delta
-        logger.debug(f"[权衡计算] 自动代价: {penalties}")
-        return merged
+        return apply_tradeoff_penalties(
+            proposed_changes,
+            current_traits,
+            self.tradeoff_calculator,
+        )
     
     def _enforce_trait_tradeoffs(
         self, 

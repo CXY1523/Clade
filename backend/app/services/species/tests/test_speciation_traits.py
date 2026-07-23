@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from ..speciation import SpeciationService
-from ..speciation_traits import validate_trait_changes
+from ..speciation_traits import apply_tradeoff_penalties, validate_trait_changes
 
 
 def _limits(
@@ -110,3 +110,72 @@ def test_service_trait_validation_delegate_uses_bound_limit_calculator() -> None
         3.5,
     ) == (True, "验证通过")
     assert calls == [3.5]
+
+
+class _TradeoffCalculator:
+    def __init__(self, penalties=None, *, error=None) -> None:
+        self.penalties = penalties
+        self.error = error
+        self.calls = []
+
+    def calculate_penalties(self, gains, current_traits):
+        self.calls.append((gains, current_traits))
+        if self.error is not None:
+            raise self.error
+        return self.penalties
+
+
+def test_tradeoff_penalties_preserve_fast_return_identity() -> None:
+    empty = {}
+    changes = {"speed": 1.0}
+    non_gains = {"speed": 0.0, "armor": -1.0}
+    calculator = _TradeoffCalculator({"armor": -0.5})
+
+    assert apply_tradeoff_penalties(empty, {}, calculator) is empty
+    assert apply_tradeoff_penalties(changes, {}, None) is changes
+    assert apply_tradeoff_penalties(non_gains, {}, calculator) is non_gains
+    assert calculator.calls == []
+
+
+def test_tradeoff_penalties_pass_only_positive_gains_and_current_traits() -> None:
+    calculator = _TradeoffCalculator({})
+    changes = {"speed": 2.0, "armor": -1.0, "social": 0.0}
+    current = {"speed": 5.0}
+
+    assert apply_tradeoff_penalties(changes, current, calculator) is changes
+    assert calculator.calls == [({"speed": 2.0}, current)]
+
+
+def test_tradeoff_penalties_use_empty_traits_and_fall_back_on_error() -> None:
+    error = RuntimeError("calculator failed")
+    calculator = _TradeoffCalculator(error=error)
+    changes = {"speed": 2.0}
+
+    assert apply_tradeoff_penalties(changes, None, calculator) is changes
+    assert calculator.calls == [({"speed": 2.0}, {})]
+
+
+def test_tradeoff_penalties_merge_existing_and_new_trait_deltas() -> None:
+    calculator = _TradeoffCalculator({"speed": -0.5, "armor": -1.25})
+    changes = {"speed": 2.0, "social": -0.2}
+
+    result = apply_tradeoff_penalties(
+        changes,
+        {"speed": 5.0},
+        calculator,
+    )
+
+    assert result == {"speed": 1.5, "social": -0.2, "armor": -1.25}
+    assert result is not changes
+    assert changes == {"speed": 2.0, "social": -0.2}
+
+
+def test_service_tradeoff_penalty_delegate_uses_current_calculator() -> None:
+    calculator = _TradeoffCalculator({"armor": -0.5})
+    service = object.__new__(SpeciationService)
+    service.tradeoff_calculator = calculator
+
+    assert service._apply_tradeoff_penalties(
+        {"speed": 1.0},
+        {"speed": 4.0},
+    ) == {"speed": 1.0, "armor": -0.5}

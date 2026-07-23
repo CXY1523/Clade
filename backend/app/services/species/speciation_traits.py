@@ -1,9 +1,40 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Any, Callable
 
 logger = logging.getLogger(f"{__package__}.speciation")
+
+
+def apply_tradeoff_penalties(
+    proposed_changes: dict[str, float],
+    current_traits: dict[str, float],
+    tradeoff_calculator: Any,
+) -> dict[str, float]:
+    """基于自动代价计算器为增益添加权衡代价。"""
+    if not proposed_changes or not tradeoff_calculator:
+        return proposed_changes
+
+    gains = {k: v for k, v in proposed_changes.items() if v > 0}
+    if not gains:
+        return proposed_changes
+
+    try:
+        penalties = tradeoff_calculator.calculate_penalties(
+            gains, current_traits or {}
+        )
+    except Exception as e:
+        logger.debug(f"[权衡计算] 计算失败，跳过自动代价: {e}")
+        return proposed_changes
+
+    if not penalties:
+        return proposed_changes
+
+    merged = dict(proposed_changes)
+    for trait, delta in penalties.items():
+        merged[trait] = merged.get(trait, 0.0) + delta
+    logger.debug(f"[权衡计算] 自动代价: {penalties}")
+    return merged
 
 
 def validate_trait_changes(
