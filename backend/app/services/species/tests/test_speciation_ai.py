@@ -1,9 +1,13 @@
+import asyncio
 from types import SimpleNamespace
+
+import pytest
 
 from .. import speciation as speciation_module
 from ..speciation import SpeciationService
 from ..speciation_ai import (
     build_batch_payload,
+    call_ai_wrapper,
     generate_rule_based_fallback,
     normalize_ai_content,
     parse_batch_results,
@@ -710,6 +714,218 @@ def test_service_batch_result_parser_delegate_preserves_fallback_override(
         "fallback",
         {"value": 3},
     )
+
+
+@pytest.mark.asyncio
+async def test_single_ai_wrapper_forwards_exact_invocation_without_callback(
+    monkeypatch,
+) -> None:
+    router = object()
+    payload = {"parent": "P"}
+    content = {"result": "ok"}
+    captured: dict = {}
+
+    async def fake_invoke_with_heartbeat(**kwargs):
+        captured.update(kwargs)
+        return {"content": content}
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.invoke_with_heartbeat",
+        fake_invoke_with_heartbeat,
+    )
+
+    result = await call_ai_wrapper(router, payload, None)
+
+    assert result is content
+    assert captured == {
+        "router": router,
+        "capability": "speciation",
+        "payload": payload,
+        "task_name": "单物种分化",
+        "heartbeat_interval": 2.0,
+        "event_callback": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_single_ai_wrapper_prefers_three_argument_callback(
+    monkeypatch,
+) -> None:
+    events: list[tuple[str, str, str]] = []
+
+    async def fake_invoke_with_heartbeat(**kwargs):
+        kwargs["event_callback"]("heartbeat", "working", "speciation")
+        return {"content": {"done": True}}
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.invoke_with_heartbeat",
+        fake_invoke_with_heartbeat,
+    )
+
+    result = await call_ai_wrapper(
+        object(),
+        {},
+        lambda event_type, message, category: events.append(
+            (event_type, message, category)
+        ),
+    )
+
+    assert result == {"done": True}
+    assert events == [("heartbeat", "working", "speciation")]
+
+
+@pytest.mark.asyncio
+async def test_single_ai_wrapper_falls_back_to_one_argument_callback(
+    monkeypatch,
+) -> None:
+    messages: list[str] = []
+
+    async def fake_invoke_with_heartbeat(**kwargs):
+        kwargs["event_callback"]("heartbeat", "legacy message", "speciation")
+        return {"content": {}}
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.invoke_with_heartbeat",
+        fake_invoke_with_heartbeat,
+    )
+
+    await call_ai_wrapper(object(), {}, lambda message: messages.append(message))
+
+    assert messages == ["legacy message"]
+
+
+@pytest.mark.asyncio
+async def test_single_ai_wrapper_schedules_coroutine_callback_once(
+    monkeypatch,
+) -> None:
+    scheduled = []
+
+    def fake_create_task(coroutine):
+        scheduled.append(coroutine)
+        coroutine.close()
+        return object()
+
+    async def async_callback(
+        _event_type: str,
+        _message: str,
+        _category: str,
+    ) -> None:
+        return None
+
+    async def fake_invoke_with_heartbeat(**kwargs):
+        kwargs["event_callback"]("heartbeat", "working", "speciation")
+        return {"content": {}}
+
+    monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.invoke_with_heartbeat",
+        fake_invoke_with_heartbeat,
+    )
+
+    await call_ai_wrapper(object(), {}, async_callback)
+
+    assert len(scheduled) == 1
+
+
+@pytest.mark.asyncio
+async def test_single_ai_wrapper_isolates_callback_errors(
+    monkeypatch,
+    caplog,
+) -> None:
+    def broken_callback(*_args):
+        raise RuntimeError("callback failed")
+
+    async def fake_invoke_with_heartbeat(**kwargs):
+        kwargs["event_callback"]("heartbeat", "working", "speciation")
+        return {"content": {"continued": True}}
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.invoke_with_heartbeat",
+        fake_invoke_with_heartbeat,
+    )
+
+    result = await call_ai_wrapper(object(), {}, broken_callback)
+
+    assert result == {"continued": True}
+    assert "[Speciation] 心跳回调失败: callback failed" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [asyncio.TimeoutError(), RuntimeError("boom")])
+async def test_single_ai_wrapper_returns_empty_for_invocation_errors(
+    monkeypatch,
+    error: Exception,
+) -> None:
+    async def fake_invoke_with_heartbeat(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.invoke_with_heartbeat",
+        fake_invoke_with_heartbeat,
+    )
+
+    assert await call_ai_wrapper(object(), {}, None) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (["not", "a", "dict"], {}),
+        ({"content": None}, None),
+    ],
+)
+async def test_single_ai_wrapper_preserves_response_content_rules(
+    monkeypatch,
+    response,
+    expected,
+) -> None:
+    async def fake_invoke_with_heartbeat(**_kwargs):
+        return response
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.invoke_with_heartbeat",
+        fake_invoke_with_heartbeat,
+    )
+
+    assert await call_ai_wrapper(object(), {}, None) == expected
+
+
+@pytest.mark.asyncio
+async def test_service_single_ai_wrapper_delegate_preserves_router(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    sentinel = {"delegated": True}
+
+    async def fake_call_ai_wrapper(router, payload, stream_callback):
+        captured.update(
+            {
+                "router": router,
+                "payload": payload,
+                "stream_callback": stream_callback,
+            }
+        )
+        return sentinel
+
+    monkeypatch.setattr(
+        speciation_module,
+        "call_ai_wrapper",
+        fake_call_ai_wrapper,
+    )
+    service = object.__new__(SpeciationService)
+    service.router = object()
+    payload = {"test": True}
+    callback = lambda _message: None
+
+    result = await service._call_ai_wrapper(payload, callback)
+
+    assert result is sentinel
+    assert captured == {
+        "router": service.router,
+        "payload": payload,
+        "stream_callback": callback,
+    }
 
 
 def test_ai_normalization_preserves_non_dict_identity() -> None:

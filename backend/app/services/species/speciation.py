@@ -26,6 +26,7 @@ from .speciation_context import (
 )
 from .speciation_ai import (
     build_batch_payload,
+    call_ai_wrapper,
     generate_rule_based_fallback,
     normalize_ai_content,
     parse_batch_results,
@@ -2021,43 +2022,7 @@ class SpeciationService:
 
     async def _call_ai_wrapper(self, payload: dict, stream_callback: Callable[[str], Awaitable[None] | None] | Callable[[str, str, str], None] | None) -> dict:
         """AI调用包装器（带心跳检测）"""
-        from ...ai.streaming_helper import invoke_with_heartbeat
-        import asyncio
-        
-        def heartbeat_callback(event_type: str, message: str, category: str):
-            if stream_callback:
-                try:
-                    # 尝试以3参数方式调用 (event_type, message, category)
-                    # 这是为了兼容 SpeciationStage 传入的完整事件回调
-                    try:
-                        result = stream_callback(event_type, message, category)
-                    except TypeError:
-                        # 如果失败，回退到1参数方式 (message only)
-                        # 用于兼容旧的仅接收消息的回调
-                        result = stream_callback(message)
-                    
-                    if asyncio.iscoroutine(result):
-                        asyncio.create_task(result)
-                except Exception as e:
-                    # 避免回调错误中断主流程，但记录日志
-                    logger.warning(f"[Speciation] 心跳回调失败: {e}")
-        
-        try:
-            response = await invoke_with_heartbeat(
-                router=self.router,
-                capability="speciation",
-                payload=payload,
-                task_name="单物种分化",
-                heartbeat_interval=2.0,
-                event_callback=heartbeat_callback if stream_callback else None,
-            )
-        except asyncio.TimeoutError:
-            logger.error("[分化] 单个请求超时")
-            return {}
-        except Exception as e:
-            logger.error(f"[分化] 请求异常: {e}")
-            return {}
-        return response.get("content") if isinstance(response, dict) else {}
+        return await call_ai_wrapper(self.router, payload, stream_callback)
 
     # 保留 process 方法以兼容旧调用，直到全部迁移
     def process(self, *args, **kwargs):
