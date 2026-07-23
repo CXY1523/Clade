@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from ..speciation_process import (
+    enhance_rule_fallback_descriptions,
     execute_active_ai_batches,
     generate_background_results,
     partition_speciation_entries,
@@ -322,3 +323,102 @@ async def test_active_ai_batches_repeat_batch_exception_per_entry() -> None:
     ]
     assert results[0] is batch_error
     assert results[1] is batch_error
+
+
+@pytest.mark.asyncio
+async def test_fallback_description_enhancement_preserves_empty_noop() -> None:
+    class UnexpectedEnhancer:
+        def queue_for_enhancement(self, **_kwargs):
+            pytest.fail("empty fallback list must not queue work")
+
+        async def process_queue_async(self, **_kwargs):
+            pytest.fail("empty fallback list must not process work")
+
+    pending: list[tuple] = []
+
+    await enhance_rule_fallback_descriptions(
+        pending,
+        description_enhancer=UnexpectedEnhancer(),
+        upsert_species=lambda _species: pytest.fail(
+            "empty fallback list must not persist work"
+        ),
+    )
+
+    assert pending == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_description_enhancement_preserves_order_and_args(
+) -> None:
+    species_one = object()
+    species_two = object()
+    parent_one = object()
+    parent_two = object()
+    enhanced_one = object()
+    enhanced_two = object()
+    pending = [
+        (species_one, parent_one, "type-one"),
+        (species_two, parent_two, "type-two"),
+    ]
+    queued: list[dict] = []
+    process_kwargs: dict = {}
+    persisted: list[object] = []
+
+    class Enhancer:
+        def queue_for_enhancement(self, **kwargs):
+            queued.append(kwargs)
+
+        async def process_queue_async(self, **kwargs):
+            process_kwargs.update(kwargs)
+            return [enhanced_one, enhanced_two]
+
+    await enhance_rule_fallback_descriptions(
+        pending,
+        description_enhancer=Enhancer(),
+        upsert_species=persisted.append,
+    )
+
+    assert queued == [
+        {
+            "species": species_one,
+            "parent": parent_one,
+            "speciation_type": "type-one",
+            "is_hybrid": False,
+        },
+        {
+            "species": species_two,
+            "parent": parent_two,
+            "speciation_type": "type-two",
+            "is_hybrid": False,
+        },
+    ]
+    assert process_kwargs == {
+        "max_items": 20,
+        "timeout_per_item": 25.0,
+    }
+    assert persisted == [enhanced_one, enhanced_two]
+    assert pending == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_description_enhancement_swallows_failure_and_clears(
+) -> None:
+    pending = [(object(), object(), "type-one")]
+    processing_error = RuntimeError("enhancement failed")
+
+    class FailingEnhancer:
+        def queue_for_enhancement(self, **_kwargs):
+            return None
+
+        async def process_queue_async(self, **_kwargs):
+            raise processing_error
+
+    await enhance_rule_fallback_descriptions(
+        pending,
+        description_enhancer=FailingEnhancer(),
+        upsert_species=lambda _species: pytest.fail(
+            "failed enhancement must not persist"
+        ),
+    )
+
+    assert pending == []

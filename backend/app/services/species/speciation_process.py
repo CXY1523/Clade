@@ -7,6 +7,46 @@ from typing import Any, Callable
 logger = logging.getLogger(f"{__package__}.speciation")
 
 
+async def enhance_rule_fallback_descriptions(
+    rule_fallback_species: list[tuple[Any, Any, str]],
+    *,
+    description_enhancer: Any,
+    upsert_species: Callable[[Any], Any],
+) -> None:
+    """Enhance queued rule-generated species and always clear attempted work."""
+    if rule_fallback_species:
+        logger.info(
+            f"[描述增强] 开始处理 {len(rule_fallback_species)} 个规则生成物种的描述增强"
+        )
+        try:
+            # 将物种加入增强队列
+            for species, parent, speciation_type in rule_fallback_species:
+                description_enhancer.queue_for_enhancement(
+                    species=species,
+                    parent=parent,
+                    speciation_type=speciation_type,
+                    is_hybrid=False,
+                )
+
+            # 批量处理增强队列
+            enhanced_list = await description_enhancer.process_queue_async(
+                max_items=20,  # 每回合最多处理20个
+                timeout_per_item=25.0,
+            )
+
+            # 保存增强后的物种描述
+            for enhanced_species in enhanced_list:
+                upsert_species(enhanced_species)
+
+            logger.info(
+                f"[描述增强] 完成 {len(enhanced_list)}/{len(rule_fallback_species)} 个物种描述增强"
+            )
+        except Exception as e:
+            logger.error(f"[描述增强] 处理失败: {e}")
+        finally:
+            rule_fallback_species.clear()
+
+
 async def execute_active_ai_batches(
     active_batch: list[dict],
     *,

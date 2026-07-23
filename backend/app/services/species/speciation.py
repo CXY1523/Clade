@@ -38,6 +38,7 @@ from .speciation_lineage import (
     next_lineage_code,
 )
 from .speciation_process import (
+    enhance_rule_fallback_descriptions,
     execute_active_ai_batches,
     generate_background_results,
     partition_speciation_entries,
@@ -1731,33 +1732,11 @@ class SpeciationService:
             )
         
         # 【描述增强】处理规则fallback物种的描述增强
-        if self._rule_fallback_species:
-            logger.info(f"[描述增强] 开始处理 {len(self._rule_fallback_species)} 个规则生成物种的描述增强")
-            try:
-                # 将物种加入增强队列
-                for species, parent, speciation_type in self._rule_fallback_species:
-                    self.description_enhancer.queue_for_enhancement(
-                        species=species,
-                        parent=parent,
-                        speciation_type=speciation_type,
-                        is_hybrid=False,
-                    )
-                
-                # 批量处理增强队列
-                enhanced_list = await self.description_enhancer.process_queue_async(
-                    max_items=20,  # 每回合最多处理20个
-                    timeout_per_item=25.0,
-                )
-                
-                # 保存增强后的物种描述
-                for enhanced_species in enhanced_list:
-                    species_repository.upsert(enhanced_species)
-                
-                logger.info(f"[描述增强] 完成 {len(enhanced_list)}/{len(self._rule_fallback_species)} 个物种描述增强")
-            except Exception as e:
-                logger.error(f"[描述增强] 处理失败: {e}")
-            finally:
-                self._rule_fallback_species.clear()
+        await enhance_rule_fallback_descriptions(
+            self._rule_fallback_species,
+            description_enhancer=self.description_enhancer,
+            upsert_species=species_repository.upsert,
+        )
             
         return new_species_events
 
