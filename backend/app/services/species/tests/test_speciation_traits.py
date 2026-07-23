@@ -1,7 +1,11 @@
 from types import SimpleNamespace
 
 from ..speciation import SpeciationService
-from ..speciation_traits import apply_tradeoff_penalties, validate_trait_changes
+from ..speciation_traits import (
+    apply_tradeoff_penalties,
+    clamp_traits_to_limit,
+    validate_trait_changes,
+)
 
 
 def _limits(
@@ -179,3 +183,62 @@ def test_service_tradeoff_penalty_delegate_uses_current_calculator() -> None:
         {"speed": 1.0},
         {"speed": 4.0},
     ) == {"speed": 1.0, "armor": -0.5}
+
+
+def test_trait_clamp_caps_specialized_values_and_rounds() -> None:
+    result = clamp_traits_to_limit(
+        {"speed": 12.345, "armor": 1.236},
+        {"speed": 10.0, "armor": 1.0},
+        2.0,
+        lambda level: _limits(specialized=10.0, base=20.0),
+    )
+
+    assert result == {"speed": 10.0, "armor": 1.24}
+
+
+def test_trait_clamp_reduces_increases_proportionally_to_parent_plus_five() -> None:
+    result = clamp_traits_to_limit(
+        {"speed": 10.0, "armor": 10.0},
+        {"speed": 5.0, "armor": 5.0},
+        2.0,
+        lambda level: _limits(),
+    )
+
+    assert result == {"speed": 7.5, "armor": 7.5}
+
+
+def test_trait_clamp_globally_scales_when_no_increase_can_absorb_excess() -> None:
+    result = clamp_traits_to_limit(
+        {"speed": 10.0, "armor": 10.0},
+        {"speed": 10.0, "armor": 10.0},
+        2.0,
+        lambda level: _limits(total=10.0),
+    )
+
+    assert result == {"speed": 5.0, "armor": 5.0}
+
+
+def test_trait_clamp_keeps_first_two_specializations_on_stable_tie() -> None:
+    traits = {"speed": 8.0, "armor": 8.0, "social": 8.0}
+
+    assert clamp_traits_to_limit(
+        traits,
+        traits,
+        2.0,
+        lambda level: _limits(base=5.0),
+    ) == {"speed": 8.0, "armor": 8.0, "social": 5.0}
+
+
+def test_service_trait_clamp_delegate_uses_bound_limit_calculator() -> None:
+    calls = []
+    service = object.__new__(SpeciationService)
+    service.trophic_calculator = SimpleNamespace(
+        get_attribute_limits=lambda level: calls.append(level) or _limits()
+    )
+
+    assert service._clamp_traits_to_limit(
+        {"speed": 3.0},
+        {"speed": 2.0},
+        4.0,
+    ) == {"speed": 3.0}
+    assert calls == [4.0]

@@ -37,6 +37,82 @@ def apply_tradeoff_penalties(
     return merged
 
 
+def clamp_traits_to_limit(
+    traits: dict,
+    parent_traits: dict,
+    trophic_level: float,
+    get_attribute_limits: Callable[[float], dict],
+) -> dict:
+    """智能钳制属性到营养级限制范围内
+
+    策略：
+    1. 单个属性不超过特化上限
+    2. 属性总和不超过营养级上限和父代+5.0
+    3. 最多2个属性超过基础上限
+    """
+    limits = get_attribute_limits(trophic_level)
+
+    clamped = dict(traits)
+
+    # 1. 钳制单个属性到特化上限
+    for k, v in clamped.items():
+        if v > limits["specialized"]:
+            clamped[k] = limits["specialized"]
+
+    # 2. 检查并钳制总和
+    current_sum = sum(clamped.values())
+    parent_sum = sum(parent_traits.values())
+
+    # 总和最多增加5.0（保守的演化步长，比原本允许的8更严格）
+    max_increase = 5.0
+    target_max_sum = min(limits["total"], parent_sum + max_increase)
+
+    if current_sum > target_max_sum:
+        # 计算需要缩减的量
+        excess = current_sum - target_max_sum
+        # 只缩减增加的属性（保持权衡原则）
+        increased_traits = {
+            k: v
+            for k, v in clamped.items()
+            if v > parent_traits.get(k, 0)
+        }
+
+        if increased_traits:
+            # 按增加量比例分配缩减（增加多的缩减多）
+            total_increase = sum(
+                v - parent_traits.get(k, 0)
+                for k, v in increased_traits.items()
+            )
+            if total_increase > 0:
+                for k, v in increased_traits.items():
+                    increase = v - parent_traits.get(k, 0)
+                    reduction = excess * (increase / total_increase)
+                    clamped[k] = max(parent_traits.get(k, 0), v - reduction)
+
+        # 如果还是超了（说明没有增加的属性或不足以缩减），全局缩放
+        current_sum = sum(clamped.values())
+        if current_sum > target_max_sum:
+            scale = target_max_sum / current_sum
+            for k in clamped:
+                clamped[k] *= scale
+
+    # 3. 确保最多2个属性超过基础上限
+    base_limit = limits["base"]
+    specialized_traits = [
+        (k, v) for k, v in clamped.items() if v > base_limit
+    ]
+    if len(specialized_traits) > 2:
+        # 保留最高的2个，其余降到基础上限
+        specialized_traits.sort(key=lambda x: x[1], reverse=True)
+        keep_specialized = {k for k, _ in specialized_traits[:2]}
+
+        for k, v in clamped.items():
+            if v > base_limit and k not in keep_specialized:
+                clamped[k] = base_limit
+
+    return {k: round(v, 2) for k, v in clamped.items()}
+
+
 def validate_trait_changes(
     old_traits: dict,
     new_traits: dict,
