@@ -6,6 +6,8 @@ from .. import speciation_process as speciation_process_module
 from ..speciation_process import (
     build_offspring_ai_entry,
     enhance_rule_fallback_descriptions,
+    evaluate_candidate_eligibility,
+    evaluate_environmental_pressure,
     execute_active_ai_batches,
     generate_background_results,
     materialize_active_result,
@@ -1505,3 +1507,307 @@ def test_candidate_state_normalization_preserves_cache_fallback_filters(
     assert work.is_isolated is False
     assert work.mortality_gradient == 0.0
     assert work.clusters == []
+
+
+def _candidate_work(
+    *,
+    candidate_data: dict | None = None,
+    candidate_population: int = 500,
+    death_rate: float = 0.2,
+    is_isolated: bool = False,
+) -> speciation_process_module._CandidateWork:
+    return speciation_process_module._CandidateWork(
+        candidate_data=candidate_data,
+        candidate_tiles=set(),
+        tile_populations={},
+        tile_mortality={},
+        global_population=candidate_population,
+        candidate_population=candidate_population,
+        death_rate=death_rate,
+        is_isolated=is_isolated,
+        mortality_gradient=0.0,
+        clusters=[],
+    )
+
+
+def _candidate_config(**overrides) -> SimpleNamespace:
+    values = {
+        "cooldown_turns": 10,
+        "early_skip_cooldown_turns": 10,
+        "pressure_threshold_early": 0.5,
+        "resource_threshold_early": 0.5,
+        "evo_potential_threshold_early": 0.8,
+        "pressure_threshold_late": 0.7,
+        "resource_threshold_late": 0.7,
+        "evo_potential_threshold_late": 0.9,
+        "radiation_base_chance": 0.15,
+        "radiation_pop_ratio_early": 0.8,
+        "radiation_pop_ratio_late": 1.2,
+        "radiation_early_bonus": 0.25,
+        "radiation_max_chance_early": 0.6,
+        "radiation_max_chance_late": 0.4,
+        "no_isolation_penalty_early": 0.95,
+        "no_isolation_penalty_late": 0.8,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _candidate_species(
+    *,
+    evolution_potential: float = 0.5,
+    speciation_pressure: float = 0.0,
+    last_speciation_turn: int = -999,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        common_name="Parent",
+        hidden_traits={"evolution_potential": evolution_potential},
+        morphology_stats={
+            "speciation_pressure": speciation_pressure,
+            "last_speciation_turn": last_speciation_turn,
+            "milestone_progress": 0.25,
+        },
+    )
+
+
+def _eligibility_result(
+    *,
+    resource_pressure: float = 0.2,
+    niche_overlap: float = 0.3,
+    niche_saturation: float = 0.4,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        resource_pressure=resource_pressure,
+        niche_overlap=niche_overlap,
+        niche_saturation=niche_saturation,
+    )
+
+
+def test_candidate_eligibility_preserves_threshold_values_and_early_bypass(
+) -> None:
+    species = _candidate_species(last_speciation_turn=4)
+    work = evaluate_candidate_eligibility(
+        _candidate_work(
+            candidate_population=500,
+            is_isolated=True,
+        ),
+        species=species,
+        result=_eligibility_result(
+            resource_pressure=0.6,
+            niche_overlap=0.8,
+            niche_saturation=0.9,
+        ),
+        turn_index=5,
+        average_pressure=0.7,
+        spec_config=_candidate_config(),
+        calculate_speciation_threshold=lambda species_arg, turn: (
+            100
+            if (species_arg, turn) == (species, 5)
+            else pytest.fail("threshold inputs changed")
+        ),
+    )
+
+    assert work is not None
+    assert work.survivors == 500
+    assert work.resource_pressure == 0.6
+    assert work.niche_overlap == 0.8
+    assert work.niche_saturation == 0.9
+    assert work.base_threshold == 100
+    assert work.min_population == int(100 * 0.7 * 0.8 * 1.1)
+    assert work.evo_potential == 0.5
+    assert work.speciation_pressure == 0.0
+
+
+@pytest.mark.parametrize(
+    ("work", "species", "turn_index"),
+    [
+        (
+            _candidate_work(candidate_population=100),
+            _candidate_species(),
+            20,
+        ),
+        (
+            _candidate_work(candidate_population=500),
+            _candidate_species(last_speciation_turn=15),
+            20,
+        ),
+        (
+            _candidate_work(candidate_population=500),
+            _candidate_species(evolution_potential=0.14),
+            20,
+        ),
+    ],
+    ids=["population", "cooldown", "potential"],
+)
+def test_candidate_eligibility_preserves_each_early_return(
+    work,
+    species,
+    turn_index: int,
+) -> None:
+    assert evaluate_candidate_eligibility(
+        work,
+        species=species,
+        result=_eligibility_result(),
+        turn_index=turn_index,
+        average_pressure=0.0,
+        spec_config=_candidate_config(),
+        calculate_speciation_threshold=lambda *_args: 100,
+    ) is None
+
+
+def _eligible_work(
+    *,
+    candidate_data: dict | None = None,
+    candidate_population: int = 100,
+    death_rate: float = 0.2,
+    is_isolated: bool = False,
+    speciation_pressure: float = 0.0,
+) -> speciation_process_module._CandidateWork:
+    return speciation_process_module._CandidateWork(
+        candidate_data=candidate_data,
+        candidate_tiles=set(),
+        tile_populations={},
+        tile_mortality={},
+        global_population=candidate_population,
+        candidate_population=candidate_population,
+        death_rate=death_rate,
+        is_isolated=is_isolated,
+        mortality_gradient=0.0,
+        clusters=[],
+        survivors=candidate_population,
+        resource_pressure=0.0,
+        niche_overlap=0.2,
+        niche_saturation=0.2,
+        base_threshold=100,
+        min_population=100,
+        evo_potential=0.2,
+        speciation_pressure=speciation_pressure,
+    )
+
+
+def test_environmental_pressure_isolation_skips_plant_and_random_checks(
+) -> None:
+    work = evaluate_environmental_pressure(
+        _eligible_work(candidate_data={}, is_isolated=True),
+        species=_candidate_species(),
+        is_early_game=False,
+        average_pressure=0.0,
+        spec_config=_candidate_config(),
+        is_plant=lambda _species: False,
+        plant_evolution_service=SimpleNamespace(),
+        random_random=lambda: pytest.fail(
+            "isolated candidate must not draw radiation randomness"
+        ),
+    )
+
+    assert work is not None
+    assert work.speciation_pressure == 0.0
+
+
+def test_environmental_pressure_preserves_plant_milestone_short_circuit(
+) -> None:
+    species = _candidate_species()
+    milestone = SimpleNamespace(id="root", name="Root")
+    calls: list[tuple] = []
+    service = SimpleNamespace(
+        get_next_milestone=lambda species_arg: (
+            calls.append(("get", species_arg)) or milestone
+        ),
+        check_milestone_requirements=lambda species_arg, milestone_id: (
+            calls.append(("check", species_arg, milestone_id))
+            or (True, 1.0, None)
+        ),
+    )
+
+    work = evaluate_environmental_pressure(
+        _eligible_work(candidate_data={}),
+        species=species,
+        is_early_game=False,
+        average_pressure=0.0,
+        spec_config=_candidate_config(),
+        is_plant=lambda species_arg: (
+            calls.append(("is_plant", species_arg)) or True
+        ),
+        plant_evolution_service=service,
+        random_random=lambda: pytest.fail(
+            "met milestone must suppress radiation randomness"
+        ),
+    )
+
+    assert work is not None
+    assert work.speciation_pressure == 0.0
+    assert calls == [
+        ("is_plant", species),
+        ("get", species),
+        ("check", species, "root"),
+    ]
+
+
+def test_environmental_pressure_updates_readiness_before_radiation_draw(
+) -> None:
+    species = _candidate_species()
+    milestone = SimpleNamespace(id="leaf", name="Leaf")
+    calls: list[str] = []
+    service = SimpleNamespace(
+        get_next_milestone=lambda _species: (
+            calls.append("get") or milestone
+        ),
+        check_milestone_requirements=lambda *_args: (
+            calls.append("check") or (False, 0.9, None)
+        ),
+    )
+
+    work = evaluate_environmental_pressure(
+        _eligible_work(candidate_data={}, candidate_population=200),
+        species=species,
+        is_early_game=False,
+        average_pressure=0.0,
+        spec_config=_candidate_config(),
+        is_plant=lambda _species: calls.append("is_plant") or True,
+        plant_evolution_service=service,
+        random_random=lambda: calls.append("random") or 1.0,
+    )
+
+    assert work is not None
+    assert work.speciation_pressure == pytest.approx(0.09)
+    assert calls == ["is_plant", "get", "check", "random"]
+
+
+def test_environmental_pressure_preserves_population_random_short_circuit(
+) -> None:
+    work = evaluate_environmental_pressure(
+        _eligible_work(candidate_data={}, candidate_population=100),
+        species=_candidate_species(),
+        is_early_game=False,
+        average_pressure=0.0,
+        spec_config=_candidate_config(),
+        is_plant=lambda _species: False,
+        plant_evolution_service=SimpleNamespace(),
+        random_random=lambda: pytest.fail(
+            "population guard must short-circuit before random draw"
+        ),
+    )
+
+    assert work is not None
+
+
+def test_environmental_pressure_preserves_legacy_death_rate_return_order(
+) -> None:
+    calls: list[str] = []
+    work = evaluate_environmental_pressure(
+        _eligible_work(
+            candidate_data=None,
+            candidate_population=200,
+            death_rate=0.9,
+        ),
+        species=_candidate_species(),
+        is_early_game=False,
+        average_pressure=0.0,
+        spec_config=_candidate_config(),
+        is_plant=lambda _species: False,
+        plant_evolution_service=SimpleNamespace(),
+        random_random=lambda: calls.append("random") or 1.0,
+    )
+
+    assert work is None
+    assert calls == ["random"]

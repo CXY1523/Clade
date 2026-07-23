@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 
@@ -20,6 +20,14 @@ class _CandidateWork:
     is_isolated: bool
     mortality_gradient: float
     clusters: list
+    survivors: int = 0
+    resource_pressure: float = 0.0
+    niche_overlap: float = 0.0
+    niche_saturation: float = 0.0
+    base_threshold: int = 0
+    min_population: int = 0
+    evo_potential: float = 0.0
+    speciation_pressure: float = 0.0
 
 
 def normalize_candidate_state(
@@ -168,6 +176,307 @@ def normalize_candidate_state(
         mortality_gradient=mortality_gradient,
         clusters=clusters,
     )
+
+
+def evaluate_candidate_eligibility(
+    work: _CandidateWork,
+    *,
+    species: Any,
+    result: Any,
+    turn_index: int,
+    average_pressure: float,
+    spec_config: Any,
+    calculate_speciation_threshold: Callable[[Any, int], int],
+) -> _CandidateWork | None:
+    """Apply population, cooldown and evolution-potential gates."""
+    candidate_population = work.candidate_population
+    survivors = candidate_population
+    resource_pressure = result.resource_pressure
+    niche_overlap = result.niche_overlap
+    niche_saturation = getattr(result, "niche_saturation", 0.0)
+    base_threshold = calculate_speciation_threshold(species, turn_index)
+
+    threshold_multiplier = 1.0
+    if work.is_isolated:
+        threshold_multiplier *= 0.7
+    else:
+        threshold_multiplier *= 1.1
+
+    if candidate_population > base_threshold * 3:
+        threshold_multiplier *= 0.8
+    elif candidate_population > base_threshold * 2:
+        threshold_multiplier *= 0.9
+
+    if niche_overlap > 0.7:
+        threshold_multiplier *= 1.1
+    if niche_saturation > 0.85 and not work.is_isolated:
+        threshold_multiplier *= 1.1
+
+    min_population = int(base_threshold * threshold_multiplier)
+    if candidate_population < min_population:
+        logger.debug(
+            f"[分化跳过-种群不足] {species.common_name}: "
+            f"种群{candidate_population:,} < 门槛{min_population:,}"
+        )
+        return None
+
+    evo_potential = species.hidden_traits.get(
+        "evolution_potential",
+        0.5,
+    )
+    speciation_pressure = (
+        species.morphology_stats.get("speciation_pressure", 0.0) or 0.0
+    )
+    cooldown = spec_config.cooldown_turns
+    last_speciation_turn = species.morphology_stats.get(
+        "last_speciation_turn",
+        -999,
+    )
+    turns_since_speciation = turn_index - last_speciation_turn
+
+    if (
+        turn_index >= spec_config.early_skip_cooldown_turns
+        and turns_since_speciation < cooldown
+    ):
+        logger.debug(
+            f"[分化冷却] {species.common_name} 仍在冷却期 "
+            f"({turns_since_speciation}/{cooldown}回合)"
+        )
+        return None
+    if (
+        turn_index < spec_config.early_skip_cooldown_turns
+        and turns_since_speciation < cooldown
+    ):
+        logger.debug(
+            f"[早期分化] turn={turn_index} < "
+            f"{spec_config.early_skip_cooldown_turns}"
+            "，跳过冷却期检查"
+        )
+
+    if evo_potential < 0.15 and speciation_pressure < 0.10:
+        logger.debug(
+            f"[分化跳过-潜力不足] {species.common_name}: "
+            f"演化潜力{evo_potential:.2f} < 0.15, "
+            f"累积压力{speciation_pressure:.2f} < 0.10"
+        )
+        return None
+
+    logger.info(
+        f"[分化候选] {species.common_name}: "
+        f"turn={turn_index}, 种群={candidate_population:,}, "
+        f"门槛={min_population:,} "
+        f"(base={base_threshold:,}, "
+        f"multiplier={threshold_multiplier:.2f}), "
+        f"演化潜力={evo_potential:.2f}, "
+        f"累积压力={speciation_pressure:.2f}, "
+        f"avg_pressure={average_pressure:.2f}, "
+        f"resource_pressure={resource_pressure:.2f}, "
+        f"is_isolated={work.is_isolated}, "
+        f"early_game={turn_index < 10}"
+    )
+    return replace(
+        work,
+        survivors=survivors,
+        resource_pressure=resource_pressure,
+        niche_overlap=niche_overlap,
+        niche_saturation=niche_saturation,
+        base_threshold=base_threshold,
+        min_population=min_population,
+        evo_potential=evo_potential,
+        speciation_pressure=speciation_pressure,
+    )
+
+
+def evaluate_environmental_pressure(
+    work: _CandidateWork,
+    *,
+    species: Any,
+    is_early_game: bool,
+    average_pressure: float,
+    spec_config: Any,
+    is_plant: Callable[[Any], bool],
+    plant_evolution_service: Any,
+    random_random: Callable[[], float],
+) -> _CandidateWork | None:
+    """Apply pressure, plant, radiation and legacy mortality checks."""
+    if is_early_game:
+        pressure_threshold = spec_config.pressure_threshold_early
+        resource_threshold = spec_config.resource_threshold_early
+        evo_threshold = spec_config.evo_potential_threshold_early
+    else:
+        pressure_threshold = spec_config.pressure_threshold_late
+        resource_threshold = spec_config.resource_threshold_late
+        evo_threshold = spec_config.evo_potential_threshold_late
+
+    if work.is_isolated:
+        has_pressure = True
+    elif work.candidate_population >= work.base_threshold * 2.5:
+        has_pressure = True
+        logger.debug(
+            f"[巨无霸分化] {species.common_name}: "
+            f"种群{work.candidate_population:,} >= 门槛×2.5"
+            f"({int(work.base_threshold * 2.5):,})，强制触发分化"
+        )
+    elif work.speciation_pressure >= 0.05:
+        has_pressure = True
+    elif (
+        average_pressure >= pressure_threshold
+        or work.resource_pressure >= resource_threshold
+    ):
+        if is_early_game:
+            has_pressure = True
+        elif (
+            work.resource_pressure >= 0.35
+            or work.niche_saturation > 0.4
+        ):
+            has_pressure = True
+        else:
+            has_pressure = False
+    elif work.evo_potential >= evo_threshold:
+        has_pressure = True
+    elif (
+        work.speciation_pressure >= 0.03
+        and work.candidate_population >= work.min_population * 1.5
+    ):
+        has_pressure = True
+        logger.debug(
+            f"[累积压力分化] {species.common_name}: "
+            f"speciation_pressure={work.speciation_pressure:.2f}>=0.03"
+        )
+    else:
+        has_pressure = False
+
+    plant = is_plant(species)
+    plant_milestone_ready = False
+    speciation_pressure = work.speciation_pressure
+    if plant:
+        milestone_progress = species.morphology_stats.get(
+            "milestone_progress",
+            0.0,
+        )
+        next_milestone = plant_evolution_service.get_next_milestone(
+            species
+        )
+        if next_milestone:
+            is_met, readiness, _ = (
+                plant_evolution_service.check_milestone_requirements(
+                    species,
+                    next_milestone.id,
+                )
+            )
+            if is_met:
+                has_pressure = True
+                plant_milestone_ready = True
+                speciation_type = (
+                    f"里程碑演化：{next_milestone.name}"
+                )
+                logger.info(
+                    f"[植物里程碑] {species.common_name} "
+                    f"触发里程碑分化：{next_milestone.name}"
+                )
+            elif readiness > 0.8:
+                speciation_pressure += 0.1 * readiness
+                logger.debug(
+                    f"[植物里程碑进度] {species.common_name} "
+                    f"接近里程碑 {next_milestone.name} "
+                    f"(准备度 {readiness:.0%})"
+                )
+
+    if not has_pressure:
+        pop_ratio = (
+            work.survivors / work.min_population
+            if work.min_population > 0
+            else 0
+        )
+        radiation_base = spec_config.radiation_base_chance
+        early_bonus = 0.0
+        min_pop_ratio_for_bonus = (
+            spec_config.radiation_pop_ratio_early
+            if is_early_game
+            else spec_config.radiation_pop_ratio_late
+        )
+        if (
+            is_early_game
+            and pop_ratio >= min_pop_ratio_for_bonus
+        ):
+            early_bonus = spec_config.radiation_early_bonus
+
+        if pop_ratio >= 1.5:
+            pop_factor = min(0.20, (pop_ratio - 1.5) * 0.05)
+        elif (
+            is_early_game
+            and pop_ratio >= min_pop_ratio_for_bonus
+        ):
+            pop_factor = min(0.15, (pop_ratio - 0.5) * 0.10)
+        else:
+            pop_factor = 0.0
+
+        saturation_factor = 0.0
+        if work.niche_saturation > 0.5:
+            saturation_factor = (
+                work.niche_saturation - 0.5
+            ) * 0.25
+
+        pressure_factor = speciation_pressure * 0.40
+        radiation_chance = (
+            radiation_base
+            + early_bonus
+            + pop_factor
+            + saturation_factor
+            + pressure_factor
+        )
+        if plant:
+            radiation_chance += 0.05
+
+        max_radiation = (
+            spec_config.radiation_max_chance_early
+            if is_early_game
+            else spec_config.radiation_max_chance_late
+        )
+        radiation_chance = min(max_radiation, radiation_chance)
+        no_isolation_penalty = (
+            spec_config.no_isolation_penalty_early
+            if is_early_game
+            else spec_config.no_isolation_penalty_late
+        )
+        if not work.is_isolated:
+            radiation_chance *= no_isolation_penalty
+
+        min_pop_ratio = (
+            spec_config.radiation_pop_ratio_early
+            if is_early_game
+            else spec_config.radiation_pop_ratio_late
+        )
+        if (
+            work.survivors >= work.min_population * min_pop_ratio
+            and random_random() < radiation_chance
+        ):
+            has_pressure = True
+            speciation_type = "辐射演化"
+            logger.info(
+                f"[辐射演化] {species.common_name} "
+                f"触发辐射演化 "
+                f"(种群:{work.survivors:,}/{work.min_population:,}"
+                f"={pop_ratio:.1f}x, "
+                f"饱和度:{work.niche_saturation:.1%}, "
+                f"概率:{radiation_chance:.1%}, "
+                f"早期={is_early_game})"
+            )
+        else:
+            has_pressure = False
+            speciation_type = "自然分化"
+            logger.debug(
+                f"[自然分化候选] {species.common_name}: "
+                "辐射演化检查未通过，但作为候选进入概率计算 "
+                f"(radiation_chance={radiation_chance:.1%})"
+            )
+
+    if (
+        not work.candidate_data
+        and (work.death_rate < 0.03 or work.death_rate > 0.70)
+    ):
+        return None
+    return replace(work, speciation_pressure=speciation_pressure)
 
 
 def build_offspring_ai_entry(

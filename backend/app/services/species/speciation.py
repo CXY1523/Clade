@@ -40,6 +40,8 @@ from .speciation_lineage import (
 from .speciation_process import (
     build_offspring_ai_entry,
     enhance_rule_fallback_descriptions,
+    evaluate_candidate_eligibility,
+    evaluate_environmental_pressure,
     execute_active_ai_batches,
     generate_background_results,
     materialize_active_results,
@@ -445,250 +447,42 @@ class SpeciationService:
             clusters = candidate_work.clusters
             
             # 使用候选地块的种群数据
-            survivors = candidate_population
-            resource_pressure = result.resource_pressure
-            
-            # 获取生态位信息（用于后续门槛调整）
-            niche_overlap_for_threshold = result.niche_overlap
-            niche_saturation_for_threshold = getattr(result, 'niche_saturation', 0.0)
-            
-            # 条件1：计算该物种的动态分化门槛
-            # 【一揽子修改】根据隔离状态和生态条件动态调整门槛
-            # 【早期分化优化】传入 turn_index 用于早期折减
-            base_threshold = self._calculate_speciation_threshold(species, turn_index)
-            
-            # 基础门槛修正
-            threshold_multiplier = 1.0
-            
-            # 【大浪淘沙v3】隔离/不隔离的门槛修正
-            if is_isolated:
-                # 已隔离时，门槛降低（奖励隔离分化）
-                threshold_multiplier *= 0.7  # 【新增】隔离奖励
-            else:
-                # 未隔离时，小幅提高门槛
-                threshold_multiplier *= 1.1  # 原1.2 -> 1.1（进一步降低惩罚）
-            
-            # 【大浪淘沙v3】高种群时门槛额外降低（巨无霸格奖励）
-            if candidate_population > base_threshold * 3:
-                threshold_multiplier *= 0.8  # 种群是门槛3倍时，门槛再降20%
-            elif candidate_population > base_threshold * 2:
-                threshold_multiplier *= 0.9  # 种群是门槛2倍时，门槛再降10%
-            
-            # 高生态位重叠（overlap > 0.7）时，门槛小幅提高（原0.6）
-            if niche_overlap_for_threshold > 0.7:
-                threshold_multiplier *= 1.1  # 原1.2 -> 1.1
-            
-            # 资源饱和很高（saturation > 0.85）且无隔离时，门槛小幅提高
-            if niche_saturation_for_threshold > 0.85 and not is_isolated:
-                threshold_multiplier *= 1.1  # 原1.2 -> 1.1
-            
-            min_population = int(base_threshold * threshold_multiplier)
-            
-            # 【改进】使用候选地块的种群，而非全局种群
-            if candidate_population < min_population:
-                logger.debug(
-                    f"[分化跳过-种群不足] {species.common_name}: "
-                    f"种群{candidate_population:,} < 门槛{min_population:,}"
-                )
-                continue
-            
-            # 条件2：演化潜力（放宽门槛 + 累积压力补偿）
-            evo_potential = species.hidden_traits.get("evolution_potential", 0.5)
-            speciation_pressure = species.morphology_stats.get("speciation_pressure", 0.0) or 0.0
-            
-            # 【新增】分化冷却期检查
-            # 早期跳过冷却期，鼓励早期多分化
-            cooldown = spec_config.cooldown_turns
-            last_speciation_turn = species.morphology_stats.get("last_speciation_turn", -999)
-            turns_since_speciation = turn_index - last_speciation_turn
-            
-            if turn_index >= spec_config.early_skip_cooldown_turns and turns_since_speciation < cooldown:
-                logger.debug(
-                    f"[分化冷却] {species.common_name} 仍在冷却期 "
-                    f"({turns_since_speciation}/{cooldown}回合)"
-                )
-                continue
-            elif turn_index < spec_config.early_skip_cooldown_turns and turns_since_speciation < cooldown:
-                logger.debug(f"[早期分化] turn={turn_index} < {spec_config.early_skip_cooldown_turns}，跳过冷却期检查")
-            
-            # 【平衡优化v4】几乎所有物种都有分化潜力
-            # 演化潜力≥0.15 或 累积分化压力≥0.10
-            # 生物学依据：50万年尺度下，几乎任何物种都会产生遗传分化
-            if evo_potential < 0.15 and speciation_pressure < 0.10:
-                logger.debug(
-                    f"[分化跳过-潜力不足] {species.common_name}: "
-                    f"演化潜力{evo_potential:.2f} < 0.15, 累积压力{speciation_pressure:.2f} < 0.10"
-                )
-                continue
-            
-            # 记录通过初步检查的物种
-            # 【早期分化优化】添加详细日志，便于验证早期分化效果
-            logger.info(
-                f"[分化候选] {species.common_name}: "
-                f"turn={turn_index}, 种群={candidate_population:,}, 门槛={min_population:,} "
-                f"(base={base_threshold:,}, multiplier={threshold_multiplier:.2f}), "
-                f"演化潜力={evo_potential:.2f}, 累积压力={speciation_pressure:.2f}, "
-                f"avg_pressure={average_pressure:.2f}, resource_pressure={resource_pressure:.2f}, "
-                f"is_isolated={is_isolated}, early_game={turn_index < 10}"
+            candidate_work = evaluate_candidate_eligibility(
+                candidate_work,
+                species=species,
+                result=result,
+                turn_index=turn_index,
+                average_pressure=average_pressure,
+                spec_config=spec_config,
+                calculate_speciation_threshold=(
+                    self._calculate_speciation_threshold
+                ),
             )
-            
-            # 条件3：压力或资源饱和
-            # 【一揽子修改】收紧压力阈值，地理隔离为主通道
-            # 无隔离时需满足更严格条件
-            
-            # 获取生态位信息（用于生态隔离判断）
-            niche_overlap = result.niche_overlap
-            niche_saturation = getattr(result, 'niche_saturation', 0.0)
-            
-            # 根据回合阶段使用不同的阈值（从配置读取）
-            if is_early_game:
-                pressure_threshold = spec_config.pressure_threshold_early
-                resource_threshold = spec_config.resource_threshold_early
-                evo_threshold = spec_config.evo_potential_threshold_early
-            else:
-                pressure_threshold = spec_config.pressure_threshold_late
-                resource_threshold = spec_config.resource_threshold_late
-                evo_threshold = spec_config.evo_potential_threshold_late
-            
-            # 【大浪淘沙v3】大幅放宽分化触发条件
-            
-            # 地理隔离时条件最宽松
-            if is_isolated:
-                has_pressure = True
-            # 【新增】高种群直接触发（巨无霸格强制分化）
-            elif candidate_population >= base_threshold * 2.5:
-                has_pressure = True
-                logger.debug(
-                    f"[巨无霸分化] {species.common_name}: "
-                    f"种群{candidate_population:,} >= 门槛×2.5({int(base_threshold*2.5):,})，强制触发分化"
-                )
-            # 累积分化压力足够高时触发
-            elif speciation_pressure >= 0.05:  # 原0.08 -> 0.05
-                has_pressure = True
-            # 无隔离时需压力或资源条件
-            elif (average_pressure >= pressure_threshold or resource_pressure >= resource_threshold):
-                # 早期：任一条件满足即可
-                if is_early_game:
-                    has_pressure = True
-                else:
-                    # 后期条件放宽：资源压力0.35或饱和度0.4即可
-                    if resource_pressure >= 0.35 or niche_saturation > 0.4:
-                        has_pressure = True
-                    else:
-                        has_pressure = False
-            elif evo_potential >= evo_threshold:  # 高演化潜力可单独触发
-                has_pressure = True
-            # 【新增】累积分化压力兜底
-            elif speciation_pressure >= 0.03 and candidate_population >= min_population * 1.5:
-                has_pressure = True
-                logger.debug(f"[累积压力分化] {species.common_name}: speciation_pressure={speciation_pressure:.2f}>=0.03")
-            else:
-                has_pressure = False
-            
-            # 【新增】植物专用分化条件
-            is_plant = PlantTraitConfig.is_plant(species)
-            plant_milestone_ready = False
-            if is_plant:
-                # 检查植物是否接近里程碑
-                milestone_progress = species.morphology_stats.get("milestone_progress", 0.0)
-                next_milestone = plant_evolution_service.get_next_milestone(species)
-                
-                if next_milestone:
-                    is_met, readiness, _ = plant_evolution_service.check_milestone_requirements(
-                        species, next_milestone.id
-                    )
-                    
-                    # 如果里程碑条件满足，强制触发分化（阶段升级）
-                    if is_met:
-                        has_pressure = True
-                        plant_milestone_ready = True
-                        speciation_type = f"里程碑演化：{next_milestone.name}"
-                        logger.info(
-                            f"[植物里程碑] {species.common_name} 触发里程碑分化：{next_milestone.name}"
-                        )
-                    # 如果接近里程碑（readiness > 80%），增加分化概率
-                    elif readiness > 0.8:
-                        speciation_pressure += 0.1 * readiness
-                        logger.debug(
-                            f"[植物里程碑进度] {species.common_name} 接近里程碑 {next_milestone.name} "
-                            f"(准备度 {readiness:.0%})"
-                        )
-            
-            # 自然辐射演化（繁荣物种分化）
-            # 【大浪淘沙v3】大幅提高辐射演化概率，降低门槛
-            if not has_pressure:
-                pop_ratio = survivors / min_population if min_population > 0 else 0
-                
-                # 【大浪淘沙v3】基础概率提高
-                radiation_base = spec_config.radiation_base_chance  # 现在是0.15
-                
-                # 早期额外加成（从配置）
-                early_bonus = 0.0
-                min_pop_ratio_for_bonus = spec_config.radiation_pop_ratio_early if is_early_game else spec_config.radiation_pop_ratio_late
-                if is_early_game and pop_ratio >= min_pop_ratio_for_bonus:
-                    early_bonus = spec_config.radiation_early_bonus  # 现在是0.25
-                
-                # 【大浪淘沙v3】种群因子：降低门槛，提高加成
-                if pop_ratio >= 1.5:  # 原2.0 -> 1.5
-                    pop_factor = min(0.20, (pop_ratio - 1.5) * 0.05)  # 最多+0.20（原0.10）
-                elif is_early_game and pop_ratio >= min_pop_ratio_for_bonus:
-                    pop_factor = min(0.15, (pop_ratio - 0.5) * 0.10)  # 早期更宽松
-                else:
-                    pop_factor = 0.0
-                
-                # 【大浪淘沙v3】资源饱和加成：降低门槛
-                saturation_factor = 0.0
-                if niche_saturation > 0.5:  # 原0.7 -> 0.5
-                    saturation_factor = (niche_saturation - 0.5) * 0.25  # 最多+0.125
-                
-                # 累积压力加成（提高权重）
-                pressure_factor = speciation_pressure * 0.40  # 原0.20 -> 0.40
-                
-                radiation_chance = radiation_base + early_bonus + pop_factor + saturation_factor + pressure_factor
-                
-                # 植物加成提高
-                if is_plant:
-                    radiation_chance += 0.05  # 原0.03 -> 0.05
-                
-                # 【大浪淘沙v3】硬性上限提高
-                max_radiation = spec_config.radiation_max_chance_early if is_early_game else spec_config.radiation_max_chance_late
-                radiation_chance = min(max_radiation, radiation_chance)  # 早期60%，后期40%
-                
-                # 【大浪淘沙v3】无隔离惩罚减轻
-                no_isolation_penalty = spec_config.no_isolation_penalty_early if is_early_game else spec_config.no_isolation_penalty_late
-                if not is_isolated:
-                    radiation_chance *= no_isolation_penalty  # 早期95%，后期70%
-                
-                # 【大浪淘沙v3】种群门槛降低
-                min_pop_ratio = spec_config.radiation_pop_ratio_early if is_early_game else spec_config.radiation_pop_ratio_late
-                if survivors >= min_population * min_pop_ratio and random.random() < radiation_chance:
-                    has_pressure = True
-                    speciation_type = "辐射演化"
-                    logger.info(
-                        f"[辐射演化] {species.common_name} 触发辐射演化 "
-                        f"(种群:{survivors:,}/{min_population:,}={pop_ratio:.1f}x, "
-                        f"饱和度:{niche_saturation:.1%}, 概率:{radiation_chance:.1%}, "
-                        f"早期={is_early_game})"
-                    )
-                else:
-                    # 【大浪淘沙v4】移除硬性跳过！
-                    # 即使辐射演化随机检查没通过，分化候选也应该进入后续概率计算
-                    # 只是把 has_pressure 标记为 False，后续会有更低的基础概率
-                    has_pressure = False
-                    speciation_type = "自然分化"
-                    logger.debug(
-                        f"[自然分化候选] {species.common_name}: "
-                        f"辐射演化检查未通过，但作为候选进入概率计算 "
-                        f"(radiation_chance={radiation_chance:.1%})"
-                    )
-            
-            # 条件4：死亡率检查（已在候选地块筛选时过滤）
-            # 对于使用预筛选数据的情况，跳过此检查
-            if not candidate_data and (death_rate < 0.03 or death_rate > 0.70):
+            if candidate_work is None:
                 continue
-            
-            # 条件5：随机性 (应用密度制约)
-            # 【优化】世代时间影响分化概率，但采用更温和的曲线
+
+            candidate_work = evaluate_environmental_pressure(
+                candidate_work,
+                species=species,
+                is_early_game=is_early_game,
+                average_pressure=average_pressure,
+                spec_config=spec_config,
+                is_plant=PlantTraitConfig.is_plant,
+                plant_evolution_service=plant_evolution_service,
+                random_random=random.random,
+            )
+            if candidate_work is None:
+                continue
+
+            survivors = candidate_work.survivors
+            resource_pressure = candidate_work.resource_pressure
+            niche_overlap = candidate_work.niche_overlap
+            niche_saturation = candidate_work.niche_saturation
+            base_threshold = candidate_work.base_threshold
+            min_population = candidate_work.min_population
+            evo_potential = candidate_work.evo_potential
+            speciation_pressure = candidate_work.speciation_pressure
+
             generation_time = species.morphology_stats.get("generation_time_days", 365)
             # 50万年 = 1.825亿天
             total_days = 500_000 * 365
