@@ -2,10 +2,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from .. import speciation_process as speciation_process_module
 from ..speciation_process import (
     enhance_rule_fallback_descriptions,
     execute_active_ai_batches,
     generate_background_results,
+    materialize_background_result,
+    materialize_background_results,
     partition_speciation_entries,
 )
 
@@ -422,3 +425,286 @@ async def test_fallback_description_enhancement_swallows_failure_and_clears(
     )
 
     assert pending == []
+
+
+def test_background_result_materialization_preserves_callbacks_and_state(
+) -> None:
+    parent = SimpleNamespace(common_name="Parent", lineage_code="PARENT")
+    created = SimpleNamespace(
+        common_name="Created",
+        created_turn=8,
+        genus_code="GENUS",
+    )
+    stored = SimpleNamespace(
+        common_name="Stored",
+        created_turn=8,
+        genus_code="GENUS",
+    )
+    entry = {
+        "ctx": {
+            "parent": parent,
+            "new_code": "CHILD",
+            "population": 123,
+            "speciation_type": "adaptive",
+            "assigned_tiles": {4, 5},
+        }
+    }
+    raw_content = {"common_name": "Raw"}
+    validated_content = {"common_name": "Validated"}
+    calls: list[tuple] = []
+    queued: list[tuple] = []
+    persisted: list[object] = []
+    timestamp = object()
+    lineage_event = object()
+    branching_event = object()
+
+    class GeneLibrary:
+        def inherit_dormant_genes(self, parent_arg, child_arg, genus_arg):
+            calls.append(("inherit_genes", parent_arg, child_arg, genus_arg))
+
+    gene_library = GeneLibrary()
+
+    class GeneOwner:
+        @property
+        def gene_library_service(self):
+            calls.append(("get_gene_library",))
+            return gene_library
+
+    class GenusRepository:
+        def get_by_code(self, code):
+            calls.append(("get_genus", code))
+            return "GENUS-OBJECT"
+
+    def validate_and_fix(content, parent_arg, preprocess_result):
+        calls.append(
+            ("validate", content, parent_arg, preprocess_result)
+        )
+        return validated_content
+
+    def create_species(**kwargs):
+        calls.append(("create", kwargs))
+        return created
+
+    def upsert_species(species):
+        calls.append(
+            ("upsert", species, getattr(species, "is_background", None))
+        )
+        persisted.append(species)
+        return stored
+
+    def inherit_habitat_distribution(**kwargs):
+        calls.append(("inherit_habitat", kwargs))
+
+    def try_speciation_breakthrough(species, turn):
+        calls.append(("breakthrough", species, turn))
+        return "activated-gene"
+
+    def lineage_event_factory(**kwargs):
+        calls.append(("lineage_factory", kwargs))
+        return lineage_event
+
+    def log_lineage_event(event):
+        calls.append(("log_event", event))
+
+    def utcnow():
+        calls.append(("utcnow",))
+        return timestamp
+
+    def branching_event_factory(**kwargs):
+        calls.append(("branching_factory", kwargs))
+        return branching_event
+
+    result = materialize_background_result(
+        entry,
+        raw_content,
+        turn_index=8,
+        average_pressure=3.25,
+        validate_and_fix=validate_and_fix,
+        create_species=create_species,
+        rule_fallback_species=queued,
+        random_uniform=lambda low, high: (
+            calls.append(("random", low, high)) or 0.4
+        ),
+        inherit_habitat_distribution=inherit_habitat_distribution,
+        gene_library_service_owner=GeneOwner(),
+        genus_repository=GenusRepository(),
+        try_speciation_breakthrough=try_speciation_breakthrough,
+        upsert_species=upsert_species,
+        log_lineage_event=log_lineage_event,
+        lineage_event_factory=lineage_event_factory,
+        branching_event_factory=branching_event_factory,
+        utcnow=utcnow,
+    )
+
+    assert result is branching_event
+    assert created.is_background is True
+    assert queued == [(stored, parent, "adaptive")]
+    assert persisted == [created, stored, stored]
+    assert [call[0] for call in calls] == [
+        "validate",
+        "create",
+        "upsert",
+        "random",
+        "inherit_habitat",
+        "get_gene_library",
+        "get_gene_library",
+        "get_genus",
+        "get_gene_library",
+        "inherit_genes",
+        "upsert",
+        "breakthrough",
+        "upsert",
+        "lineage_factory",
+        "log_event",
+        "utcnow",
+        "branching_factory",
+    ]
+    assert calls[1][1] == {
+        "parent": parent,
+        "new_code": "CHILD",
+        "survivors": 123,
+        "turn_index": 8,
+        "ai_payload": validated_content,
+        "average_pressure": 3.25,
+        "speciation_type": "adaptive",
+    }
+    assert calls[4][1] == {
+        "parent": parent,
+        "child": stored,
+        "turn_index": 8,
+        "assigned_tiles": {4, 5},
+        "reproduction_bonus": 0.4,
+    }
+    assert calls[13][1] == {
+        "lineage_code": "CHILD",
+        "event_type": "speciation",
+        "payload": {"parent": "PARENT", "turn": 8},
+    }
+    assert calls[16][1] == {
+        "parent_lineage": "PARENT",
+        "new_lineage": "CHILD",
+        "description": "Parent在压力3.2条件下分化出CHILD（背景物种）",
+        "timestamp": timestamp,
+        "reason": "Parent种群在演化压力下发生生态位分化",
+    }
+
+
+def test_background_result_materialization_preserves_optional_noop_branches(
+) -> None:
+    parent = SimpleNamespace(common_name="Parent", lineage_code="PARENT")
+    child = SimpleNamespace(
+        common_name="Child",
+        created_turn=1,
+        genus_code=None,
+    )
+    upserts: list[object] = []
+    genus_lookups: list[str] = []
+    entry = {
+        "ctx": {
+            "parent": parent,
+            "new_code": "CHILD",
+            "population": 5,
+            "speciation_type": "type",
+        }
+    }
+
+    result = materialize_background_result(
+        entry,
+        {},
+        turn_index=1,
+        average_pressure=0.0,
+        validate_and_fix=lambda content, *_args, **_kwargs: content,
+        create_species=lambda **_kwargs: child,
+        rule_fallback_species=[],
+        random_uniform=lambda _low, _high: 0.3,
+        inherit_habitat_distribution=lambda **kwargs: (
+            pytest.fail("assigned_tiles must default to an empty set")
+            if kwargs["assigned_tiles"] != set()
+            else None
+        ),
+        gene_library_service_owner=SimpleNamespace(),
+        genus_repository=SimpleNamespace(
+            get_by_code=lambda code: genus_lookups.append(code)
+        ),
+        try_speciation_breakthrough=lambda _species, _turn: None,
+        upsert_species=lambda species: (
+            upserts.append(species) or species
+        ),
+        log_lineage_event=lambda _event: None,
+        lineage_event_factory=lambda **kwargs: kwargs,
+        branching_event_factory=lambda **kwargs: kwargs,
+        utcnow=lambda: "now",
+    )
+
+    assert upserts == [child]
+    assert genus_lookups == []
+    assert result["timestamp"] == "now"
+
+
+def test_background_results_materialization_preserves_loop_order(
+    monkeypatch,
+) -> None:
+    first = ({"name": "entry-one"}, {"name": "content-one"})
+    second = ({"name": "entry-two"}, {"name": "content-two"})
+    calls: list[tuple] = []
+
+    def materialize_one(entry, content, **kwargs):
+        calls.append((entry, content, kwargs))
+        return f"event-{entry['name']}"
+
+    monkeypatch.setattr(
+        speciation_process_module,
+        "materialize_background_result",
+        materialize_one,
+    )
+
+    marker = object()
+    existing_events = ["existing-active-event"]
+    result = materialize_background_results(
+        [first, second],
+        result_events=existing_events,
+        marker=marker,
+    )
+
+    assert result is None
+    assert existing_events == [
+        "existing-active-event",
+        "event-entry-one",
+        "event-entry-two",
+    ]
+    assert calls == [
+        (first[0], first[1], {"marker": marker}),
+        (second[0], second[1], {"marker": marker}),
+    ]
+
+
+def test_background_results_materialization_preserves_partial_append_on_error(
+    monkeypatch,
+) -> None:
+    first = ({"name": "entry-one"}, {"name": "content-one"})
+    second = ({"name": "entry-two"}, {"name": "content-two"})
+    processing_error = RuntimeError("second entry failed")
+
+    def materialize_one(entry, _content, **_kwargs):
+        if entry is second[0]:
+            raise processing_error
+        return "event-entry-one"
+
+    monkeypatch.setattr(
+        speciation_process_module,
+        "materialize_background_result",
+        materialize_one,
+    )
+    existing_events = ["existing-active-event"]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        materialize_background_results(
+            [first, second],
+            result_events=existing_events,
+        )
+
+    assert exc_info.value is processing_error
+    assert existing_events == [
+        "existing-active-event",
+        "event-entry-one",
+    ]

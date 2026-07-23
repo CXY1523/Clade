@@ -7,6 +7,147 @@ from typing import Any, Callable
 logger = logging.getLogger(f"{__package__}.speciation")
 
 
+def materialize_background_result(
+    entry: dict,
+    ai_content: dict,
+    *,
+    turn_index: int,
+    average_pressure: float,
+    validate_and_fix: Callable[..., dict],
+    create_species: Callable[..., Any],
+    rule_fallback_species: list[tuple[Any, Any, str]],
+    random_uniform: Callable[[float, float], float],
+    inherit_habitat_distribution: Callable[..., Any],
+    gene_library_service_owner: Any,
+    genus_repository: Any,
+    try_speciation_breakthrough: Callable[..., Any],
+    upsert_species: Callable[[Any], Any],
+    log_lineage_event: Callable[[Any], Any],
+    lineage_event_factory: Callable[..., Any],
+    branching_event_factory: Callable[..., Any],
+    utcnow: Callable[[], Any],
+) -> Any:
+    """Create and persist one background species result and its event."""
+    ctx = entry["ctx"]
+
+    logger.info(
+        f"[规则分化结果] 背景物种: {ai_content.get('common_name')}, description长度: {len(str(ai_content.get('description', '')))}"
+    )
+
+    # 【新增】规则引擎后验证：验证并修正输出
+    ai_content = validate_and_fix(
+        ai_content,
+        ctx["parent"],
+        preprocess_result=None,
+    )
+
+    new_species = create_species(
+        parent=ctx["parent"],
+        new_code=ctx["new_code"],
+        survivors=ctx["population"],
+        turn_index=turn_index,
+        ai_payload=ai_content,
+        average_pressure=average_pressure,
+        speciation_type=ctx["speciation_type"],
+    )
+
+    # 背景物种子代也标记为背景
+    new_species.is_background = True
+
+    logger.info(
+        f"[规则分化] 新背景物种 {new_species.common_name} created_turn={new_species.created_turn}"
+    )
+    new_species = upsert_species(new_species)
+
+    # 将背景物种加入增强队列（用于模板描述和向量遗传）
+    rule_fallback_species.append(
+        (new_species, ctx["parent"], ctx["speciation_type"])
+    )
+
+    # 处理分配地块
+    assigned_tiles = ctx.get("assigned_tiles", set())
+
+    # 【v3.1】背景物种也给予繁殖补偿
+    reproduction_bonus = random_uniform(0.30, 0.50)
+
+    inherit_habitat_distribution(
+        parent=ctx["parent"],
+        child=new_species,
+        turn_index=turn_index,
+        assigned_tiles=assigned_tiles,
+        reproduction_bonus=reproduction_bonus,
+    )
+
+    # 【修复】即使没有 genus 也调用继承方法（处理新突变和额外基因）
+    if (
+        hasattr(gene_library_service_owner, "gene_library_service")
+        and gene_library_service_owner.gene_library_service
+    ):
+        genus = (
+            genus_repository.get_by_code(new_species.genus_code)
+            if new_species.genus_code
+            else None
+        )
+        gene_library_service_owner.gene_library_service.inherit_dormant_genes(
+            ctx["parent"],
+            new_species,
+            genus,
+        )
+        upsert_species(new_species)
+
+    # 【分化突破】背景物种仅激活已有休眠基因（不生成新基因）
+    breakthrough_result = try_speciation_breakthrough(
+        new_species,
+        turn_index,
+    )
+    if breakthrough_result:
+        upsert_species(new_species)
+        logger.info(
+            f"[分化突破-背景] {new_species.common_name} 在分化中激活休眠基因: "
+            f"{breakthrough_result}"
+        )
+
+    log_lineage_event(
+        lineage_event_factory(
+            lineage_code=ctx["new_code"],
+            event_type="speciation",
+            payload={
+                "parent": ctx["parent"].lineage_code,
+                "turn": turn_index,
+            },
+        )
+    )
+
+    event_desc = (
+        f"{ctx['parent'].common_name}在压力{average_pressure:.1f}条件下"
+        f"分化出{ctx['new_code']}（背景物种）"
+    )
+    reason_text = (
+        f"{ctx['parent'].common_name}种群在演化压力下发生生态位分化"
+    )
+
+    return branching_event_factory(
+        parent_lineage=ctx["parent"].lineage_code,
+        new_lineage=ctx["new_code"],
+        description=event_desc,
+        timestamp=utcnow(),
+        reason=reason_text,
+    )
+
+
+def materialize_background_results(
+    background_results: list[tuple[dict, dict]],
+    *,
+    result_events: list[Any],
+    **kwargs: Any,
+) -> None:
+    """Materialize background results in their existing stable order."""
+    for entry, ai_content in background_results:
+        result_events.append(
+            materialize_background_result(entry, ai_content, **kwargs)
+        )
+
+
 async def enhance_rule_fallback_descriptions(
     rule_fallback_species: list[tuple[Any, Any, str]],
     *,
