@@ -1,10 +1,173 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Callable
 
 
 logger = logging.getLogger(f"{__package__}.speciation")
+
+
+@dataclass(frozen=True)
+class _CandidateWork:
+    candidate_data: dict | None
+    candidate_tiles: set
+    tile_populations: dict
+    tile_mortality: dict
+    global_population: int
+    candidate_population: int
+    death_rate: float
+    is_isolated: bool
+    mortality_gradient: float
+    clusters: list
+
+
+def normalize_candidate_state(
+    *,
+    species: Any,
+    lineage_code: str,
+    global_population: int,
+    result_death_rate: float,
+    turn_index: int,
+    spec_config: Any,
+    speciation_candidates: dict,
+    tile_population_cache: dict,
+    tile_mortality_cache: dict,
+    calculate_speciation_threshold: Callable[[Any, int], int],
+) -> _CandidateWork:
+    """Normalize pre-screened or legacy tile candidate state."""
+    candidate_data = speciation_candidates.get(lineage_code)
+
+    if candidate_data:
+        candidate_tiles = candidate_data["candidate_tiles"]
+        tile_populations = candidate_data["tile_populations"]
+        tile_mortality = candidate_data["tile_mortality"]
+        is_isolated = candidate_data["is_isolated"]
+        mortality_gradient = candidate_data["mortality_gradient"]
+        clusters = candidate_data["clusters"]
+
+        candidate_population = int(
+            candidate_data["total_candidate_population"]
+        )
+        tile_total_population = int(sum(tile_populations.values()))
+        if (
+            tile_total_population > 0
+            and abs(tile_total_population - global_population) > 0
+        ):
+            logger.warning(
+                f"[种群同步] {species.common_name}: "
+                f"地块总人口({tile_total_population:,}) "
+                f"≠ 全局人口({global_population:,})，以地块总和为准"
+            )
+            global_population = tile_total_population
+            species.morphology_stats["population"] = tile_total_population
+        if candidate_population > global_population:
+            candidate_population = global_population
+
+        total_pop = sum(
+            tile_populations.get(t, 0) for t in candidate_tiles
+        )
+        if total_pop > 0:
+            death_rate = sum(
+                tile_mortality.get(t, 0)
+                * tile_populations.get(t, 0)
+                for t in candidate_tiles
+            ) / total_pop
+        else:
+            death_rate = result_death_rate
+
+        base_threshold_for_cluster = calculate_speciation_threshold(
+            species,
+            turn_index,
+        )
+        min_cluster_pop = int(base_threshold_for_cluster * 0.6)
+
+        valid_clusters = []
+        for cluster in clusters:
+            cluster_pop = sum(
+                tile_populations.get(t, 0) for t in cluster
+            )
+            if cluster_pop >= min_cluster_pop:
+                valid_clusters.append(cluster)
+
+        if not valid_clusters and clusters:
+            is_isolated = False
+            logger.debug(
+                f"[簇人口不足] {species.common_name}: "
+                f"所有{len(clusters)}个簇人口 < "
+                f"门槛60%({min_cluster_pop:,})"
+            )
+        elif valid_clusters:
+            clusters = valid_clusters
+
+        logger.debug(
+            f"[地块分化检查] {species.common_name}: "
+            f"候选地块={len(candidate_tiles)}, "
+            f"候选种群={candidate_population:,}, "
+            f"加权死亡率={death_rate:.1%}, 隔离={is_isolated}, "
+            f"有效簇={len(valid_clusters) if valid_clusters else 0}/"
+            f"{len(clusters) if clusters else 0}"
+        )
+    else:
+        candidate_tiles = set()
+        tile_populations = tile_population_cache.get(lineage_code, {})
+        tile_mortality = tile_mortality_cache.get(lineage_code, {})
+        candidate_population = int(
+            species.morphology_stats.get("population", 0) or 0
+        )
+        tile_total_population = (
+            int(sum(tile_populations.values()))
+            if tile_populations
+            else candidate_population
+        )
+        if (
+            tile_total_population > 0
+            and abs(tile_total_population - candidate_population) > 0
+        ):
+            logger.warning(
+                f"[种群同步] {species.common_name}: "
+                f"地块总人口({tile_total_population:,}) "
+                f"≠ 全局人口({candidate_population:,})，"
+                f"以地块总和为准"
+            )
+            candidate_population = tile_total_population
+            species.morphology_stats["population"] = tile_total_population
+            global_population = tile_total_population
+        death_rate = result_death_rate
+        is_isolated = False
+        mortality_gradient = 0.0
+        clusters = []
+
+        if tile_populations and tile_mortality:
+            for tile_id, pop in tile_populations.items():
+                rate = tile_mortality.get(tile_id, 0.5)
+                if (
+                    pop >= spec_config.candidate_tile_min_pop
+                    and spec_config.candidate_tile_death_rate_min
+                    <= rate
+                    <= spec_config.candidate_tile_death_rate_max
+                ):
+                    candidate_tiles.add(tile_id)
+            if candidate_tiles:
+                candidate_population = int(
+                    sum(
+                        tile_populations.get(t, 0)
+                        for t in candidate_tiles
+                    )
+                )
+
+    return _CandidateWork(
+        candidate_data=candidate_data,
+        candidate_tiles=candidate_tiles,
+        tile_populations=tile_populations,
+        tile_mortality=tile_mortality,
+        global_population=global_population,
+        candidate_population=candidate_population,
+        death_rate=death_rate,
+        is_isolated=is_isolated,
+        mortality_gradient=mortality_gradient,
+        clusters=clusters,
+    )
 
 
 def build_offspring_ai_entry(

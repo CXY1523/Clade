@@ -12,6 +12,7 @@ from ..speciation_process import (
     materialize_active_results,
     materialize_background_result,
     materialize_background_results,
+    normalize_candidate_state,
     partition_speciation_entries,
     prepare_active_result,
 )
@@ -1369,3 +1370,138 @@ def test_offspring_ai_entry_preserves_fallback_region_defaults() -> None:
     assert entry["payload"]["is_geographic_isolation"] is False
     assert entry["payload"]["map_changes_summary"] == ""
     assert entry["payload"]["major_events_summary"] == ""
+
+
+def test_candidate_state_normalization_preserves_prescreened_state() -> None:
+    species = SimpleNamespace(
+        common_name="Parent",
+        morphology_stats={"population": 100},
+    )
+    candidate_tiles = {1, 2, 3}
+    tile_populations = {1: 80, 2: 70, 3: 10}
+    tile_mortality = {1: 0.2, 2: 0.6, 3: 0.9}
+    original_clusters = [{1}, {2}, {3}]
+    candidate_data = {
+        "candidate_tiles": candidate_tiles,
+        "tile_populations": tile_populations,
+        "tile_mortality": tile_mortality,
+        "is_isolated": True,
+        "mortality_gradient": 0.7,
+        "clusters": original_clusters,
+        "total_candidate_population": 200,
+    }
+    threshold_calls: list[tuple] = []
+
+    work = normalize_candidate_state(
+        species=species,
+        lineage_code="PARENT",
+        global_population=100,
+        result_death_rate=0.5,
+        turn_index=4,
+        spec_config=SimpleNamespace(
+            candidate_tile_min_pop=1,
+            candidate_tile_death_rate_min=0.0,
+            candidate_tile_death_rate_max=1.0,
+        ),
+        speciation_candidates={"PARENT": candidate_data},
+        tile_population_cache={},
+        tile_mortality_cache={},
+        calculate_speciation_threshold=lambda species_arg, turn: (
+            threshold_calls.append((species_arg, turn)) or 100
+        ),
+    )
+
+    assert work.candidate_data is candidate_data
+    assert work.candidate_tiles is candidate_tiles
+    assert work.tile_populations is tile_populations
+    assert work.tile_mortality is tile_mortality
+    assert work.global_population == 160
+    assert species.morphology_stats["population"] == 160
+    assert work.candidate_population == 160
+    assert work.death_rate == pytest.approx(
+        (0.2 * 80 + 0.6 * 70 + 0.9 * 10) / 160
+    )
+    assert work.is_isolated is True
+    assert work.mortality_gradient == 0.7
+    assert work.clusters == [{1}, {2}]
+    assert work.clusters is not original_clusters
+    assert threshold_calls == [(species, 4)]
+
+
+def test_candidate_state_normalization_downgrades_empty_valid_clusters(
+) -> None:
+    species = SimpleNamespace(
+        common_name="Parent",
+        morphology_stats={"population": 80},
+    )
+    clusters = [{1}, {2}]
+    candidate_data = {
+        "candidate_tiles": {1, 2},
+        "tile_populations": {1: 40, 2: 40},
+        "tile_mortality": {1: 0.2, 2: 0.3},
+        "is_isolated": True,
+        "mortality_gradient": 0.1,
+        "clusters": clusters,
+        "total_candidate_population": 80,
+    }
+
+    work = normalize_candidate_state(
+        species=species,
+        lineage_code="PARENT",
+        global_population=80,
+        result_death_rate=0.5,
+        turn_index=2,
+        spec_config=SimpleNamespace(
+            candidate_tile_min_pop=1,
+            candidate_tile_death_rate_min=0.0,
+            candidate_tile_death_rate_max=1.0,
+        ),
+        speciation_candidates={"PARENT": candidate_data},
+        tile_population_cache={},
+        tile_mortality_cache={},
+        calculate_speciation_threshold=lambda _species, _turn: 100,
+    )
+
+    assert work.is_isolated is False
+    assert work.clusters is clusters
+
+
+def test_candidate_state_normalization_preserves_cache_fallback_filters(
+) -> None:
+    species = SimpleNamespace(
+        common_name="Parent",
+        morphology_stats={"population": 100},
+    )
+    tile_populations = {1: 50, 2: 30, 3: 5}
+    tile_mortality = {1: 0.2, 2: 0.8, 3: 0.4}
+
+    work = normalize_candidate_state(
+        species=species,
+        lineage_code="PARENT",
+        global_population=100,
+        result_death_rate=0.33,
+        turn_index=3,
+        spec_config=SimpleNamespace(
+            candidate_tile_min_pop=10,
+            candidate_tile_death_rate_min=0.1,
+            candidate_tile_death_rate_max=0.7,
+        ),
+        speciation_candidates={},
+        tile_population_cache={"PARENT": tile_populations},
+        tile_mortality_cache={"PARENT": tile_mortality},
+        calculate_speciation_threshold=lambda *_args: pytest.fail(
+            "fallback path must not calculate cluster threshold"
+        ),
+    )
+
+    assert work.candidate_data is None
+    assert work.candidate_tiles == {1}
+    assert work.tile_populations is tile_populations
+    assert work.tile_mortality is tile_mortality
+    assert work.global_population == 85
+    assert species.morphology_stats["population"] == 85
+    assert work.candidate_population == 50
+    assert work.death_rate == 0.33
+    assert work.is_isolated is False
+    assert work.mortality_gradient == 0.0
+    assert work.clusters == []

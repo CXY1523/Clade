@@ -44,6 +44,7 @@ from .speciation_process import (
     generate_background_results,
     materialize_active_results,
     materialize_background_results,
+    normalize_candidate_state,
     partition_speciation_entries,
 )
 from .speciation_habitat import (
@@ -418,101 +419,30 @@ class SpeciationService:
             
             # ========== 【基于地块的分化检查】==========
             # 优先使用预筛选的分化候选数据
-            candidate_data = self._speciation_candidates.get(lineage_code)
-            
-            if candidate_data:
-                # 使用地块级数据
-                candidate_tiles = candidate_data["candidate_tiles"]
-                tile_populations = candidate_data["tile_populations"]
-                tile_mortality = candidate_data["tile_mortality"]
-                is_isolated = candidate_data["is_isolated"]
-                mortality_gradient = candidate_data["mortality_gradient"]
-                clusters = candidate_data["clusters"]
-                
-                # 计算候选地块上的总种群
-                candidate_population = int(candidate_data["total_candidate_population"])
-                tile_total_population = int(sum(tile_populations.values()))
-                # 与全局种群同步：以地块总和为准，修正全局人口
-                if tile_total_population > 0 and abs(tile_total_population - global_population) > 0:
-                    logger.warning(
-                        f"[种群同步] {species.common_name}: 地块总人口({tile_total_population:,}) "
-                        f"≠ 全局人口({global_population:,})，以地块总和为准"
-                    )
-                    global_population = tile_total_population
-                    species.morphology_stats["population"] = tile_total_population
-                # 候选人口不得超过全局人口
-                if candidate_population > global_population:
-                    candidate_population = global_population
-                
-                # 计算候选地块的加权平均死亡率
-                total_pop = sum(tile_populations.get(t, 0) for t in candidate_tiles)
-                if total_pop > 0:
-                    death_rate = sum(
-                        tile_mortality.get(t, 0) * tile_populations.get(t, 0) 
-                        for t in candidate_tiles
-                    ) / total_pop
-                else:
-                    death_rate = result.death_rate
-                
-                # 【一揽子修改】候选簇人口检查
-                # 要求候选簇内人口 >= 基础门槛的 60%，避免极度分散的小簇触发
-                # 【早期分化优化】传入 turn_index 用于早期折减
-                base_threshold_for_cluster = self._calculate_speciation_threshold(species, turn_index)
-                min_cluster_pop = int(base_threshold_for_cluster * 0.6)
-                
-                # 检查每个簇的人口
-                valid_clusters = []
-                for cluster in clusters:
-                    cluster_pop = sum(tile_populations.get(t, 0) for t in cluster)
-                    if cluster_pop >= min_cluster_pop:
-                        valid_clusters.append(cluster)
-                
-                # 如果没有有效簇，降级隔离状态
-                if not valid_clusters and clusters:
-                    is_isolated = False
-                    logger.debug(
-                        f"[簇人口不足] {species.common_name}: "
-                        f"所有{len(clusters)}个簇人口 < 门槛60%({min_cluster_pop:,})"
-                    )
-                elif valid_clusters:
-                    clusters = valid_clusters
-                
-                logger.debug(
-                    f"[地块分化检查] {species.common_name}: "
-                    f"候选地块={len(candidate_tiles)}, 候选种群={candidate_population:,}, "
-                    f"加权死亡率={death_rate:.1%}, 隔离={is_isolated}, "
-                    f"有效簇={len(valid_clusters) if valid_clusters else 0}/{len(clusters) if clusters else 0}"
-                )
-            else:
-                # 回退到全局数据（兼容旧逻辑）
-                candidate_tiles = set()
-                tile_populations = self._tile_population_cache.get(lineage_code, {})
-                tile_mortality = self._tile_mortality_cache.get(lineage_code, {})
-                candidate_population = int(species.morphology_stats.get("population", 0) or 0)
-                tile_total_population = int(sum(tile_populations.values())) if tile_populations else candidate_population
-                if tile_total_population > 0 and abs(tile_total_population - candidate_population) > 0:
-                    logger.warning(
-                        f"[种群同步] {species.common_name}: 地块总人口({tile_total_population:,}) "
-                        f"≠ 全局人口({candidate_population:,})，以地块总和为准"
-                    )
-                    candidate_population = tile_total_population
-                    species.morphology_stats["population"] = tile_total_population
-                    global_population = tile_total_population
-                death_rate = result.death_rate
-                is_isolated = False
-                mortality_gradient = 0.0
-                clusters = []
-                
-                # 如果有地块数据，尝试筛选候选地块
-                # 使用配置中的筛选条件
-                if tile_populations and tile_mortality:
-                    for tile_id, pop in tile_populations.items():
-                        rate = tile_mortality.get(tile_id, 0.5)
-                        if (pop >= spec_config.candidate_tile_min_pop and 
-                            spec_config.candidate_tile_death_rate_min <= rate <= spec_config.candidate_tile_death_rate_max):
-                            candidate_tiles.add(tile_id)
-                    if candidate_tiles:
-                        candidate_population = int(sum(tile_populations.get(t, 0) for t in candidate_tiles))
+            candidate_work = normalize_candidate_state(
+                species=species,
+                lineage_code=lineage_code,
+                global_population=global_population,
+                result_death_rate=result.death_rate,
+                turn_index=turn_index,
+                spec_config=spec_config,
+                speciation_candidates=self._speciation_candidates,
+                tile_population_cache=self._tile_population_cache,
+                tile_mortality_cache=self._tile_mortality_cache,
+                calculate_speciation_threshold=(
+                    self._calculate_speciation_threshold
+                ),
+            )
+            candidate_data = candidate_work.candidate_data
+            candidate_tiles = candidate_work.candidate_tiles
+            tile_populations = candidate_work.tile_populations
+            tile_mortality = candidate_work.tile_mortality
+            global_population = candidate_work.global_population
+            candidate_population = candidate_work.candidate_population
+            death_rate = candidate_work.death_rate
+            is_isolated = candidate_work.is_isolated
+            mortality_gradient = candidate_work.mortality_gradient
+            clusters = candidate_work.clusters
             
             # 使用候选地块的种群数据
             survivors = candidate_population
