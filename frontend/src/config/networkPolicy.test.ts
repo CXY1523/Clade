@@ -1,4 +1,6 @@
 import { spawn, spawnSync } from "child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
 import path from "path";
 import { describe, expect, it } from "vitest";
 
@@ -49,6 +51,21 @@ interface ViteCliResult {
 
 type ViteCommand = "dev" | "preview";
 
+function createPreviewFixture(): string {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "clade-vite-preview-"));
+  try {
+    writeFileSync(
+      path.join(fixtureRoot, "index.html"),
+      "<!doctype html><title>Clade preview test</title>",
+      "utf8"
+    );
+    return fixtureRoot;
+  } catch (error) {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 function runViteCli(
   command: ViteCommand,
   hostArgs: string[],
@@ -62,26 +79,42 @@ function runViteCli(
 
   const viteCli = path.resolve(process.cwd(), "node_modules/vite/bin/vite.js");
   const testPort = String(40_000 + Math.floor(Math.random() * 10_000));
+  const previewFixture = command === "preview" ? createPreviewFixture() : null;
+  const previewArgs = previewFixture
+    ? ["preview", "--outDir", previewFixture]
+    : [];
 
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      process.execPath,
-      [
-        viteCli,
-        ...(command === "preview" ? ["preview"] : []),
-        ...hostArgs,
-        "--port",
-        testPort,
-        "--strictPort",
-        "--clearScreen",
-        "false",
-      ],
-      {
-        cwd: process.cwd(),
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
+    const cleanupPreviewFixture = () => {
+      if (previewFixture) {
+        rmSync(previewFixture, { recursive: true, force: true });
       }
-    );
+    };
+    let child;
+    try {
+      child = spawn(
+        process.execPath,
+        [
+          viteCli,
+          ...previewArgs,
+          ...hostArgs,
+          "--port",
+          testPort,
+          "--strictPort",
+          "--clearScreen",
+          "false",
+        ],
+        {
+          cwd: process.cwd(),
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        }
+      );
+    } catch (error) {
+      cleanupPreviewFixture();
+      reject(error);
+      return;
+    }
     let output = "";
     let startedListening = false;
     let timedOut = false;
@@ -107,10 +140,12 @@ function runViteCli(
     child.stderr.on("data", capture);
     child.on("error", (error) => {
       clearTimeout(timeout);
+      cleanupPreviewFixture();
       reject(error);
     });
     child.on("close", (exitCode) => {
       clearTimeout(timeout);
+      cleanupPreviewFixture();
       if (timedOut) {
         reject(new Error(`Vite CLI did not settle before timeout:\n${output}`));
         return;
