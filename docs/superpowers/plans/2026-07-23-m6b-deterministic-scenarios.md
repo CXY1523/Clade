@@ -10,6 +10,8 @@ SQLite engine, and runs the existing lightweight core pipeline
 `FinalizeStage`). The runner collects each turn's existing `PipelineMetrics`
 through the isolated measurement wrapper. Python and NumPy global random state
 is restored after every run, and AI/embedding integration remains disabled.
+The runner refuses to start unless the caller explicitly marks a dedicated
+benchmark process and supplies that process's current application engine.
 
 **Scope**
 
