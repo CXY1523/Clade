@@ -26,6 +26,7 @@ from .speciation_context import (
 )
 from .speciation_ai import (
     build_batch_payload,
+    call_batch_ai,
     call_ai_wrapper,
     generate_rule_based_fallback,
     normalize_ai_content,
@@ -1871,138 +1872,17 @@ class SpeciationService:
             stream_callback: 流式回调（用于心跳）
             entries: 原始entries列表，用于判断是否为植物批次
         """
-        from ...ai.streaming_helper import StreamOutcome, stream_invoke_with_heartbeat
-        import asyncio
-        import json
-        
-        # === 【新增】内共生并发检测 ===
-        endosymbiosis_tasks = []
-        endosymbiosis_indices = []  # 记录对应的 entries 索引
-        
-        if entries:
-            pressure = payload.get("average_pressure", 0.0)
-            pressure_context = payload.get("pressure_summary", "")
-            
-            for i, entry in enumerate(entries):
-                parent = entry["ctx"]["parent"]
-                turn_index = entry["ctx"].get("turn_index", 0)
-                
-                # 并发启动内共生尝试（不阻塞主流程）
-                task = asyncio.create_task(
-                    self._attempt_endosymbiosis_async(
-                        parent, pressure, pressure_context, turn_index
-                    )
-                )
-                endosymbiosis_tasks.append(task)
-                endosymbiosis_indices.append(i)
-
-        # 【植物混合模式】检测是否为纯植物批次
-        prompt_name = "speciation_batch"  # 默认
-        batch_type = "动物"
-        if entries:
-            is_all_plants = all(
-                PlantTraitConfig.is_plant(e["ctx"]["parent"]) for e in entries
-            )
-            if is_all_plants:
-                prompt_name = "plant_speciation_batch"
-                batch_type = "植物"
-                # 为植物批次添加器官类别信息
-                if entries:
-                    first_parent = entries[0]["ctx"]["parent"]
-                    current_stage = getattr(first_parent, 'life_form_stage', 0)
-                    payload["organ_categories_info"] = plant_evolution_service.get_organ_category_info_for_prompt(current_stage)
-                logger.debug(f"[分化批量] 使用植物专用Prompt，批次大小: {len(entries)}")
-        
-        # 【优化】使用流式调用 + 智能空闲超时（只要AI在输出就不会超时）
-        # 【修复】正确传递 event_type 和 category，不再丢失事件类型
-        def heartbeat_callback(event_type: str, message: str, category: str):
-            if stream_callback:
-                try:
-                    result = stream_callback(event_type, message, category)
-                    if asyncio.iscoroutine(result):
-                        asyncio.create_task(result)
-                except Exception:
-                    pass
-        
-        batch_size = len(entries) if entries else 0
-        
-        # 启动 Batch AI Task
-        batch_ai_task = asyncio.create_task(
-            stream_invoke_with_heartbeat(
-                router=self.router,
-                capability=prompt_name,
-                payload=payload,
-                task_name=f"分化[{batch_type}×{batch_size}]",
-                heartbeat_interval=2.0,
-                event_callback=heartbeat_callback if stream_callback else None,
-            )
+        return await call_batch_ai(
+            self.router,
+            payload,
+            stream_callback,
+            entries,
+            attempt_endosymbiosis_async=self._attempt_endosymbiosis_async,
+            is_plant=PlantTraitConfig.is_plant,
+            get_organ_category_info_for_prompt=(
+                plant_evolution_service.get_organ_category_info_for_prompt
+            ),
         )
-        
-        # 等待所有任务 (Batch + Endosymbiosis)
-        # 注意：我们允许内共生失败（返回None），也允许Batch失败（异常）
-        all_tasks = [batch_ai_task] + endosymbiosis_tasks
-        results = await asyncio.gather(*all_tasks, return_exceptions=True)
-        
-        batch_result = results[0]
-        endo_results = results[1:]
-        
-        # 处理 Batch 结果
-        final_content = {}
-        if isinstance(batch_result, StreamOutcome):
-            if batch_result.completed:
-                try:
-                    parsed_content = json.loads(batch_result.content)
-                except (TypeError, ValueError):
-                    logger.warning("[分化批量] AI返回内容不是有效JSON，将使用规则fallback")
-                    final_content = {
-                        "_error": "invalid_response",
-                        "_use_fallback": True,
-                    }
-                else:
-                    if isinstance(parsed_content, dict):
-                        final_content = parsed_content
-                    else:
-                        logger.warning("[分化批量] AI返回内容不是JSON对象，将使用规则fallback")
-                        final_content = {
-                            "_error": "invalid_response",
-                            "_use_fallback": True,
-                        }
-            elif batch_result.reason == "outbound_timeout":
-                logger.warning("[分化批量] AI流式请求中断，将使用规则fallback")
-                final_content = {"_timeout": True, "_use_fallback": True}
-            else:
-                logger.warning("[分化批量] AI流式请求失败，将使用规则fallback")
-                final_content = {"_error": "stream_error", "_use_fallback": True}
-        elif isinstance(batch_result, Exception):
-            # Batch 失败处理
-            if isinstance(batch_result, asyncio.TimeoutError):
-                logger.warning("[分化批量] AI请求超时，将使用规则fallback")
-                final_content = {"_timeout": True, "_use_fallback": True}
-            else:
-                logger.error(
-                    "[分化批量] 请求异常 (%s)，将使用规则fallback",
-                    type(batch_result).__name__,
-                )
-                final_content = {"_error": "stream_error", "_use_fallback": True}
-        
-        if not isinstance(final_content, dict):
-            final_content = {}
-
-        # === 注入内共生结果 ===
-        # 将成功的内共生结果暂存到 _endo_overrides 字段
-        # 后续 _parse_batch_results 会优先使用这些结果
-        
-        valid_endo_overrides = {}
-        for idx, res in zip(endosymbiosis_indices, endo_results):
-            if isinstance(res, dict) and res.get("is_endosymbiosis"):
-                res["request_id"] = idx # 确保 ID 匹配
-                valid_endo_overrides[idx] = res
-        
-        if valid_endo_overrides:
-             final_content["_endo_overrides"] = valid_endo_overrides
-             logger.info(f"[内共生] 成功捕获 {len(valid_endo_overrides)} 个内共生事件，准备注入")
-
-        return final_content
     
     def _parse_batch_results(
         self, 

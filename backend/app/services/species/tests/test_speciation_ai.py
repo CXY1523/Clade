@@ -1,12 +1,16 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
+
+from app.ai.streaming_helper import StreamOutcome
 
 from .. import speciation as speciation_module
 from ..speciation import SpeciationService
 from ..speciation_ai import (
     build_batch_payload,
+    call_batch_ai,
     call_ai_wrapper,
     generate_rule_based_fallback,
     normalize_ai_content,
@@ -926,6 +930,364 @@ async def test_service_single_ai_wrapper_delegate_preserves_router(
         "payload": payload,
         "stream_callback": callback,
     }
+
+
+@pytest.mark.asyncio
+async def test_batch_ai_invocation_preserves_animal_tasks_and_endo_injection(
+    monkeypatch,
+) -> None:
+    router = object()
+    parents = [SimpleNamespace(name="first"), SimpleNamespace(name="second")]
+    entries = [
+        {
+            "ctx": {
+                "parent": parents[0],
+                "turn_index": 8,
+            }
+        },
+        {"ctx": {"parent": parents[1]}},
+    ]
+    payload = {
+        "average_pressure": 4.5,
+        "pressure_summary": "high pressure",
+    }
+    endosymbiosis = {"is_endosymbiosis": True, "common_name": "共生体"}
+    endo_calls: list[tuple] = []
+    invocation: dict = {}
+    events: list[tuple[str, str, str]] = []
+
+    async def attempt_endosymbiosis(parent, pressure, context, turn_index):
+        endo_calls.append((parent, pressure, context, turn_index))
+        if parent is parents[0]:
+            return endosymbiosis
+        raise RuntimeError("ignored endosymbiosis failure")
+
+    async def fake_stream_invoke_with_heartbeat(**kwargs):
+        invocation.update(kwargs)
+        kwargs["event_callback"]("heartbeat", "streaming", "speciation")
+        return StreamOutcome(
+            content=json.dumps({"results": [{"request_id": 0}]}),
+            completed=True,
+        )
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.stream_invoke_with_heartbeat",
+        fake_stream_invoke_with_heartbeat,
+    )
+
+    result = await call_batch_ai(
+        router,
+        payload,
+        lambda event_type, message, category: events.append(
+            (event_type, message, category)
+        ),
+        entries,
+        attempt_endosymbiosis_async=attempt_endosymbiosis,
+        is_plant=lambda _parent: False,
+        get_organ_category_info_for_prompt=lambda _stage: pytest.fail(
+            "animal batches must not request plant organ context"
+        ),
+    )
+
+    assert invocation == {
+        "router": router,
+        "capability": "speciation_batch",
+        "payload": payload,
+        "task_name": "分化[动物×2]",
+        "heartbeat_interval": 2.0,
+        "event_callback": invocation["event_callback"],
+    }
+    assert callable(invocation["event_callback"])
+    assert events == [("heartbeat", "streaming", "speciation")]
+    assert endo_calls == [
+        (parents[0], 4.5, "high pressure", 8),
+        (parents[1], 4.5, "high pressure", 0),
+    ]
+    assert endosymbiosis["request_id"] == 0
+    assert result == {
+        "results": [{"request_id": 0}],
+        "_endo_overrides": {0: endosymbiosis},
+    }
+
+
+@pytest.mark.asyncio
+async def test_batch_ai_invocation_preserves_plant_prompt_and_payload_mutation(
+    monkeypatch,
+) -> None:
+    parents = [
+        SimpleNamespace(life_form_stage=3),
+        SimpleNamespace(life_form_stage=5),
+    ]
+    entries = [{"ctx": {"parent": parent}} for parent in parents]
+    payload: dict = {}
+    stages: list[int] = []
+    invocation: dict = {}
+
+    async def fake_stream_invoke_with_heartbeat(**kwargs):
+        invocation.update(kwargs)
+        return StreamOutcome(content="{}", completed=True)
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.stream_invoke_with_heartbeat",
+        fake_stream_invoke_with_heartbeat,
+    )
+
+    result = await call_batch_ai(
+        object(),
+        payload,
+        None,
+        entries,
+        attempt_endosymbiosis_async=lambda *_args: _async_none(),
+        is_plant=lambda parent: parent in parents,
+        get_organ_category_info_for_prompt=lambda stage: stages.append(stage)
+        or "PLANT ORGANS",
+    )
+
+    assert result == {}
+    assert stages == [3]
+    assert payload["organ_categories_info"] == "PLANT ORGANS"
+    assert invocation["capability"] == "plant_speciation_batch"
+    assert invocation["task_name"] == "分化[植物×2]"
+    assert invocation["event_callback"] is None
+
+
+async def _async_none():
+    return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (
+            StreamOutcome(content="not-json", completed=True),
+            {"_error": "invalid_response", "_use_fallback": True},
+        ),
+        (
+            StreamOutcome(content="[]", completed=True),
+            {"_error": "invalid_response", "_use_fallback": True},
+        ),
+        (
+            StreamOutcome(
+                content='{"partial": true}',
+                completed=False,
+                reason="outbound_timeout",
+            ),
+            {"_timeout": True, "_use_fallback": True},
+        ),
+        (
+            StreamOutcome(content="", completed=False, reason="stream_error"),
+            {"_error": "stream_error", "_use_fallback": True},
+        ),
+    ],
+)
+async def test_batch_ai_invocation_preserves_stream_outcome_branches(
+    monkeypatch,
+    outcome: StreamOutcome,
+    expected: dict,
+) -> None:
+    async def fake_stream_invoke_with_heartbeat(**_kwargs):
+        return outcome
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.stream_invoke_with_heartbeat",
+        fake_stream_invoke_with_heartbeat,
+    )
+
+    result = await call_batch_ai(
+        object(),
+        {},
+        None,
+        [],
+        attempt_endosymbiosis_async=lambda *_args: _async_none(),
+        is_plant=lambda _parent: False,
+        get_organ_category_info_for_prompt=lambda _stage: "",
+    )
+
+    assert result == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            asyncio.TimeoutError(),
+            {"_timeout": True, "_use_fallback": True},
+        ),
+        (
+            RuntimeError("stream failed"),
+            {"_error": "stream_error", "_use_fallback": True},
+        ),
+    ],
+)
+async def test_batch_ai_invocation_preserves_task_exception_branches(
+    monkeypatch,
+    error: Exception,
+    expected: dict,
+) -> None:
+    async def fake_stream_invoke_with_heartbeat(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.stream_invoke_with_heartbeat",
+        fake_stream_invoke_with_heartbeat,
+    )
+
+    result = await call_batch_ai(
+        object(),
+        {},
+        None,
+        [],
+        attempt_endosymbiosis_async=lambda *_args: _async_none(),
+        is_plant=lambda _parent: False,
+        get_organ_category_info_for_prompt=lambda _stage: "",
+    )
+
+    assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_batch_ai_invocation_preserves_unexpected_batch_result(
+    monkeypatch,
+) -> None:
+    async def fake_stream_invoke_with_heartbeat(**_kwargs):
+        return {"content": "not a StreamOutcome"}
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.stream_invoke_with_heartbeat",
+        fake_stream_invoke_with_heartbeat,
+    )
+
+    result = await call_batch_ai(
+        object(),
+        {},
+        None,
+        [],
+        attempt_endosymbiosis_async=lambda *_args: _async_none(),
+        is_plant=lambda _parent: False,
+        get_organ_category_info_for_prompt=lambda _stage: "",
+    )
+
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_batch_ai_invocation_schedules_async_heartbeat_callback(
+    monkeypatch,
+) -> None:
+    callback_completed = asyncio.Event()
+
+    async def callback(
+        _event_type: str,
+        _message: str,
+        _category: str,
+    ) -> None:
+        callback_completed.set()
+
+    async def fake_stream_invoke_with_heartbeat(**kwargs):
+        kwargs["event_callback"]("heartbeat", "streaming", "speciation")
+        await asyncio.sleep(0)
+        return StreamOutcome(content="{}", completed=True)
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.stream_invoke_with_heartbeat",
+        fake_stream_invoke_with_heartbeat,
+    )
+
+    await call_batch_ai(
+        object(),
+        {},
+        callback,
+        [],
+        attempt_endosymbiosis_async=lambda *_args: _async_none(),
+        is_plant=lambda _parent: False,
+        get_organ_category_info_for_prompt=lambda _stage: "",
+    )
+
+    assert callback_completed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_batch_ai_invocation_isolates_heartbeat_callback_errors(
+    monkeypatch,
+) -> None:
+    def broken_callback(
+        _event_type: str,
+        _message: str,
+        _category: str,
+    ) -> None:
+        raise RuntimeError("ignored callback error")
+
+    async def fake_stream_invoke_with_heartbeat(**kwargs):
+        kwargs["event_callback"]("heartbeat", "streaming", "speciation")
+        return StreamOutcome(content="{}", completed=True)
+
+    monkeypatch.setattr(
+        "app.ai.streaming_helper.stream_invoke_with_heartbeat",
+        fake_stream_invoke_with_heartbeat,
+    )
+
+    assert (
+        await call_batch_ai(
+            object(),
+            {},
+            broken_callback,
+            [],
+            attempt_endosymbiosis_async=lambda *_args: _async_none(),
+            is_plant=lambda _parent: False,
+            get_organ_category_info_for_prompt=lambda _stage: "",
+        )
+        == {}
+    )
+
+
+@pytest.mark.asyncio
+async def test_service_batch_ai_delegate_preserves_runtime_dependencies(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    sentinel = {"delegated": True}
+
+    async def fake_call_batch_ai(
+        router,
+        payload,
+        stream_callback,
+        entries,
+        **kwargs,
+    ):
+        captured.update(
+            {
+                "router": router,
+                "payload": payload,
+                "stream_callback": stream_callback,
+                "entries": entries,
+                **kwargs,
+            }
+        )
+        return sentinel
+
+    monkeypatch.setattr(speciation_module, "call_batch_ai", fake_call_batch_ai)
+    service = object.__new__(SpeciationService)
+    service.router = object()
+    service._attempt_endosymbiosis_async = lambda *_args: _async_none()
+    payload = {"test": True}
+    entries = _batch_result_entries(1)
+    callback = lambda *_args: None
+
+    result = await service._call_batch_ai(payload, callback, entries)
+
+    assert result is sentinel
+    assert captured["router"] is service.router
+    assert captured["payload"] is payload
+    assert captured["stream_callback"] is callback
+    assert captured["entries"] is entries
+    assert (
+        captured["attempt_endosymbiosis_async"]
+        is service._attempt_endosymbiosis_async
+    )
+    assert callable(captured["is_plant"])
+    assert callable(captured["get_organ_category_info_for_prompt"])
 
 
 def test_ai_normalization_preserves_non_dict_identity() -> None:
