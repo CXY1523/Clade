@@ -37,6 +37,7 @@ from .speciation_lineage import (
     generate_multiple_lineage_codes,
     next_lineage_code,
 )
+from .speciation_process import partition_speciation_entries
 from .speciation_habitat import (
     allocate_tiles_from_clusters,
     allocate_tiles_to_offspring,
@@ -1357,28 +1358,22 @@ class SpeciationService:
 
         # 【优化】分离背景物种和非背景物种的 entries
         # 背景物种直接走规则生成，不调用 AI，节省 Token 和时间
-        background_entries: list[dict] = []
-        ai_entries: list[dict] = []
-        
-        for entry in entries:
-            parent = entry["ctx"]["parent"]
-            if getattr(parent, 'is_background', False):
-                background_entries.append(entry)
-            else:
-                ai_entries.append(entry)
+        (
+            background_entries,
+            active_batch,
+            self._deferred_requests,
+        ) = partition_speciation_entries(
+            entries,
+            self._deferred_requests,
+            max_deferred_requests=self.max_deferred_requests,
+            max_speciation_per_turn=self.max_speciation_per_turn,
+        )
         
         if background_entries:
             logger.info(
                 f"[分化优化] 检测到 {len(background_entries)} 个背景物种分化，"
                 f"跳过 AI 直接使用规则生成"
             )
-
-        # 合并上回合遗留请求，并限制本回合最大任务数（只针对非背景物种）
-        pending = self._deferred_requests + ai_entries
-        if len(pending) > self.max_deferred_requests:
-            pending = pending[:self.max_deferred_requests]
-        active_batch = pending[: self.max_speciation_per_turn]
-        self._deferred_requests = pending[self.max_speciation_per_turn :]
 
         if not active_batch and not background_entries:
             logger.info("[分化] 没有可执行的分化任务，本回合跳过")
