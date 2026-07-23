@@ -38,6 +38,7 @@ from .speciation_lineage import (
     next_lineage_code,
 )
 from .speciation_process import (
+    build_offspring_ai_entry,
     enhance_rule_fallback_descriptions,
     execute_active_ai_batches,
     generate_background_results,
@@ -1192,173 +1193,53 @@ class SpeciationService:
             
             # 为每个子种创建任务
             for idx, (new_code, population) in enumerate(zip(new_codes, pop_splits)):
-                # 限制 history_highlights 长度，防止 Context Explosion
-                # 只取最后2个事件，且截断长度
-                safe_history = []
-                if species.history_highlights:
-                    for event in species.history_highlights[-2:]:
-                        safe_history.append(event[:80] + "..." if len(event) > 80 else event)
-                
-                # 推断生物类群
-                biological_domain = self._infer_biological_domain(species)
-                
-                # 【核心改进】获取该子代对应区域的压力信息
-                assigned_tiles = offspring_tiles[idx] if idx < len(offspring_tiles) else set()
-                
-                # 获取该子代区域的压力数据
-                if cluster_pressure_data and idx < len(cluster_pressure_data):
-                    region_data = cluster_pressure_data[idx]
-                    region_mortality = region_data["avg_mortality"]
-                    region_pressure_level = region_data["pressure_level"]
-                    region_population = region_data["population"]
-                else:
-                    # 计算分配地块的平均死亡率
-                    if assigned_tiles and tile_mortality:
-                        region_mortality = sum(
-                            tile_mortality.get(t, 0.5) for t in assigned_tiles
-                        ) / len(assigned_tiles)
-                    else:
-                        region_mortality = death_rate
-                    
-                    if region_mortality > 0.5:
-                        region_pressure_level = "高压"
-                    elif region_mortality > 0.3:
-                        region_pressure_level = "中压"
-                    else:
-                        region_pressure_level = "低压"
-                    region_population = population
-                
-                # 生成地块级环境摘要
-                # 【新增】获取该子代所属隔离簇的环境详情
-                cluster_environment = None
-                tile_environment = candidate_data.get("tile_environment") if candidate_data else None
-                cluster_environments = candidate_data.get("cluster_environments", []) if candidate_data else []
-                if cluster_environments and idx < len(cluster_environments):
-                    cluster_environment = cluster_environments[idx]
-                
-                tile_context = self._generate_tile_context(
-                    assigned_tiles, tile_populations, tile_mortality, 
-                    mortality_gradient, is_isolated,
-                    tile_environment=tile_environment,
-                    cluster_environment=cluster_environment
+                entries.append(
+                    build_offspring_ai_entry(
+                        species=species,
+                        new_code=new_code,
+                        population=population,
+                        offspring_index=idx,
+                        num_offspring=num_offspring,
+                        offspring_tiles=offspring_tiles,
+                        cluster_pressure_data=cluster_pressure_data,
+                        clusters=clusters,
+                        tile_populations=tile_populations,
+                        tile_mortality=tile_mortality,
+                        mortality_gradient=mortality_gradient,
+                        is_isolated=is_isolated,
+                        death_rate=death_rate,
+                        candidate_data=candidate_data,
+                        average_pressure=average_pressure,
+                        pressure_summary=pressure_summary,
+                        generations=generations,
+                        speciation_type=speciation_type,
+                        map_changes=map_changes,
+                        major_events=major_events,
+                        food_chain_summary=self._food_chain_summary,
+                        current_pressures=getattr(
+                            self, "_current_pressures", None
+                        ),
+                        current_pressure_types=self._current_pressure_types,
+                        organ_catalog=self._organ_catalog,
+                        turn_index=turn_index,
+                        infer_biological_domain=(
+                            self._infer_biological_domain
+                        ),
+                        generate_tile_context=self._generate_tile_context,
+                        rules=self.rules,
+                        naming_hint_generator=self.naming_hint_generator,
+                        summarize_organs=self._summarize_organs,
+                        summarize_map_changes=self._summarize_map_changes,
+                        summarize_major_events=self._summarize_major_events,
+                        summarize_prey_species=self._summarize_prey_species,
+                        summarize_dormant_genes=(
+                            self._summarize_dormant_genes
+                        ),
+                        organ_evolution_service=(
+                            self.organ_evolution_service
+                        ),
+                    )
                 )
-                
-                # 【新增】规则引擎预处理：计算约束条件
-                environment_pressure_dict = {
-                    "temperature": 0,  # 从 pressure_summary 解析或使用默认值
-                    "humidity": 0,
-                    "salinity": 0,
-                }
-                # 尝试从 pressures 中提取实际压力值（如果可用）
-                if hasattr(self, '_current_pressures') and self._current_pressures:
-                    for p in self._current_pressures:
-                        if hasattr(p, 'modifiers'):
-                            environment_pressure_dict.update(p.modifiers)
-                
-                rule_constraints = self.rules.preprocess(
-                    parent_species=species,
-                    offspring_index=idx + 1,
-                    total_offspring=num_offspring,
-                    environment_pressure=environment_pressure_dict,
-                    pressure_context=pressure_summary,
-                )
-                
-                # 【命名提示】生成随机命名参考
-                naming_seed = abs(hash(f"{new_code}-{species.lineage_code}-{idx}")) % 1_000_000_007
-                self.naming_hint_generator.set_seed(naming_seed)
-                naming_hints = self.naming_hint_generator.generate_compact_hint()
-                
-                ai_payload = {
-                    "parent_lineage": species.lineage_code,
-                    "latin_name": species.latin_name,
-                    "common_name": species.common_name,
-                    "habitat_type": species.habitat_type,
-                    "biological_domain": biological_domain,
-                    "current_organs_summary": self._summarize_organs(species),
-                    "environment_pressure": average_pressure,
-                    "pressure_summary": pressure_summary,
-                    "evolutionary_generations": int(generations),
-                    "traits": species.description,
-                    "history_highlights": "; ".join(safe_history) if safe_history else "无",
-                    "survivors": population,
-                    "speciation_type": speciation_type,
-                    "map_changes_summary": self._summarize_map_changes(map_changes) if map_changes else "",
-                    "major_events_summary": self._summarize_major_events(major_events) if major_events else "",
-                    "parent_trophic_level": species.trophic_level,
-                    "offspring_index": idx + 1,
-                    "total_offspring": num_offspring,
-                    "food_chain_status": self._food_chain_summary,
-                    # 【新增】地块级分化信息
-                    "tile_context": tile_context,
-                    "region_mortality": region_mortality,
-                    "region_pressure_level": region_pressure_level,
-                    "mortality_gradient": mortality_gradient,
-                    "num_isolation_regions": len(clusters) if clusters else 1,
-                    "is_geographic_isolation": is_isolated and len(clusters) >= 2 if clusters else False,
-                    # 【新增】规则引擎约束（供简化版Prompt使用）
-                    "trait_budget_summary": rule_constraints["trait_budget_summary"],
-                    "organ_constraints_summary": rule_constraints["organ_constraints_summary"],
-                    "evolution_direction": rule_constraints["evolution_direction"],
-                    "direction_description": rule_constraints["direction_description"],
-                    "suggested_increases": ", ".join(rule_constraints["suggested_increases"]),
-                    "suggested_decreases": ", ".join(rule_constraints["suggested_decreases"]),
-                    "habitat_options": ", ".join(rule_constraints["habitat_options"]),
-                    "trophic_range": rule_constraints["trophic_range"],
-                    # 【新增】生态位探索策略（指导子代往不同生态位方向演化）
-                    "niche_exploration_strategy": rule_constraints.get("niche_exploration_strategy", "保守继承型"),
-                    "niche_exploration_description": rule_constraints.get("niche_exploration_description", ""),
-                    "niche_exploration_full": rule_constraints.get("niche_exploration_full", ""),
-                    "target_diet_focus": rule_constraints.get("target_diet_focus", "与父代相同"),
-                    "target_body_size_trend": rule_constraints.get("target_body_size_trend", "similar"),
-                    "target_ecological_role": rule_constraints.get("target_ecological_role", ""),
-                    "competition_with_parent": rule_constraints.get("competition_with_parent", "direct"),
-                    # 【新增】时代信息
-                    "era_summary": rule_constraints.get("era_summary", ""),
-                    "era_single_cap": rule_constraints.get("era_single_cap", 15),
-                    "era_total_cap": rule_constraints.get("era_total_cap", 100),
-                    # 【新增】增强预算上下文（边际递减、突破机会、栖息地加成）
-                    "diminishing_returns_context": rule_constraints.get("diminishing_returns_context", ""),
-                    "breakthrough_opportunities": rule_constraints.get("breakthrough_opportunities", ""),
-                    "habitat_specialization_bonus": rule_constraints.get("habitat_specialization_bonus", ""),
-                    "strategy_recommendation": rule_constraints.get("strategy_recommendation", ""),
-                    "budget_usage_percent": rule_constraints.get("budget_usage_percent", 0.5),
-                    "remaining_budget": rule_constraints.get("remaining_budget", 50),
-                    # 【新增】捕食关系信息
-                    "diet_type": species.diet_type or "omnivore",
-                    "prey_species_summary": self._summarize_prey_species(species),
-                    # 【新增】基因多样性状态
-                    "gene_diversity_radius": getattr(species, "gene_diversity_radius", 0.35) or 0.35,
-                    "gene_stability": getattr(species, "gene_stability", 0.5) or 0.5,
-                    "explored_directions": len(getattr(species, "explored_directions", []) or []),
-                    # 【新增】休眠基因信息，智能筛选后指导AI分化方向
-                    "dormant_genes_summary": self._summarize_dormant_genes(
-                        species, 
-                        pressure_types=self._current_pressure_types,
-                        pressure_strength=average_pressure
-                    ),
-                    # 【新增】器官枚举提示（闭集 organ_key）
-                    "organ_key_catalog": "\n".join(
-                        [f"- {c['organ_key']} ({c['category']})：{c['default_name']}" for c in self._organ_catalog]
-                    ),
-                    # 【新增】成熟器官上下文（自由器官演化系统）
-                    "mature_organs_context": self.organ_evolution_service.build_mature_organs_context(species),
-                    # 【命名提示】随机命名参考
-                    "naming_hints": naming_hints,
-                }
-                
-                entries.append({
-                    "ctx": {
-                        "parent": species,
-                        "new_code": new_code,
-                        "population": population,
-                        "ai_payload_input": ai_payload,  # 原始输入，用于fallback
-                        "speciation_type": speciation_type,
-                        "assigned_tiles": assigned_tiles,  # 【新增】该子代的栖息地块
-                        "average_pressure": average_pressure,  # 【修复】添加压力信息用于fallback
-                    },
-                    "payload": ai_payload,
-                    "request_turn": turn_index,  # 【关键】用于验证请求是否过期
-                })
         
         if not entries and not self._deferred_requests:
             return []

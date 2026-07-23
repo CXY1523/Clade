@@ -7,6 +7,218 @@ from typing import Any, Callable
 logger = logging.getLogger(f"{__package__}.speciation")
 
 
+def build_offspring_ai_entry(
+    *,
+    species: Any, new_code: str, population: int,
+    offspring_index: int, num_offspring: int, offspring_tiles: list,
+    cluster_pressure_data: list[dict], clusters: list,
+    tile_populations: dict, tile_mortality: dict,
+    mortality_gradient: float, is_isolated: bool, death_rate: float,
+    candidate_data: dict | None, average_pressure: float,
+    pressure_summary: str, generations: float, speciation_type: str,
+    map_changes: list, major_events: list, food_chain_summary: str,
+    current_pressures: list | None, current_pressure_types: list,
+    organ_catalog: list[dict], turn_index: int,
+    infer_biological_domain: Callable[[Any], str],
+    generate_tile_context: Callable[..., str], rules: Any,
+    naming_hint_generator: Any,
+    summarize_organs: Callable[[Any], str],
+    summarize_map_changes: Callable[[list], str],
+    summarize_major_events: Callable[[list], str],
+    summarize_prey_species: Callable[[Any], str],
+    summarize_dormant_genes: Callable[..., str],
+    organ_evolution_service: Any,
+) -> dict:
+    """Build one offspring AI request entry from an existing plan."""
+    safe_history = []
+    if species.history_highlights:
+        for event in species.history_highlights[-2:]:
+            safe_history.append(
+                event[:80] + "..." if len(event) > 80 else event
+            )
+
+    biological_domain = infer_biological_domain(species)
+    assigned_tiles = offspring_tiles[offspring_index] if (
+        offspring_index < len(offspring_tiles)
+    ) else set()
+
+    if cluster_pressure_data and offspring_index < len(cluster_pressure_data):
+        region_data = cluster_pressure_data[offspring_index]
+        region_mortality = region_data["avg_mortality"]
+        region_pressure_level = region_data["pressure_level"]
+        region_population = region_data["population"]
+    else:
+        if assigned_tiles and tile_mortality:
+            region_mortality = sum(
+                tile_mortality.get(t, 0.5)
+                for t in assigned_tiles
+            ) / len(assigned_tiles)
+        else:
+            region_mortality = death_rate
+
+        if region_mortality > 0.5:
+            region_pressure_level = "高压"
+        elif region_mortality > 0.3:
+            region_pressure_level = "中压"
+        else:
+            region_pressure_level = "低压"
+        region_population = population
+
+    cluster_environment = None
+    tile_environment = candidate_data.get(
+        "tile_environment"
+    ) if candidate_data else None
+    cluster_environments = candidate_data.get(
+        "cluster_environments", []
+    ) if candidate_data else []
+    if cluster_environments and offspring_index < len(cluster_environments):
+        cluster_environment = cluster_environments[offspring_index]
+
+    tile_context = generate_tile_context(
+        assigned_tiles,
+        tile_populations,
+        tile_mortality,
+        mortality_gradient,
+        is_isolated,
+        tile_environment=tile_environment,
+        cluster_environment=cluster_environment,
+    )
+
+    environment_pressure_dict = {
+        "temperature": 0,
+        "humidity": 0,
+        "salinity": 0,
+    }
+    if current_pressures:
+        for p in current_pressures:
+            if hasattr(p, "modifiers"):
+                environment_pressure_dict.update(p.modifiers)
+
+    rule_constraints = rules.preprocess(
+        parent_species=species,
+        offspring_index=offspring_index + 1,
+        total_offspring=num_offspring,
+        environment_pressure=environment_pressure_dict,
+        pressure_context=pressure_summary,
+    )
+
+    naming_seed = abs(hash(
+        f"{new_code}-{species.lineage_code}-{offspring_index}"
+    )) % 1_000_000_007
+    naming_hint_generator.set_seed(naming_seed)
+    naming_hints = naming_hint_generator.generate_compact_hint()
+
+    ai_payload = {
+        "parent_lineage": species.lineage_code,
+        "latin_name": species.latin_name,
+        "common_name": species.common_name,
+        "habitat_type": species.habitat_type,
+        "biological_domain": biological_domain,
+        "current_organs_summary": summarize_organs(species),
+        "environment_pressure": average_pressure,
+        "pressure_summary": pressure_summary,
+        "evolutionary_generations": int(generations),
+        "traits": species.description,
+        "history_highlights": "; ".join(safe_history) if safe_history else "无",
+        "survivors": population,
+        "speciation_type": speciation_type,
+        "map_changes_summary": summarize_map_changes(
+            map_changes
+        ) if map_changes else "",
+        "major_events_summary": summarize_major_events(
+            major_events
+        ) if major_events else "",
+        "parent_trophic_level": species.trophic_level,
+        "offspring_index": offspring_index + 1,
+        "total_offspring": num_offspring,
+        "food_chain_status": food_chain_summary,
+        "tile_context": tile_context,
+        "region_mortality": region_mortality,
+        "region_pressure_level": region_pressure_level,
+        "mortality_gradient": mortality_gradient,
+        "num_isolation_regions": len(clusters) if clusters else 1,
+        "is_geographic_isolation": (
+            is_isolated and len(clusters) >= 2 if clusters else False
+        ),
+        "trait_budget_summary": rule_constraints["trait_budget_summary"],
+        "organ_constraints_summary": rule_constraints[
+            "organ_constraints_summary"],
+        "evolution_direction": rule_constraints["evolution_direction"],
+        "direction_description": rule_constraints["direction_description"],
+        "suggested_increases": ", ".join(rule_constraints["suggested_increases"]),
+        "suggested_decreases": ", ".join(rule_constraints["suggested_decreases"]),
+        "habitat_options": ", ".join(rule_constraints["habitat_options"]),
+        "trophic_range": rule_constraints["trophic_range"],
+        "niche_exploration_strategy": rule_constraints.get(
+            "niche_exploration_strategy", "保守继承型"),
+        "niche_exploration_description": rule_constraints.get(
+            "niche_exploration_description", ""),
+        "niche_exploration_full": rule_constraints.get(
+            "niche_exploration_full", ""),
+        "target_diet_focus": rule_constraints.get(
+            "target_diet_focus", "与父代相同"),
+        "target_body_size_trend": rule_constraints.get(
+            "target_body_size_trend", "similar"),
+        "target_ecological_role": rule_constraints.get(
+            "target_ecological_role", ""),
+        "competition_with_parent": rule_constraints.get(
+            "competition_with_parent", "direct"),
+        "era_summary": rule_constraints.get("era_summary", ""),
+        "era_single_cap": rule_constraints.get("era_single_cap", 15),
+        "era_total_cap": rule_constraints.get("era_total_cap", 100),
+        "diminishing_returns_context": rule_constraints.get(
+            "diminishing_returns_context", ""),
+        "breakthrough_opportunities": rule_constraints.get(
+            "breakthrough_opportunities", ""),
+        "habitat_specialization_bonus": rule_constraints.get(
+            "habitat_specialization_bonus", ""),
+        "strategy_recommendation": rule_constraints.get(
+            "strategy_recommendation", ""),
+        "budget_usage_percent": rule_constraints.get(
+            "budget_usage_percent", 0.5),
+        "remaining_budget": rule_constraints.get("remaining_budget", 50),
+        "diet_type": species.diet_type or "omnivore",
+        "prey_species_summary": summarize_prey_species(species),
+        "gene_diversity_radius": getattr(
+            species, "gene_diversity_radius", 0.35) or 0.35,
+        "gene_stability": getattr(
+            species, "gene_stability", 0.5) or 0.5,
+        "explored_directions": len(
+            getattr(species, "explored_directions", []) or []
+        ),
+        "dormant_genes_summary": summarize_dormant_genes(
+            species,
+            pressure_types=current_pressure_types,
+            pressure_strength=average_pressure,
+        ),
+        "organ_key_catalog": "\n".join(
+            [
+                f"- {c['organ_key']} ({c['category']})："
+                f"{c['default_name']}"
+                for c in organ_catalog
+            ]
+        ),
+        "mature_organs_context": (
+            organ_evolution_service.build_mature_organs_context(species)
+        ),
+        "naming_hints": naming_hints,
+    }
+
+    return {
+        "ctx": {
+            "parent": species,
+            "new_code": new_code,
+            "population": population,
+            "ai_payload_input": ai_payload,
+            "speciation_type": speciation_type,
+            "assigned_tiles": assigned_tiles,
+            "average_pressure": average_pressure,
+        },
+        "payload": ai_payload,
+        "request_turn": turn_index,
+    }
+
+
 def prepare_active_result(
     result: Any,
     entry: dict,

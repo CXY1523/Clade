@@ -4,6 +4,7 @@ import pytest
 
 from .. import speciation_process as speciation_process_module
 from ..speciation_process import (
+    build_offspring_ai_entry,
     enhance_rule_fallback_descriptions,
     execute_active_ai_batches,
     generate_background_results,
@@ -1076,3 +1077,295 @@ def test_active_results_materialization_preserves_partial_append(
 
     assert exc_info.value is processing_error
     assert events == ["existing-event", "first-event"]
+
+
+def _offspring_species() -> SimpleNamespace:
+    return SimpleNamespace(
+        lineage_code="PARENT",
+        latin_name="Species parent",
+        common_name="Parent",
+        habitat_type="forest",
+        description="parent traits",
+        history_highlights=[
+            "old event",
+            "x" * 81,
+            "recent event",
+        ],
+        trophic_level=2.5,
+        diet_type=None,
+        gene_diversity_radius=0.0,
+        gene_stability=None,
+        explored_directions=["one", "two"],
+    )
+
+
+def _rule_constraints() -> dict:
+    return {
+        "trait_budget_summary": "budget",
+        "organ_constraints_summary": "organs",
+        "evolution_direction": "direction",
+        "direction_description": "direction-description",
+        "suggested_increases": ["speed", "vision"],
+        "suggested_decreases": ["size"],
+        "habitat_options": ["forest", "coast"],
+        "trophic_range": "2-3",
+        "niche_exploration_strategy": "explore",
+        "niche_exploration_description": "explore-description",
+        "niche_exploration_full": "explore-full",
+        "target_diet_focus": "plants",
+        "target_body_size_trend": "smaller",
+        "target_ecological_role": "browser",
+        "competition_with_parent": "reduced",
+        "era_summary": "era",
+        "era_single_cap": 12,
+        "era_total_cap": 80,
+        "diminishing_returns_context": "diminishing",
+        "breakthrough_opportunities": "breakthrough",
+        "habitat_specialization_bonus": "habitat-bonus",
+        "strategy_recommendation": "strategy",
+        "budget_usage_percent": 0.25,
+        "remaining_budget": 75,
+    }
+
+
+def test_offspring_ai_entry_preserves_cluster_payload_and_call_order() -> None:
+    species = _offspring_species()
+    assigned_tiles = {7, 8}
+    cluster_environment = {"temperature": "cold"}
+    candidate_data = {
+        "tile_environment": {7: {"temperature": 1}},
+        "cluster_environments": [cluster_environment],
+    }
+    pressure = SimpleNamespace(modifiers={"temperature": 3, "wind": 2})
+    calls: list[tuple] = []
+    naming = SimpleNamespace(
+        set_seed=lambda seed: calls.append(("set_seed", seed)),
+        generate_compact_hint=lambda: (
+            calls.append(("generate_name",)) or "name-hint"
+        ),
+    )
+    rules = SimpleNamespace(
+        preprocess=lambda **kwargs: (
+            calls.append(("preprocess", kwargs)) or _rule_constraints()
+        )
+    )
+    organ_service = SimpleNamespace(
+        build_mature_organs_context=lambda species_arg: (
+            calls.append(("mature_organs", species_arg)) or "mature"
+        )
+    )
+    organ_catalog = [
+        {
+            "organ_key": "vision",
+            "category": "sensory",
+            "default_name": "Eye",
+        }
+    ]
+
+    entry = build_offspring_ai_entry(
+        species=species,
+        new_code="CHILD",
+        population=123,
+        offspring_index=0,
+        num_offspring=2,
+        offspring_tiles=[assigned_tiles],
+        cluster_pressure_data=[
+            {
+                "avg_mortality": 0.6,
+                "pressure_level": "高压",
+                "population": 321,
+            }
+        ],
+        clusters=[{7, 8}, {9}],
+        tile_populations={7: 100},
+        tile_mortality={7: 0.7},
+        mortality_gradient=0.4,
+        is_isolated=True,
+        death_rate=0.2,
+        candidate_data=candidate_data,
+        average_pressure=3.5,
+        pressure_summary="pressure",
+        generations=4.9,
+        speciation_type="地理隔离",
+        map_changes=["map"],
+        major_events=["event"],
+        food_chain_summary="food-chain",
+        current_pressures=[pressure],
+        current_pressure_types=["heat"],
+        organ_catalog=organ_catalog,
+        turn_index=12,
+        infer_biological_domain=lambda value: (
+            calls.append(("domain", value)) or "animal"
+        ),
+        generate_tile_context=lambda *args, **kwargs: (
+            calls.append(("tile_context", args, kwargs)) or "tile-context"
+        ),
+        rules=rules,
+        naming_hint_generator=naming,
+        summarize_organs=lambda value: (
+            calls.append(("organs", value)) or "organ-summary"
+        ),
+        summarize_map_changes=lambda value: "map-summary",
+        summarize_major_events=lambda value: "event-summary",
+        summarize_prey_species=lambda value: "prey-summary",
+        summarize_dormant_genes=lambda *args, **kwargs: (
+            calls.append(("dormant", args, kwargs)) or "dormant-summary"
+        ),
+        organ_evolution_service=organ_service,
+    )
+
+    payload = entry["payload"]
+    assert entry["ctx"] == {
+        "parent": species,
+        "new_code": "CHILD",
+        "population": 123,
+        "ai_payload_input": payload,
+        "speciation_type": "地理隔离",
+        "assigned_tiles": assigned_tiles,
+        "average_pressure": 3.5,
+    }
+    assert entry["request_turn"] == 12
+    assert payload == {
+        "parent_lineage": "PARENT",
+        "latin_name": "Species parent",
+        "common_name": "Parent",
+        "habitat_type": "forest",
+        "biological_domain": "animal",
+        "current_organs_summary": "organ-summary",
+        "environment_pressure": 3.5,
+        "pressure_summary": "pressure",
+        "evolutionary_generations": 4,
+        "traits": "parent traits",
+        "history_highlights": ("x" * 80) + "...; recent event",
+        "survivors": 123,
+        "speciation_type": "地理隔离",
+        "map_changes_summary": "map-summary",
+        "major_events_summary": "event-summary",
+        "parent_trophic_level": 2.5,
+        "offspring_index": 1,
+        "total_offspring": 2,
+        "food_chain_status": "food-chain",
+        "tile_context": "tile-context",
+        "region_mortality": 0.6,
+        "region_pressure_level": "高压",
+        "mortality_gradient": 0.4,
+        "num_isolation_regions": 2,
+        "is_geographic_isolation": True,
+        "trait_budget_summary": "budget",
+        "organ_constraints_summary": "organs",
+        "evolution_direction": "direction",
+        "direction_description": "direction-description",
+        "suggested_increases": "speed, vision",
+        "suggested_decreases": "size",
+        "habitat_options": "forest, coast",
+        "trophic_range": "2-3",
+        "niche_exploration_strategy": "explore",
+        "niche_exploration_description": "explore-description",
+        "niche_exploration_full": "explore-full",
+        "target_diet_focus": "plants",
+        "target_body_size_trend": "smaller",
+        "target_ecological_role": "browser",
+        "competition_with_parent": "reduced",
+        "era_summary": "era",
+        "era_single_cap": 12,
+        "era_total_cap": 80,
+        "diminishing_returns_context": "diminishing",
+        "breakthrough_opportunities": "breakthrough",
+        "habitat_specialization_bonus": "habitat-bonus",
+        "strategy_recommendation": "strategy",
+        "budget_usage_percent": 0.25,
+        "remaining_budget": 75,
+        "diet_type": "omnivore",
+        "prey_species_summary": "prey-summary",
+        "gene_diversity_radius": 0.35,
+        "gene_stability": 0.5,
+        "explored_directions": 2,
+        "dormant_genes_summary": "dormant-summary",
+        "organ_key_catalog": "- vision (sensory)：Eye",
+        "mature_organs_context": "mature",
+        "naming_hints": "name-hint",
+    }
+    expected_seed = (
+        abs(hash("CHILD-PARENT-0")) % 1_000_000_007
+    )
+    assert [call[0] for call in calls] == [
+        "domain",
+        "tile_context",
+        "preprocess",
+        "set_seed",
+        "generate_name",
+        "organs",
+        "dormant",
+        "mature_organs",
+    ]
+    assert calls[2][1]["environment_pressure"] == {
+        "temperature": 3,
+        "humidity": 0,
+        "salinity": 0,
+        "wind": 2,
+    }
+    assert calls[3] == ("set_seed", expected_seed)
+    assert calls[6][2] == {
+        "pressure_types": ["heat"],
+        "pressure_strength": 3.5,
+    }
+
+
+def test_offspring_ai_entry_preserves_fallback_region_defaults() -> None:
+    species = _offspring_species()
+    constraints = _rule_constraints()
+
+    entry = build_offspring_ai_entry(
+        species=species,
+        new_code="CHILD",
+        population=10,
+        offspring_index=0,
+        num_offspring=1,
+        offspring_tiles=[{1, 2}],
+        cluster_pressure_data=[],
+        clusters=[],
+        tile_populations={},
+        tile_mortality={1: 0.2, 2: 0.6},
+        mortality_gradient=0.0,
+        is_isolated=True,
+        death_rate=0.9,
+        candidate_data=None,
+        average_pressure=0.0,
+        pressure_summary="",
+        generations=1,
+        speciation_type="adaptive",
+        map_changes=[],
+        major_events=[],
+        food_chain_summary="",
+        current_pressures=[],
+        current_pressure_types=[],
+        organ_catalog=[],
+        turn_index=1,
+        infer_biological_domain=lambda _species: "animal",
+        generate_tile_context=lambda *_args, **_kwargs: "tiles",
+        rules=SimpleNamespace(preprocess=lambda **_kwargs: constraints),
+        naming_hint_generator=SimpleNamespace(
+            set_seed=lambda _seed: None,
+            generate_compact_hint=lambda: "hint",
+        ),
+        summarize_organs=lambda _species: "",
+        summarize_map_changes=lambda _changes: pytest.fail(
+            "empty map changes must not be summarized"
+        ),
+        summarize_major_events=lambda _events: pytest.fail(
+            "empty events must not be summarized"
+        ),
+        summarize_prey_species=lambda _species: "",
+        summarize_dormant_genes=lambda *_args, **_kwargs: "",
+        organ_evolution_service=SimpleNamespace(
+            build_mature_organs_context=lambda _species: ""
+        ),
+    )
+
+    assert entry["ctx"]["assigned_tiles"] == {1, 2}
+    assert entry["payload"]["region_mortality"] == pytest.approx(0.4)
+    assert entry["payload"]["region_pressure_level"] == "中压"
+    assert entry["payload"]["num_isolation_regions"] == 1
+    assert entry["payload"]["is_geographic_isolation"] is False
+    assert entry["payload"]["map_changes_summary"] == ""
+    assert entry["payload"]["major_events_summary"] == ""
