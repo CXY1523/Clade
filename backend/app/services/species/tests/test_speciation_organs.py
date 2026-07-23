@@ -8,6 +8,7 @@ from ..speciation_organs import (
     get_complexity_constraints,
     infer_complexity_by_rules,
     update_capabilities,
+    validate_gradual_evolution,
 )
 
 
@@ -168,3 +169,164 @@ def test_service_complexity_delegates_match_direct_functions() -> None:
     assert service._get_complexity_constraints(
         "complexity_0"
     ) == get_complexity_constraints("complexity_0")
+
+
+def test_gradual_validation_empty_input_skips_constraint_lookup() -> None:
+    def unexpected_lookup(_domain: str) -> dict:
+        raise AssertionError("empty input must not read constraints")
+
+    assert validate_gradual_evolution([], {}, "complexity_1", unexpected_lookup) == (
+        True,
+        [],
+    )
+
+
+def test_gradual_validation_skips_non_dictionary_items() -> None:
+    assert validate_gradual_evolution(
+        [None, "bad"], {}, "complexity_1", get_complexity_constraints
+    ) == (True, [])
+
+
+def test_gradual_validation_applies_parent_stage_and_jump_rules_in_place() -> None:
+    change = {
+        "category": "sensory",
+        "action": "enhance",
+        "current_stage": 1,
+        "target_stage": 4,
+        "structure_name": "眼",
+    }
+
+    valid, result = validate_gradual_evolution(
+        [change],
+        {"sensory": {"evolution_stage": 2}},
+        "complexity_1",
+        get_complexity_constraints,
+    )
+
+    assert valid is True
+    assert result == [change]
+    assert result[0] is change
+    assert change["current_stage"] == 2
+    assert change["target_stage"] == 3
+
+
+def test_gradual_validation_starts_new_organs_at_stage_one() -> None:
+    change = {
+        "category": "defense",
+        "action": "initiate",
+        "current_stage": 0,
+        "target_stage": 4,
+        "structure_name": "壳",
+    }
+
+    assert validate_gradual_evolution(
+        [change], {}, "complexity_1", get_complexity_constraints
+    ) == (True, [change])
+    assert change["target_stage"] == 1
+
+
+def test_gradual_validation_filters_prokaryote_forbidden_structures() -> None:
+    forbidden = {
+        "category": "metabolic",
+        "action": "initiate",
+        "target_stage": 1,
+        "structure_name": "线粒体",
+    }
+    allowed = {
+        "category": "defense",
+        "action": "initiate",
+        "target_stage": 1,
+        "structure_name": "细胞壁",
+    }
+
+    assert validate_gradual_evolution(
+        [forbidden, allowed], {}, "complexity_0", get_complexity_constraints
+    ) == (True, [allowed])
+
+
+def test_gradual_validation_converts_missing_parent_enhancement() -> None:
+    change = {
+        "category": "sensory",
+        "action": "enhance",
+        "current_stage": 3,
+        "target_stage": 4,
+        "structure_name": "眼",
+    }
+
+    assert validate_gradual_evolution(
+        [change], {}, "complexity_1", get_complexity_constraints
+    ) == (True, [change])
+    assert change == {
+        "category": "sensory",
+        "action": "initiate",
+        "current_stage": 0,
+        "target_stage": 1,
+        "structure_name": "眼",
+    }
+
+
+def test_gradual_validation_uses_constraint_callback() -> None:
+    seen = []
+    change = {
+        "category": "defense",
+        "action": "initiate",
+        "current_stage": 0,
+        "target_stage": 4,
+        "structure_name": "壳",
+    }
+
+    def constraints(domain: str) -> dict:
+        seen.append(domain)
+        return {
+            "origin_type": "eukaryote",
+            "hard_forbidden": [],
+            "max_organ_stage": 1,
+        }
+
+    assert validate_gradual_evolution(
+        [change], {}, "custom_domain", constraints
+    ) == (True, [change])
+    assert seen == ["custom_domain"]
+    assert change["target_stage"] == 1
+
+
+def test_gradual_validation_keeps_only_first_three_valid_changes() -> None:
+    changes = [
+        {
+            "category": str(index),
+            "action": "initiate",
+            "target_stage": 0,
+            "structure_name": str(index),
+        }
+        for index in range(4)
+    ]
+
+    assert validate_gradual_evolution(
+        changes, {}, "complexity_1", get_complexity_constraints
+    ) == (True, changes[:3])
+
+
+def test_service_gradual_validation_delegate_matches_direct_function() -> None:
+    changes = [
+        {
+            "category": "sensory",
+            "action": "enhance",
+            "current_stage": 0,
+            "target_stage": 4,
+            "structure_name": "眼",
+        }
+    ]
+    parent_organs = {"sensory": {"evolution_stage": 2}}
+    service_changes = deepcopy(changes)
+    direct_changes = deepcopy(changes)
+    service = object.__new__(SpeciationService)
+
+    assert service._validate_gradual_evolution(
+        service_changes, parent_organs, "complexity_1"
+    ) == validate_gradual_evolution(
+        direct_changes,
+        parent_organs,
+        "complexity_1",
+        get_complexity_constraints,
+    )
+    assert service_changes == direct_changes

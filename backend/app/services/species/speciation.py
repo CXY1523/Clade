@@ -42,6 +42,7 @@ from .speciation_organs import (
     get_complexity_constraints,
     infer_complexity_by_rules,
     update_capabilities,
+    validate_gradual_evolution,
 )
 from .speciation_dormant_genes import (
     process_ai_activated_genes,
@@ -5207,73 +5208,12 @@ class SpeciationService:
         
         返回：(是否有效, 过滤后的有效进化列表)
         """
-        if not organ_evolution:
-            return True, []
-        
-        valid_evolutions = []
-        
-        # 获取基础约束
-        constraints = self._get_complexity_constraints(biological_domain)
-        hard_forbidden = constraints.get("hard_forbidden", [])
-        max_stage = constraints.get("max_organ_stage", 4)
-        origin_type = constraints.get("origin_type", "eukaryote")
-        
-        for evo in organ_evolution:
-            if not isinstance(evo, dict):
-                continue
-            
-            category = evo.get("category", "")
-            action = evo.get("action", "")
-            current_stage = evo.get("current_stage", 0)
-            target_stage = evo.get("target_stage", 0)
-            structure_name = evo.get("structure_name", "")
-            
-            # === 核心验证1：阶段跳跃限制（渐进式核心） ===
-            stage_jump = target_stage - current_stage
-            if stage_jump > 2:
-                logger.info(f"[渐进式] 修正跳跃: {structure_name} {current_stage}→{target_stage} 改为 →{min(current_stage + 2, max_stage)}")
-                target_stage = min(current_stage + 2, max_stage)
-                evo["target_stage"] = target_stage
-            
-            # === 核心验证2：新器官从原基开始 ===
-            if action == "initiate" and target_stage > 1:
-                logger.info(f"[渐进式] 新器官从原基开始: {structure_name}")
-                evo["target_stage"] = 1
-            
-            # === 核心验证3：原核/真核硬性分界 ===
-            # 这是唯一的"禁止"规则，因为这需要内共生事件
-            if origin_type == "prokaryote" and hard_forbidden:
-                if any(f in structure_name for f in hard_forbidden):
-                    logger.warning(
-                        f"[生物学约束] 原核生物不能发展真核结构: {structure_name} "
-                        f"(需要内共生事件，非渐进演化)"
-                    )
-                    continue
-            
-            # === 验证4：enhance操作需要父代有该器官 ===
-            if action == "enhance":
-                if category not in parent_organs:
-                    # 自动转为initiate，允许发展新器官
-                    logger.debug(f"[器官] {category}不存在，转为新发展")
-                    evo["action"] = "initiate"
-                    evo["current_stage"] = 0
-                    evo["target_stage"] = 1
-                else:
-                    # 使用父代实际阶段
-                    actual_stage = parent_organs[category].get("evolution_stage", 4)
-                    if current_stage != actual_stage:
-                        evo["current_stage"] = actual_stage
-                        if target_stage - actual_stage > 2:
-                            evo["target_stage"] = min(actual_stage + 2, max_stage)
-            
-            valid_evolutions.append(evo)
-        
-        # 限制每次分化最多3个器官变化（放宽限制）
-        if len(valid_evolutions) > 3:
-            logger.info(f"[器官验证] 单次分化器官变化限制为3个")
-            valid_evolutions = valid_evolutions[:3]
-        
-        return True, valid_evolutions
+        return validate_gradual_evolution(
+            organ_evolution,
+            parent_organs,
+            biological_domain,
+            self._get_complexity_constraints,
+        )
 
     # ------------------------------------------------------------------ #
     # 器官归一化与去重（闭集 organ_key + 语义相似度漏斗）
