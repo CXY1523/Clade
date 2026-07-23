@@ -210,6 +210,255 @@ def build_batch_payload(
     return payload_data
 
 
+def generate_rule_based_fallback(
+    parent: Any,
+    new_code: str,
+    survivors: int,
+    speciation_type: str,
+    average_pressure: float,
+    environment_pressure: dict[str, float] | None = None,
+    turn_index: int = 0,
+    *,
+    preprocess_rules: Callable[..., dict],
+    generate_background_species_name: Callable[..., str],
+) -> dict:
+    """当 AI 持续失败时，使用规则引擎生成新物种内容。"""
+    import random
+    import hashlib
+
+    # 使用 new_code 作为随机种子，确保相同物种生成一致的内容
+    seed = int(hashlib.md5(new_code.encode()).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+
+    # ========== 0. 使用规则引擎获取约束 ==========
+    env_pressure = environment_pressure or {"temperature": 0, "humidity": 0}
+    constraints = preprocess_rules(
+        parent_species=parent,
+        offspring_index=1,
+        total_offspring=1,
+        environment_pressure=env_pressure,
+        pressure_context=speciation_type,
+        turn_index=turn_index,
+    )
+
+    # ========== 1. 生成名称（优化：避免累加截断）==========
+    parent_latin = parent.latin_name or "Species unknown"
+    latin_parts = parent_latin.split()
+    genus = latin_parts[0] if latin_parts else "Genus"
+
+    # 根据分化类型和演化方向选择后缀
+    evolution_direction = constraints.get("evolution_direction", "自然分化")
+
+    suffix_map = {
+        "环境适应型": ["robustus", "tolerans", "resistens", "durans", "fortis"],
+        "活动强化型": ["velox", "agilis", "cursor", "celer", "mobilis"],
+        "繁殖策略型": ["fecundus", "prolifer", "fertilis", "abundans", "vivax"],
+        "防御特化型": ["armatus", "spinosus", "coriaceus", "tectus", "protectus"],
+        "极端特化型": ["extremus", "ultimus", "maximus", "supremus", "insignis"],
+    }
+    suffixes = suffix_map.get(evolution_direction, ["novus", "adaptus", "evolutus", "mutatus", "diversus"])
+
+    # 添加编码后缀避免重名
+    code_suffix = new_code.replace(".", "").lower()[-3:]
+    new_species_name = f"{genus} {rng.choice(suffixes)}_{code_suffix}"
+
+    # 中文俗名：【优化】使用独立的名字系统，避免累加截断
+    new_common_name = generate_background_species_name(
+        parent=parent,
+        evolution_direction=evolution_direction,
+        habitat_type=parent.habitat_type,
+        trophic_level=parent.trophic_level,
+        rng=rng,
+    )
+
+    # ========== 2. 使用规则引擎生成特质变化 ==========
+    trait_changes = {}
+
+    # 从规则引擎获取建议的增强/减弱属性
+    suggested_increases = constraints.get("suggested_increases", [])
+    suggested_decreases = constraints.get("suggested_decreases", [])
+
+    # 增强属性（使用规则引擎的预算）
+    trait_budget = constraints.get("_trait_budget")
+    if trait_budget:
+        max_increase = trait_budget.total_increase_allowed
+        max_decrease = trait_budget.total_decrease_required
+        single_max = trait_budget.single_trait_max
+    else:
+        max_increase, max_decrease, single_max = 3.0, 1.5, 2.0
+
+    # 分配增强点数
+    total_increase = 0
+    for trait in suggested_increases[:2]:  # 最多增强2个属性
+        if trait and "随机" not in trait:
+            change = rng.uniform(
+                0.5, min(single_max, max_increase - total_increase)
+            )
+            trait_changes[trait] = f"+{change:.1f}"
+            total_increase += change
+            if total_increase >= max_increase:
+                break
+
+    # 分配减弱点数（权衡）
+    total_decrease = 0
+    for trait in suggested_decreases[:2]:  # 最多减弱2个属性
+        if trait:
+            change = rng.uniform(
+                0.3, min(single_max * 0.5, max_decrease - total_decrease)
+            )
+            trait_changes[trait] = f"-{change:.1f}"
+            total_decrease += change
+            if total_decrease >= max_decrease:
+                break
+
+    # ========== 3. 生成器官演化（使用约束）==========
+    organ_evolution = []
+    organ_constraints = constraints.get("_organ_constraints", [])
+
+    # 随机选择一个器官进行演化
+    evolvable_organs = [
+        oc
+        for oc in organ_constraints
+        if oc.max_target_stage > oc.current_stage
+    ]
+
+    if evolvable_organs and rng.random() > 0.3:  # 70% 概率进行器官演化
+        chosen = rng.choice(evolvable_organs)
+        new_stage = min(chosen.max_target_stage, chosen.current_stage + 1)
+
+        organ_names = {
+            "locomotion": "运动器官",
+            "sensory": "感觉器官",
+            "metabolic": "代谢系统",
+            "digestive": "消化系统",
+            "defense": "防御结构",
+            "reproduction": "繁殖系统",
+        }
+        stage_names = {
+            1: "原基形成",
+            2: "初级结构",
+            3: "功能完善",
+            4: "高度特化",
+        }
+
+        organ_evolution.append(
+            {
+                "category": chosen.category,
+                "current_stage": chosen.current_stage,
+                "target_stage": new_stage,
+                "description": (
+                    f"{organ_names.get(chosen.category, chosen.category)}"
+                    f"发展至{stage_names.get(new_stage, '新阶段')}"
+                ),
+            }
+        )
+
+    # ========== 4. 生成形态变化 ==========
+    parent_morph = parent.morphology_stats or {}
+    morphology_changes = {}
+
+    # 体长变化（±20%）
+    base_length = parent_morph.get("body_length_cm", 10.0)
+    length_ratio = rng.uniform(0.85, 1.15)
+    morphology_changes["body_length_cm"] = length_ratio
+
+    # 体重变化（与体长相关，但有独立变异）
+    base_weight = parent_morph.get("body_weight_g", 100.0)
+    weight_ratio = length_ratio**2.5 * rng.uniform(0.9, 1.1)  # 体重与体长的立方近似
+    morphology_changes["body_weight_g"] = weight_ratio
+
+    # ========== 5. 生成描述（更详细）==========
+    habitat_map = {
+        "marine": "海洋",
+        "freshwater": "淡水",
+        "terrestrial": "陆地",
+        "amphibious": "两栖",
+        "aerial": "空中",
+        "deep_sea": "深海",
+        "coastal": "沿岸",
+    }
+    diet_map = {
+        "herbivore": "植食性",
+        "carnivore": "肉食性",
+        "omnivore": "杂食性",
+        "detritivore": "腐食性",
+        "autotroph": "自养型",
+    }
+
+    habitat_str = habitat_map.get(
+        parent.habitat_type, parent.habitat_type or "未知"
+    )
+    diet_str = diet_map.get(parent.diet_type, parent.diet_type or "杂食性")
+    direction_desc = constraints.get("direction_description", "自然选择")
+
+    # 构建详细描述
+    description_parts = [
+        f"{new_common_name}是从{parent.common_name}分化而来的{habitat_str}{diet_str}物种。",
+        f"在{speciation_type}的选择压力下，该物种发展出{direction_desc}的演化策略。",
+    ]
+
+    # 添加关键特质描述
+    if trait_changes:
+        changes_desc = []
+        for trait, change in trait_changes.items():
+            if change.startswith("+"):
+                changes_desc.append(f"{trait}增强")
+            else:
+                changes_desc.append(f"{trait}降低")
+        description_parts.append(f"主要适应性变化包括{'、'.join(changes_desc)}。")
+
+    # 添加器官演化描述
+    if organ_evolution:
+        organ_desc = organ_evolution[0].get("description", "器官结构优化")
+        description_parts.append(f"形态上，{organ_desc}。")
+
+    description = "".join(description_parts)
+
+    # ========== 6. 生成关键创新 ==========
+    key_innovations = [f"{speciation_type}适应"]
+    if organ_evolution:
+        key_innovations.append(
+            organ_evolution[0].get("description", "器官演化")
+        )
+    if suggested_increases:
+        key_innovations.append(f"{suggested_increases[0]}强化")
+
+    # ========== 7. 返回完整内容 ==========
+    logger.info(
+        f"[规则Fallback] 为 {new_code} 生成规则物种: "
+        f"{new_common_name} ({evolution_direction})"
+    )
+
+    return {
+        "latin_name": new_species_name,
+        "common_name": new_common_name,
+        "description": description,
+        "habitat_type": parent.habitat_type,
+        "trophic_level": parent.trophic_level,
+        "diet_type": parent.diet_type,
+        "prey_species": (
+            list(parent.prey_species) if parent.prey_species else []
+        ),
+        "prey_preferences": (
+            dict(parent.prey_preferences) if parent.prey_preferences else {}
+        ),
+        "key_innovations": key_innovations,
+        "trait_changes": trait_changes,
+        "morphology_changes": morphology_changes,
+        "event_description": (
+            f"因{speciation_type}从{parent.common_name}分化，"
+            f"采用{evolution_direction}策略"
+        ),
+        "speciation_type": speciation_type,
+        "reason": (
+            f"在{speciation_type}条件下，通过{direction_desc}实现自然选择"
+        ),
+        "organ_evolution": organ_evolution,
+        "_is_rule_fallback": True,  # 标记为规则生成
+        "_evolution_direction": evolution_direction,  # 记录演化方向供后续使用
+    }
+
+
 def normalize_ai_content(ai_content: Any) -> Any:
     """将新格式的AI输出规范化为内部通用字段。
 
