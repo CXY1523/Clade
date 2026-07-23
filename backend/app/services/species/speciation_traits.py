@@ -6,6 +6,82 @@ from typing import Any, Callable
 logger = logging.getLogger(f"{__package__}.speciation")
 
 
+def add_differentiation_noise(
+    trait_changes: dict[str, float],
+    lineage_code: str,
+) -> dict[str, float]:
+    """【差异化机制】为不同子代添加随机偏移
+
+    原理：同一次分化的多个子代应该有不同的演化方向
+    - 基于谱系编码的最后字符（a, b, c...）确定偏移模式
+    - 确保兄弟物种之间有明显差异
+
+    Args:
+        trait_changes: 当前变化字典
+        lineage_code: 谱系编码（如 "A1a", "A1b", "A1c"）
+
+    Returns:
+        添加差异化后的变化字典
+    """
+    import random
+    import hashlib
+
+    if not trait_changes:
+        return trait_changes
+
+    # 基于完整谱系编码生成唯一随机种子
+    seed = int(hashlib.md5(lineage_code.encode()).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+
+    # 提取最后一个字符来确定子代编号
+    last_char = lineage_code[-1] if lineage_code else 'a'
+    offspring_index = ord(last_char.lower()) - ord('a')  # a=0, b=1, c=2...
+
+    # 定义演化方向偏好（不同子代偏向不同方向）
+    # 偏好模式：每个子代有2-3个属性获得额外加成，另外2-3个属性减少
+    direction_patterns = [
+        {"favor": ["耐寒性", "耐热性"], "disfavor": ["运动能力", "繁殖速度"]},  # 温度适应型
+        {"favor": ["运动能力", "攻击性"], "disfavor": ["耐寒性", "社会性"]},     # 活动型
+        {"favor": ["繁殖速度", "社会性"], "disfavor": ["攻击性", "运动能力"]},   # 繁殖型
+        {"favor": ["防御性", "耐旱性"], "disfavor": ["繁殖速度", "攻击性"]},      # 防御型
+        {"favor": ["耐盐性", "耐旱性"], "disfavor": ["社会性", "防御性"]},        # 环境适应型
+    ]
+
+    pattern = direction_patterns[offspring_index % len(direction_patterns)]
+
+    adjusted = dict(trait_changes)
+
+    # 对偏好属性添加额外加成（±0.3到±1.0）
+    for trait in pattern["favor"]:
+        if trait in adjusted:
+            bonus = rng.uniform(0.2, 0.8)
+            adjusted[trait] = round(adjusted[trait] + bonus, 2)
+        else:
+            # 即使AI没提议，也添加小幅增加
+            adjusted[trait] = round(rng.uniform(0.3, 0.8), 2)
+
+    # 对不偏好属性添加额外减少
+    for trait in pattern["disfavor"]:
+        if trait in adjusted:
+            penalty = rng.uniform(0.2, 0.6)
+            adjusted[trait] = round(adjusted[trait] - penalty, 2)
+        else:
+            # 添加小幅减少
+            adjusted[trait] = round(-rng.uniform(0.2, 0.5), 2)
+
+    # 添加额外的随机噪声（确保即使相同模式也有差异）
+    for trait_name in list(adjusted.keys()):
+        noise = rng.uniform(-0.3, 0.3)
+        adjusted[trait_name] = round(adjusted[trait_name] + noise, 2)
+
+    logger.debug(
+        f"[差异化] {lineage_code}: 偏好{pattern['favor']}, "
+        f"变化总和={sum(adjusted.values()):.2f}"
+    )
+
+    return adjusted
+
+
 def apply_tradeoff_penalties(
     proposed_changes: dict[str, float],
     current_traits: dict[str, float],

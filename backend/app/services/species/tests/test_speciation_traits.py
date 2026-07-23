@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from ..speciation import SpeciationService
 from ..speciation_traits import (
+    add_differentiation_noise,
     apply_tradeoff_penalties,
     clamp_traits_to_limit,
     enforce_trait_tradeoffs,
@@ -292,3 +293,55 @@ def test_service_enforced_tradeoffs_delegate_matches_direct_function() -> None:
         proposed,
         "A1a",
     ) == enforce_trait_tradeoffs(current, proposed, "A1a")
+
+
+def test_differentiation_noise_preserves_empty_input_identity() -> None:
+    changes = {}
+
+    assert add_differentiation_noise(changes, "A1a") is changes
+
+
+def test_differentiation_noise_is_exactly_deterministic_by_lineage() -> None:
+    changes = {"speed": 1.0, "armor": 2.0}
+
+    assert add_differentiation_noise(changes, "A1a") == {
+        "speed": 1.16,
+        "armor": 2.12,
+        "耐寒性": 0.43,
+        "耐热性": 0.9,
+        "运动能力": 0.0,
+        "繁殖速度": -0.32,
+    }
+    assert add_differentiation_noise(changes, "A1b") == {
+        "speed": 1.08,
+        "armor": 1.77,
+        "运动能力": 0.79,
+        "攻击性": 0.43,
+        "耐寒性": -0.41,
+        "社会性": -0.43,
+    }
+    assert changes == {"speed": 1.0, "armor": 2.0}
+
+
+def test_differentiation_noise_uses_a_pattern_for_empty_lineage() -> None:
+    assert add_differentiation_noise(
+        {"speed": 1.0, "armor": 2.0},
+        "",
+    ) == {
+        "speed": 0.71,
+        "armor": 2.25,
+        "耐寒性": 0.28,
+        "耐热性": 0.75,
+        "运动能力": -0.57,
+        "繁殖速度": -0.25,
+    }
+
+
+def test_service_differentiation_noise_delegate_matches_direct_function() -> None:
+    service = object.__new__(SpeciationService)
+    changes = {"speed": 1.0, "armor": 2.0}
+
+    assert service._add_differentiation_noise(
+        changes,
+        "A1a",
+    ) == add_differentiation_noise(changes, "A1a")
