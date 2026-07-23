@@ -547,6 +547,175 @@ def normalize_organ_evolution(
     return normalized
 
 
+def inherit_and_update_organs(
+    parent: Species,
+    ai_payload: dict,
+    turn_index: int,
+    is_plant: Callable[[Species], bool],
+    process_plant_changes: Callable[[dict, list, Species, int], dict],
+    infer_domain: Callable[[Species], str],
+    validate_gradual: Callable[[list, dict, str], tuple[bool, list]],
+    normalize_evolution: Callable[[list, Species, int, float], list],
+) -> dict:
+    """继承父代器官并应用渐进式器官进化
+
+    支持三种格式（优先级从高到低）：
+    - organ_changes: 【新】植物混合模式格式（支持自定义器官）
+    - organ_evolution: 渐进式进化格式（动物）
+    - structural_innovations: 旧格式（向后兼容）
+
+    Args:
+        parent: 父系物种
+        ai_payload: AI返回的数据
+        turn_index: 当前回合
+
+    Returns:
+        更新后的器官字典
+    """
+    # 1. 继承父代所有器官（深拷贝）
+    organs = {}
+    for category, organ_data in parent.organs.items():
+        organs[category] = dict(organ_data)
+        # 确保有进化阶段字段
+        if "evolution_stage" not in organs[category]:
+            organs[category]["evolution_stage"] = 4  # 旧数据默认完善
+        if "evolution_progress" not in organs[category]:
+            organs[category]["evolution_progress"] = 1.0
+
+    # 【植物混合模式】优先处理 organ_changes 格式
+    if is_plant(parent):
+        organ_changes = ai_payload.get("organ_changes", [])
+        if organ_changes and isinstance(organ_changes, list):
+            organs = process_plant_changes(
+                organs, organ_changes, parent, turn_index
+            )
+            return organs  # 植物使用专用处理，跳过动物逻辑
+
+    # 2. 优先使用新的 organ_evolution 格式
+    organ_evolution = ai_payload.get("organ_evolution", [])
+    if organ_evolution and isinstance(organ_evolution, list):
+        # 推断生物类群进行验证
+        biological_domain = infer_domain(parent)
+
+        # 验证渐进式进化规则
+        _, valid_evolutions = validate_gradual(
+            organ_evolution, parent.organs, biological_domain
+        )
+        # 归一化/去重/半径限制
+        valid_evolutions = normalize_evolution(
+            valid_evolutions,
+            parent,
+            turn_index,
+            getattr(parent, "gene_diversity_radius", 0.35) or 0.35,
+        )
+
+        for evo in valid_evolutions:
+            category = evo.get("category", "unknown")
+            action = evo.get("action", "enhance")
+            target_stage = evo.get("target_stage", 1)
+            structure_name = evo.get("structure_name", "未知结构")
+            description = evo.get("description", "")
+
+            if action == "initiate":
+                # 开始发展新器官（从原基开始）
+                organs[category] = {
+                    "type": structure_name,
+                    "parameters": {},
+                    "evolution_stage": target_stage,
+                    "evolution_progress": target_stage / 4.0,  # 阶段对应进度
+                    "acquired_turn": turn_index,
+                    "is_active": target_stage >= 2,  # 阶段2+才有基础功能
+                    "evolution_history": [
+                        {
+                            "turn": turn_index,
+                            "from_stage": 0,
+                            "to_stage": target_stage,
+                            "description": description
+                        }
+                    ]
+                }
+                logger.info(
+                    f"[渐进式演化] 开始发展{category}: {structure_name} (阶段0→{target_stage})"
+                )
+
+            elif action == "enhance" and category in organs:
+                # 增强现有器官
+                current_stage = organs[category].get("evolution_stage", 4)
+
+                organs[category]["type"] = structure_name
+                organs[category]["evolution_stage"] = target_stage
+                organs[category]["evolution_progress"] = target_stage / 4.0
+                organs[category]["modified_turn"] = turn_index
+                organs[category]["is_active"] = target_stage >= 2
+
+                # 记录演化历史
+                if "evolution_history" not in organs[category]:
+                    organs[category]["evolution_history"] = []
+                organs[category]["evolution_history"].append({
+                    "turn": turn_index,
+                    "from_stage": current_stage,
+                    "to_stage": target_stage,
+                    "description": description
+                })
+
+                logger.info(
+                    f"[渐进式演化] 增强{category}: {structure_name} "
+                    f"(阶段{current_stage}→{target_stage})"
+                )
+
+        return organs
+
+    # 3. 兼容旧的 structural_innovations 格式（转换为渐进式）
+    innovations = ai_payload.get("structural_innovations", [])
+    if not isinstance(innovations, list):
+        return organs
+
+    for innovation in innovations:
+        if not isinstance(innovation, dict):
+            continue
+
+        category = innovation.get("category", "unknown")
+        organ_type = innovation.get("type", "unknown")
+        parameters = innovation.get("parameters", {})
+
+        if category in organs:
+            # 器官改进：最多提升1个阶段
+            current_stage = organs[category].get("evolution_stage", 4)
+            new_stage = min(current_stage + 1, 4)
+
+            organs[category]["type"] = organ_type
+            organs[category]["parameters"] = parameters
+            organs[category]["evolution_stage"] = new_stage
+            organs[category]["evolution_progress"] = new_stage / 4.0
+            organs[category]["modified_turn"] = turn_index
+            organs[category]["is_active"] = True
+            logger.info(
+                f"[器官演化-兼容] 改进器官: {category} → {organ_type} "
+                f"(阶段{current_stage}→{new_stage})"
+            )
+        else:
+            # 新器官：从阶段1（原基）开始，而不是直接完善
+            organs[category] = {
+                "type": organ_type,
+                "parameters": parameters,
+                "evolution_stage": 1,  # 从原基开始
+                "evolution_progress": 0.25,
+                "acquired_turn": turn_index,
+                "is_active": False,  # 阶段1还没有功能
+                "evolution_history": [{
+                    "turn": turn_index,
+                    "from_stage": 0,
+                    "to_stage": 1,
+                    "description": f"开始发展{organ_type}原基"
+                }]
+            }
+            logger.info(
+                f"[器官演化-兼容] 新器官原基: {category} → {organ_type} (阶段1)"
+            )
+
+    return organs
+
+
 def update_capabilities(parent: Species, organs: dict) -> list[str]:
     """根据器官更新能力标签
 

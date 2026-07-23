@@ -11,6 +11,7 @@ from ..plant_evolution import (
 from ..speciation import SpeciationService
 from ..speciation_organs import (
     get_complexity_constraints,
+    inherit_and_update_organs,
     infer_biological_domain,
     infer_complexity_by_embedding,
     infer_complexity_by_rules,
@@ -865,3 +866,301 @@ def test_service_domain_delegate_preserves_method_overrides() -> None:
         _embedding_species()
     ) == "complexity_5"
     assert calls == ["embedding", "rules"]
+
+
+def _unexpected_organ_callback(*args, **kwargs):
+    raise AssertionError(f"unexpected callback: {args!r} {kwargs!r}")
+
+
+def test_organ_update_inherits_category_defaults_and_preserves_nested_sharing() -> None:
+    parameters = {"focus": 0.8}
+    history = [{"turn": 1}]
+    parent = SimpleNamespace(
+        organs={
+            "sensory": {
+                "type": "眼点",
+                "parameters": parameters,
+                "evolution_history": history,
+            }
+        },
+        gene_diversity_radius=0.35,
+    )
+
+    result = inherit_and_update_organs(
+        parent,
+        {},
+        8,
+        lambda current: False,
+        _unexpected_organ_callback,
+        _unexpected_organ_callback,
+        _unexpected_organ_callback,
+        _unexpected_organ_callback,
+    )
+
+    assert result["sensory"] is not parent.organs["sensory"]
+    assert result["sensory"]["evolution_stage"] == 4
+    assert result["sensory"]["evolution_progress"] == 1.0
+    assert "evolution_stage" not in parent.organs["sensory"]
+    assert result["sensory"]["parameters"] is parameters
+    assert result["sensory"]["evolution_history"] is history
+
+
+def test_organ_update_uses_plant_changes_before_animal_formats() -> None:
+    calls = []
+    plant_result = {"plant": {"type": "叶绿体"}}
+    parent = SimpleNamespace(
+        organs={"photosynthetic": {"type": "光合泡"}},
+        gene_diversity_radius=0.35,
+    )
+    changes = [{"action": "initiate", "organ_name": "叶绿体"}]
+
+    def process_plant(organs, organ_changes, current_parent, turn_index):
+        calls.append(("plant", organs, organ_changes, current_parent, turn_index))
+        return plant_result
+
+    result = inherit_and_update_organs(
+        parent,
+        {
+            "organ_changes": changes,
+            "organ_evolution": [{"action": "initiate"}],
+            "structural_innovations": [{"category": "legacy"}],
+        },
+        9,
+        lambda current: calls.append(("is_plant", current)) or True,
+        process_plant,
+        _unexpected_organ_callback,
+        _unexpected_organ_callback,
+        _unexpected_organ_callback,
+    )
+
+    assert result is plant_result
+    assert [call[0] for call in calls] == ["is_plant", "plant"]
+    _, inherited, passed_changes, passed_parent, passed_turn = calls[1]
+    assert inherited["photosynthetic"]["evolution_stage"] == 4
+    assert passed_changes is changes
+    assert passed_parent is parent
+    assert passed_turn == 9
+
+
+def test_organ_update_applies_normalized_gradual_evolution_in_callback_order() -> None:
+    history = [{"turn": 2, "from_stage": 1, "to_stage": 2}]
+    parent = SimpleNamespace(
+        organs={
+            "sensory": {
+                "type": "眼点",
+                "evolution_stage": 2,
+                "evolution_progress": 0.5,
+                "evolution_history": history,
+            }
+        },
+        gene_diversity_radius=0,
+    )
+    raw = [{"action": "raw"}]
+    valid = [{"action": "validated"}]
+    normalized = [
+        {
+            "category": "locomotion",
+            "action": "initiate",
+            "target_stage": 1,
+            "structure_name": "鳍芽",
+            "description": "开始形成鳍",
+        },
+        {
+            "category": "sensory",
+            "action": "enhance",
+            "target_stage": 3,
+            "structure_name": "复眼",
+            "description": "视觉增强",
+        },
+    ]
+    calls = []
+
+    def infer_domain(current_parent):
+        calls.append(("domain", current_parent))
+        return "complexity_3"
+
+    def validate(evolutions, parent_organs, domain):
+        calls.append(("validate", evolutions, parent_organs, domain))
+        return False, valid
+
+    def normalize(evolutions, current_parent, turn_index, radius):
+        calls.append(("normalize", evolutions, current_parent, turn_index, radius))
+        return normalized
+
+    result = inherit_and_update_organs(
+        parent,
+        {"organ_evolution": raw},
+        12,
+        lambda current: False,
+        _unexpected_organ_callback,
+        infer_domain,
+        validate,
+        normalize,
+    )
+
+    assert [call[0] for call in calls] == ["domain", "validate", "normalize"]
+    assert calls[1][1:] == (raw, parent.organs, "complexity_3")
+    assert calls[2][1:] == (valid, parent, 12, 0.35)
+    assert result["locomotion"] == {
+        "type": "鳍芽",
+        "parameters": {},
+        "evolution_stage": 1,
+        "evolution_progress": 0.25,
+        "acquired_turn": 12,
+        "is_active": False,
+        "evolution_history": [
+            {
+                "turn": 12,
+                "from_stage": 0,
+                "to_stage": 1,
+                "description": "开始形成鳍",
+            }
+        ],
+    }
+    assert result["sensory"]["type"] == "复眼"
+    assert result["sensory"]["evolution_stage"] == 3
+    assert result["sensory"]["evolution_progress"] == 0.75
+    assert result["sensory"]["modified_turn"] == 12
+    assert result["sensory"]["is_active"] is True
+    assert result["sensory"]["evolution_history"] is history
+    assert parent.organs["sensory"]["evolution_history"][-1] == {
+        "turn": 12,
+        "from_stage": 2,
+        "to_stage": 3,
+        "description": "视觉增强",
+    }
+
+
+def test_organ_update_non_list_gradual_payload_falls_through_to_legacy() -> None:
+    parent = SimpleNamespace(
+        organs={
+            "sensory": {
+                "type": "眼点",
+                "evolution_stage": 4,
+                "evolution_progress": 1.0,
+            }
+        },
+        gene_diversity_radius=0.35,
+    )
+
+    result = inherit_and_update_organs(
+        parent,
+        {
+            "organ_evolution": {"action": "enhance"},
+            "structural_innovations": [
+                "invalid",
+                {
+                    "category": "sensory",
+                    "type": "复眼",
+                    "parameters": {"acuity": 0.9},
+                },
+                {
+                    "category": "defense",
+                    "type": "甲壳",
+                    "parameters": {"hardness": 0.6},
+                },
+            ],
+        },
+        15,
+        lambda current: False,
+        _unexpected_organ_callback,
+        _unexpected_organ_callback,
+        _unexpected_organ_callback,
+        _unexpected_organ_callback,
+    )
+
+    assert result["sensory"] == {
+        "type": "复眼",
+        "parameters": {"acuity": 0.9},
+        "evolution_stage": 4,
+        "evolution_progress": 1.0,
+        "modified_turn": 15,
+        "is_active": True,
+    }
+    assert result["defense"] == {
+        "type": "甲壳",
+        "parameters": {"hardness": 0.6},
+        "evolution_stage": 1,
+        "evolution_progress": 0.25,
+        "acquired_turn": 15,
+        "is_active": False,
+        "evolution_history": [
+            {
+                "turn": 15,
+                "from_stage": 0,
+                "to_stage": 1,
+                "description": "开始发展甲壳原基",
+            }
+        ],
+    }
+
+
+def test_organ_update_returns_inherited_organs_for_non_list_legacy_payload() -> None:
+    parent = SimpleNamespace(
+        organs={"sensory": {"type": "眼点"}},
+        gene_diversity_radius=0.35,
+    )
+
+    result = inherit_and_update_organs(
+        parent,
+        {"structural_innovations": {"category": "sensory"}},
+        16,
+        lambda current: False,
+        _unexpected_organ_callback,
+        _unexpected_organ_callback,
+        _unexpected_organ_callback,
+        _unexpected_organ_callback,
+    )
+
+    assert result == {
+        "sensory": {
+            "type": "眼点",
+            "evolution_stage": 4,
+            "evolution_progress": 1.0,
+        }
+    }
+
+
+def test_service_organ_update_delegate_preserves_method_overrides(
+    monkeypatch,
+) -> None:
+    calls = []
+    parent = SimpleNamespace(organs={}, gene_diversity_radius=0.4)
+    evolution = [{"action": "enhance"}]
+
+    class _OverriddenService(SpeciationService):
+        def _infer_biological_domain(self, current_parent):
+            calls.append(("domain", current_parent))
+            return "complexity_2"
+
+        def _validate_gradual_evolution(
+            self, evolutions, parent_organs, biological_domain
+        ):
+            calls.append(
+                ("validate", evolutions, parent_organs, biological_domain)
+            )
+            return True, evolutions
+
+        def _normalize_organ_evolution(
+            self, evolutions, current_parent, turn_index, radius
+        ):
+            calls.append(
+                ("normalize", evolutions, current_parent, turn_index, radius)
+            )
+            return []
+
+    monkeypatch.setattr(
+        "app.services.species.speciation.PlantTraitConfig.is_plant",
+        lambda current: calls.append(("is_plant", current)) or False,
+    )
+    service = object.__new__(_OverriddenService)
+
+    assert service._inherit_and_update_organs(
+        parent, {"organ_evolution": evolution}, 17
+    ) == {}
+    assert [call[0] for call in calls] == [
+        "is_plant",
+        "domain",
+        "validate",
+        "normalize",
+    ]
