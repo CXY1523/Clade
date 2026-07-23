@@ -4,6 +4,7 @@ from ..speciation import SpeciationService
 from ..speciation_traits import (
     apply_tradeoff_penalties,
     clamp_traits_to_limit,
+    enforce_trait_tradeoffs,
     validate_trait_changes,
 )
 
@@ -242,3 +243,52 @@ def test_service_trait_clamp_delegate_uses_bound_limit_calculator() -> None:
         4.0,
     ) == {"speed": 3.0}
     assert calls == [4.0]
+
+
+def test_enforced_tradeoffs_preserve_empty_and_sufficient_decrease_identity() -> None:
+    empty = {}
+    sufficient = {"speed": 10.0, "social": -3.0}
+
+    assert enforce_trait_tradeoffs({}, empty, "A1a") is empty
+    assert enforce_trait_tradeoffs(
+        {"armor": 10.0},
+        sufficient,
+        "A1a",
+    ) is sufficient
+
+
+def test_enforced_tradeoffs_reduce_gains_when_no_candidate_exists() -> None:
+    assert enforce_trait_tradeoffs(
+        {"speed": 5.0},
+        {"speed": 4.0},
+        "A1a",
+    ) == {"speed": 2.4}
+
+
+def test_enforced_tradeoffs_are_exactly_deterministic_by_lineage() -> None:
+    current = {"armor": 10.0, "social": 8.0, "speed": 5.0}
+    proposed = {"speed": 4.0}
+
+    assert enforce_trait_tradeoffs(current, proposed, "A1a") == {
+        "speed": 4.0,
+        "social": -1.42,
+        "armor": -0.11,
+    }
+    assert enforce_trait_tradeoffs(current, proposed, "A1b") == {
+        "speed": 4.0,
+        "armor": -1.2,
+        "social": -0.23,
+    }
+    assert proposed == {"speed": 4.0}
+
+
+def test_service_enforced_tradeoffs_delegate_matches_direct_function() -> None:
+    service = object.__new__(SpeciationService)
+    current = {"armor": 10.0, "social": 8.0, "speed": 5.0}
+    proposed = {"speed": 4.0}
+
+    assert service._enforce_trait_tradeoffs(
+        current,
+        proposed,
+        "A1a",
+    ) == enforce_trait_tradeoffs(current, proposed, "A1a")

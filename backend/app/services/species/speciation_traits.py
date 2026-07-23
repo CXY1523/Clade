@@ -113,6 +113,88 @@ def clamp_traits_to_limit(
     return {k: round(v, 2) for k, v in clamped.items()}
 
 
+def enforce_trait_tradeoffs(
+    current_traits: dict[str, float],
+    proposed_changes: dict[str, float],
+    lineage_code: str,
+) -> dict[str, float]:
+    """【强制权衡机制】确保属性变化有增必有减
+
+    原理：50万年的演化不应该是纯粹的"升级"，而是适应性权衡
+    - 如果提议的变化只增不减，自动添加减少项
+    - 确保属性总和不会无限增长
+
+    Args:
+        current_traits: 当前属性字典
+        proposed_changes: AI提议的变化 {"耐寒性": 2.0, "运动能力": 1.0}
+        lineage_code: 谱系编码（用于确定哪些属性减少）
+
+    Returns:
+        调整后的变化字典
+    """
+    import random
+    import hashlib
+
+    if not proposed_changes:
+        return proposed_changes
+
+    # 计算总变化
+    increases = {k: v for k, v in proposed_changes.items() if v > 0}
+    decreases = {k: v for k, v in proposed_changes.items() if v < 0}
+
+    total_increase = sum(increases.values())
+    total_decrease = abs(sum(decreases.values()))
+
+    # 如果已经有足够的减少，直接返回
+    if total_decrease >= total_increase * 0.3:
+        return proposed_changes
+
+    # 需要添加的减少量（至少抵消30%的增加）
+    needed_decrease = total_increase * 0.4 - total_decrease
+    if needed_decrease <= 0:
+        return proposed_changes
+
+    # 基于谱系编码生成确定性随机种子（确保同一物种每次结果一致）
+    seed = int(hashlib.md5(lineage_code.encode()).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+
+    # 选择要减少的属性（优先选择当前值较高且未被增加的）
+    adjusted = dict(proposed_changes)
+    candidate_traits = [
+        (name, value)
+        for name, value in current_traits.items()
+        if name not in increases and value > 3.0  # 只减少中高值属性
+    ]
+
+    if not candidate_traits:
+        # 如果没有合适的候选，从增加项中随机选一个减少幅度
+        for trait_name in list(increases.keys()):
+            if needed_decrease <= 0:
+                break
+            reduction = min(needed_decrease, increases[trait_name] * 0.5)
+            adjusted[trait_name] = increases[trait_name] - reduction
+            needed_decrease -= reduction
+        return adjusted
+
+    # 随机选择1-3个属性进行减少
+    rng.shuffle(candidate_traits)
+    num_to_reduce = min(len(candidate_traits), rng.randint(1, 3))
+
+    for trait_name, current_value in candidate_traits[:num_to_reduce]:
+        if needed_decrease <= 0:
+            break
+        # 减少幅度与当前值成比例（高值属性减更多）
+        max_reduction = min(needed_decrease, current_value * 0.2, 3.0)
+        reduction = rng.uniform(max_reduction * 0.5, max_reduction)
+        adjusted[trait_name] = -round(reduction, 2)
+        needed_decrease -= reduction
+        logger.debug(
+            f"[权衡] {lineage_code}: {trait_name} -{reduction:.2f} (权衡代价)"
+        )
+
+    return adjusted
+
+
 def validate_trait_changes(
     old_traits: dict,
     new_traits: dict,
