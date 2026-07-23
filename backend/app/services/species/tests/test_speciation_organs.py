@@ -11,6 +11,8 @@ from ..plant_evolution import (
 from ..speciation import SpeciationService
 from ..speciation_organs import (
     get_complexity_constraints,
+    infer_biological_domain,
+    infer_complexity_by_embedding,
     infer_complexity_by_rules,
     normalize_organ_evolution,
     process_plant_organ_changes,
@@ -36,6 +38,34 @@ ORGAN_CATALOG = [
         "default_name": "鳍状运动",
     },
 ]
+
+COMPLEXITY_REFERENCES = {
+    0: "level zero",
+    1: "level one",
+    2: "level two",
+}
+
+
+class _EmbeddingVectors:
+    def __init__(
+        self,
+        reference_vectors: list[list[float]],
+        species_vector: list[float],
+        *,
+        fail_species: bool = False,
+    ) -> None:
+        self.reference_vectors = reference_vectors
+        self.species_vector = species_vector
+        self.fail_species = fail_species
+        self.calls: list[tuple[list[str], bool]] = []
+
+    def embed(self, texts: list[str], require_real: bool = False) -> list[list[float]]:
+        self.calls.append((list(texts), require_real))
+        if len(texts) > 1:
+            return self.reference_vectors
+        if self.fail_species:
+            raise RuntimeError("species embedding failed")
+        return [self.species_vector]
 
 
 def test_capabilities_convert_legacy_labels_preserve_unknown_and_deduplicate() -> None:
@@ -672,3 +702,166 @@ def test_service_organ_normalization_delegate_matches_direct_function() -> None:
         service._organ_catalog,
     )
     assert service_changes == direct_changes
+
+
+def _embedding_species() -> SimpleNamespace:
+    return SimpleNamespace(
+        common_name="test species",
+        description="test description",
+        abstract_traits={"speed": 8.0, "armor": 2.0},
+    )
+
+
+def _infer_with_cache(
+    embedding_service: _EmbeddingVectors,
+    state: dict,
+    *,
+    effective: dict[int, list[float]] | None = None,
+) -> int | None:
+    return infer_complexity_by_embedding(
+        _embedding_species(),
+        embedding_service,
+        COMPLEXITY_REFERENCES,
+        lambda: state["base"],
+        lambda value: state.__setitem__("base", value),
+        lambda: state["base"] if effective is None else effective,
+    )
+
+
+def test_domain_selection_prefers_embedding_and_skips_rules() -> None:
+    calls = []
+    species = _embedding_species()
+
+    result = infer_biological_domain(
+        species,
+        lambda current: calls.append(("embedding", current)) or 4,
+        lambda current: calls.append(("rules", current)) or 2,
+    )
+
+    assert result == "complexity_4"
+    assert calls == [("embedding", species)]
+
+
+def test_domain_selection_falls_back_to_rules_only_for_none() -> None:
+    species = _embedding_species()
+    calls = []
+
+    result = infer_biological_domain(
+        species,
+        lambda current: calls.append(("embedding", current)),
+        lambda current: calls.append(("rules", current)) or 2,
+    )
+
+    assert result == "complexity_2"
+    assert calls == [("embedding", species), ("rules", species)]
+
+
+def test_embedding_complexity_initializes_cache_and_selects_best_level() -> None:
+    embedding_service = _EmbeddingVectors(
+        [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]],
+        [0.0, 2.0],
+    )
+    state = {"base": None}
+
+    assert _infer_with_cache(embedding_service, state) == 1
+    assert state["base"] == {
+        0: [1.0, 0.0],
+        1: [0.0, 1.0],
+        2: [-1.0, 0.0],
+    }
+    assert embedding_service.calls[0] == (
+        list(COMPLEXITY_REFERENCES.values()),
+        False,
+    )
+    assert embedding_service.calls[1][1] is False
+
+
+def test_embedding_complexity_uses_effective_cache_without_reembedding_references() -> None:
+    embedding_service = _EmbeddingVectors([], [0.0, 1.0])
+    state = {"base": {0: [1.0, 0.0]}}
+    effective = {4: [0.0, 1.0]}
+
+    assert _infer_with_cache(
+        embedding_service, state, effective=effective
+    ) == 4
+    assert len(embedding_service.calls) == 1
+
+
+def test_embedding_complexity_returns_none_for_zero_species_vector() -> None:
+    embedding_service = _EmbeddingVectors([], [0.0, 0.0])
+    state = {"base": {0: [1.0, 0.0]}}
+
+    assert _infer_with_cache(embedding_service, state) is None
+
+
+def test_embedding_complexity_skips_zero_references_and_keeps_default_level() -> None:
+    embedding_service = _EmbeddingVectors([], [1.0, 0.0])
+    state = {"base": {0: [0.0, 0.0], 5: [0.0, 0.0]}}
+
+    assert _infer_with_cache(embedding_service, state) == 1
+
+
+def test_embedding_complexity_keeps_first_level_on_similarity_tie() -> None:
+    embedding_service = _EmbeddingVectors([], [1.0, 0.0])
+    state = {"base": {3: [1.0, 0.0], 4: [2.0, 0.0]}}
+
+    assert _infer_with_cache(embedding_service, state) == 3
+
+
+def test_embedding_complexity_preserves_cache_when_species_embed_fails() -> None:
+    embedding_service = _EmbeddingVectors(
+        [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]],
+        [0.0, 1.0],
+        fail_species=True,
+    )
+    state = {"base": None}
+
+    assert _infer_with_cache(embedding_service, state) is None
+    assert state["base"] == {
+        0: [1.0, 0.0],
+        1: [0.0, 1.0],
+        2: [-1.0, 0.0],
+    }
+
+
+def test_service_embedding_delegate_lazily_uses_router_and_class_cache(
+    monkeypatch,
+) -> None:
+    embedding_service = _EmbeddingVectors(
+        [[1.0, 0.0] for _ in SpeciationService._COMPLEXITY_REFERENCES],
+        [1.0, 0.0],
+    )
+    service = object.__new__(SpeciationService)
+    service.router = SimpleNamespace(embedding_service=embedding_service)
+    monkeypatch.setattr(SpeciationService, "_complexity_embeddings", None)
+
+    assert service._infer_complexity_by_embedding(_embedding_species()) == 0
+    assert service._embedding_service is embedding_service
+    assert SpeciationService._complexity_embeddings is not None
+
+
+def test_service_embedding_delegate_returns_none_without_available_service() -> None:
+    service = object.__new__(SpeciationService)
+    service.router = SimpleNamespace()
+
+    assert service._infer_complexity_by_embedding(_embedding_species()) is None
+
+
+def test_service_domain_delegate_preserves_method_overrides() -> None:
+    calls = []
+
+    class _OverriddenService(SpeciationService):
+        def _infer_complexity_by_embedding(self, species):
+            calls.append("embedding")
+            return None
+
+        def _infer_complexity_by_rules(self, species):
+            calls.append("rules")
+            return 5
+
+    service = object.__new__(_OverriddenService)
+
+    assert service._infer_biological_domain(
+        _embedding_species()
+    ) == "complexity_5"
+    assert calls == ["embedding", "rules"]

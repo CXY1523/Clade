@@ -40,6 +40,8 @@ from .speciation_habitat import (
 )
 from .speciation_organs import (
     get_complexity_constraints,
+    infer_biological_domain,
+    infer_complexity_by_embedding,
     infer_complexity_by_rules,
     normalize_organ_evolution,
     process_plant_organ_changes,
@@ -4921,14 +4923,11 @@ class SpeciationService:
         - complexity_4: 器官级（节肢动物、鱼类等）
         - complexity_5: 高等器官系统（脊椎动物高等类群）
         """
-        # 尝试使用embedding进行智能分类
-        complexity_level = self._infer_complexity_by_embedding(species)
-        
-        if complexity_level is None:
-            # 降级到基于规则的推断
-            complexity_level = self._infer_complexity_by_rules(species)
-        
-        return f"complexity_{complexity_level}"
+        return infer_biological_domain(
+            species,
+            self._infer_complexity_by_embedding,
+            self._infer_complexity_by_rules,
+        )
     
     def _infer_complexity_by_embedding(self, species: Species) -> int | None:
         """使用embedding相似度推断复杂度等级"""
@@ -4942,53 +4941,17 @@ class SpeciationService:
         
         if self._embedding_service is None:
             return None
-        
-        try:
-            # 懒加载参考描述的embedding
-            if SpeciationService._complexity_embeddings is None:
-                ref_descriptions = list(self._COMPLEXITY_REFERENCES.values())
-                ref_vectors = self._embedding_service.embed(ref_descriptions, require_real=False)
-                SpeciationService._complexity_embeddings = {
-                    level: vec for level, vec in enumerate(ref_vectors)
-                }
-            
-            # 获取物种描述的embedding（使用统一的描述构建方法）
-            from ..system.embedding import EmbeddingService
-            species_text = EmbeddingService.build_species_text(species, include_traits=True, include_names=False)
-            species_vec = self._embedding_service.embed([species_text], require_real=False)[0]
-            
-            # 计算与各等级参考的余弦相似度
-            import numpy as np
-            species_arr = np.array(species_vec)
-            species_norm = np.linalg.norm(species_arr)
-            if species_norm == 0:
-                return None
-            species_arr = species_arr / species_norm
-            
-            best_level = 1  # 默认简单真核
-            best_similarity = -1
-            
-            for level, ref_vec in self._complexity_embeddings.items():
-                ref_arr = np.array(ref_vec)
-                ref_norm = np.linalg.norm(ref_arr)
-                if ref_norm == 0:
-                    continue
-                ref_arr = ref_arr / ref_norm
-                
-                similarity = float(np.dot(species_arr, ref_arr))
-                if similarity > best_similarity:
-                    best_similarity = similarity
-                    best_level = level
-            
-            logger.debug(
-                f"[复杂度推断-embedding] {species.common_name}: "
-                f"等级{best_level} (相似度{best_similarity:.3f})"
-            )
-            return best_level
-            
-        except Exception as e:
-            logger.warning(f"[复杂度推断] Embedding推断失败: {e}")
-            return None
+
+        return infer_complexity_by_embedding(
+            species,
+            self._embedding_service,
+            self._COMPLEXITY_REFERENCES,
+            lambda: SpeciationService._complexity_embeddings,
+            lambda embeddings: setattr(
+                SpeciationService, "_complexity_embeddings", embeddings
+            ),
+            lambda: self._complexity_embeddings,
+        )
     
     def _infer_complexity_by_rules(self, species: Species) -> int:
         """基于规则推断复杂度等级（降级方案）"""

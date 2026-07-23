@@ -84,6 +84,93 @@ def get_complexity_constraints(complexity_level: str) -> dict:
         }
 
 
+def infer_biological_domain(
+    species: Species,
+    infer_by_embedding: Callable[[Species], int | None],
+    infer_by_rules: Callable[[Species], int],
+) -> str:
+    """根据物种特征推断其生物复杂度等级
+
+        采用多层判断策略：
+        1. 优先使用embedding相似度（如果服务可用）
+        2. 结构化特征检测（器官数量、体型等）
+        3. 关键词匹配作为补充
+
+        返回值：复杂度等级字符串，格式为 "complexity_N"
+        - complexity_0: 原核生物（细菌、古菌）
+        - complexity_1: 简单真核（单细胞真核生物）
+        - complexity_2: 殖民/简单多细胞（团藻、海绵等）
+        - complexity_3: 组织级（扁形虫、环节动物等）
+        - complexity_4: 器官级（节肢动物、鱼类等）
+        - complexity_5: 高等器官系统（脊椎动物高等类群）
+        """
+    # 尝试使用embedding进行智能分类
+    complexity_level = infer_by_embedding(species)
+
+    if complexity_level is None:
+        # 降级到基于规则的推断
+        complexity_level = infer_by_rules(species)
+
+    return f"complexity_{complexity_level}"
+
+
+def infer_complexity_by_embedding(
+    species: Species,
+    embedding_service: Any,
+    complexity_references: dict[int, str],
+    get_cached_embeddings: Callable[[], dict[int, list[float]] | None],
+    set_cached_embeddings: Callable[[dict[int, list[float]]], None],
+    get_effective_embeddings: Callable[[], dict[int, list[float]]],
+) -> int | None:
+    """使用embedding相似度推断复杂度等级"""
+    try:
+        # 懒加载参考描述的embedding
+        if get_cached_embeddings() is None:
+            ref_descriptions = list(complexity_references.values())
+            ref_vectors = embedding_service.embed(ref_descriptions, require_real=False)
+            set_cached_embeddings(
+                {level: vec for level, vec in enumerate(ref_vectors)}
+            )
+
+        # 获取物种描述的embedding（使用统一的描述构建方法）
+        from ..system.embedding import EmbeddingService
+        species_text = EmbeddingService.build_species_text(species, include_traits=True, include_names=False)
+        species_vec = embedding_service.embed([species_text], require_real=False)[0]
+
+        # 计算与各等级参考的余弦相似度
+        import numpy as np
+        species_arr = np.array(species_vec)
+        species_norm = np.linalg.norm(species_arr)
+        if species_norm == 0:
+            return None
+        species_arr = species_arr / species_norm
+
+        best_level = 1  # 默认简单真核
+        best_similarity = -1
+
+        for level, ref_vec in get_effective_embeddings().items():
+            ref_arr = np.array(ref_vec)
+            ref_norm = np.linalg.norm(ref_arr)
+            if ref_norm == 0:
+                continue
+            ref_arr = ref_arr / ref_norm
+
+            similarity = float(np.dot(species_arr, ref_arr))
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_level = level
+
+        logger.debug(
+            f"[复杂度推断-embedding] {species.common_name}: "
+            f"等级{best_level} (相似度{best_similarity:.3f})"
+        )
+        return best_level
+
+    except Exception as e:
+        logger.warning(f"[复杂度推断] Embedding推断失败: {e}")
+        return None
+
+
 def validate_gradual_evolution(
     organ_evolution: list,
     parent_organs: dict,
