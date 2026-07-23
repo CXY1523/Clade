@@ -7,9 +7,12 @@ from ..speciation_process import (
     enhance_rule_fallback_descriptions,
     execute_active_ai_batches,
     generate_background_results,
+    materialize_active_result,
+    materialize_active_results,
     materialize_background_result,
     materialize_background_results,
     partition_speciation_entries,
+    prepare_active_result,
 )
 
 
@@ -708,3 +711,368 @@ def test_background_results_materialization_preserves_partial_append_on_error(
         "existing-active-event",
         "event-entry-one",
     ]
+
+
+def test_active_result_preparation_skips_stale_without_dependencies() -> None:
+    entry = {"request_turn": 3, "ctx": {"new_code": "STALE"}}
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("stale results must not invoke preparation dependencies")
+
+    assert prepare_active_result(
+        {"unused": True},
+        entry,
+        turn_index=4,
+        average_pressure=1.0,
+        environment_pressure={"heat": 2.0},
+        queue_deferred_request=unexpected,
+        normalize_ai_content=unexpected,
+        generate_rule_based_fallback=unexpected,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("result", "retry_count"),
+    [
+        (RuntimeError("AI failed"), 0),
+        ("not-a-dict", 1),
+        ({"latin_name": "", "common_name": "Name"}, 0),
+    ],
+)
+def test_active_result_preparation_defers_retryable_invalid_results(
+    result,
+    retry_count,
+) -> None:
+    entry = {
+        "request_turn": 5,
+        "_retry_count": retry_count,
+        "ctx": {"new_code": "CHILD"},
+    }
+    queued: list[dict] = []
+
+    assert prepare_active_result(
+        result,
+        entry,
+        turn_index=5,
+        average_pressure=1.0,
+        environment_pressure={},
+        queue_deferred_request=queued.append,
+        normalize_ai_content=lambda content: content,
+        generate_rule_based_fallback=lambda **_kwargs: pytest.fail(
+            "retryable invalid results must not use fallback"
+        ),
+    ) is None
+    assert queued == [entry]
+
+
+def test_active_result_preparation_preserves_fallback_arguments() -> None:
+    parent = object()
+    entry = {
+        "request_turn": 7,
+        "_retry_count": 2,
+        "ctx": {
+            "parent": parent,
+            "new_code": "CHILD",
+            "population": 77,
+            "speciation_type": "adaptive",
+        },
+    }
+    fallback_content = {"fallback": True}
+    normalized_content = {
+        "latin_name": "Species fallback",
+        "common_name": "Fallback",
+        "description": "Description",
+    }
+    calls: list[tuple] = []
+
+    def fallback(**kwargs):
+        calls.append(("fallback", kwargs))
+        return fallback_content
+
+    def normalize(content):
+        calls.append(("normalize", content))
+        return normalized_content
+
+    prepared = prepare_active_result(
+        RuntimeError("AI failed"),
+        entry,
+        turn_index=7,
+        average_pressure=2.5,
+        environment_pressure={"heat": 0.8},
+        queue_deferred_request=lambda _entry: pytest.fail(
+            "exhausted retries must not defer"
+        ),
+        normalize_ai_content=normalize,
+        generate_rule_based_fallback=fallback,
+    )
+
+    assert prepared == (entry["ctx"], normalized_content)
+    assert calls == [
+        (
+            "fallback",
+            {
+                "parent": parent,
+                "new_code": "CHILD",
+                "survivors": 77,
+                "speciation_type": "adaptive",
+                "average_pressure": 2.5,
+                "environment_pressure": {"heat": 0.8},
+                "turn_index": 7,
+            },
+        ),
+        ("normalize", fallback_content),
+    ]
+
+
+def test_active_result_preparation_normalizes_before_required_fields() -> None:
+    entry = {
+        "request_turn": 9,
+        "ctx": {"new_code": "CHILD"},
+    }
+    normalized = {
+        "latin_name": "Species normalized",
+        "common_name": "Normalized",
+        "description": "Description",
+    }
+
+    assert prepare_active_result(
+        {"raw": True},
+        entry,
+        turn_index=9,
+        average_pressure=0.0,
+        environment_pressure={},
+        queue_deferred_request=lambda _entry: pytest.fail(
+            "valid normalized content must not defer"
+        ),
+        normalize_ai_content=lambda content: (
+            normalized if content == {"raw": True} else None
+        ),
+        generate_rule_based_fallback=lambda **_kwargs: pytest.fail(
+            "valid content must not use fallback"
+        ),
+    ) == (entry["ctx"], normalized)
+
+
+def test_active_result_materialization_preserves_core_mutations() -> None:
+    parent = SimpleNamespace(common_name="Parent", lineage_code="PARENT")
+    child = SimpleNamespace(
+        common_name="Child",
+        created_turn=10,
+        genus_code=None,
+        lineage_code="CHILD",
+        morphology_stats={},
+    )
+    ctx = {
+        "parent": parent,
+        "new_code": "CHILD",
+        "population": 50,
+        "speciation_type": "adaptive",
+        "assigned_tiles": {2},
+    }
+    ai_content = {
+        "latin_name": "Species child",
+        "common_name": "Child",
+        "description": "Description",
+        "event_description": "AI event",
+        "reason": "AI reason",
+        "_is_rule_fallback": True,
+    }
+    counts = {"PARENT": 0}
+    queued: list[tuple] = []
+    upserts: list[object] = []
+    calls: list[tuple] = []
+    lineage_event = object()
+    timestamp = object()
+
+    class GeneLibrary:
+        def inherit_dormant_genes(self, parent_arg, child_arg, genus_arg):
+            calls.append(("inherit_genes", parent_arg, child_arg, genus_arg))
+
+    class Owner:
+        _tensor_state = None
+
+        @property
+        def gene_library_service(self):
+            calls.append(("gene_library",))
+            return GeneLibrary()
+
+    result = materialize_active_result(
+        ctx,
+        ai_content,
+        turn_index=10,
+        average_pressure=4.0,
+        validate_and_fix=lambda content, *_args, **_kwargs: content,
+        create_species=lambda **kwargs: (
+            calls.append(("create", kwargs)) or child
+        ),
+        turn_offspring_counts=counts,
+        rule_fallback_species=queued,
+        random_uniform=lambda low, high: (
+            calls.append(("random", low, high)) or 0.35
+        ),
+        inherit_habitat_distribution=lambda **kwargs: calls.append(
+            ("inherit_habitat", kwargs)
+        ),
+        update_genetic_distances=lambda *args: calls.append(
+            ("genetic_distance", args)
+        ),
+        gene_library_service_owner=Owner(),
+        genus_repository=SimpleNamespace(
+            get_by_code=lambda code: pytest.fail(
+                f"genus lookup not expected: {code}"
+            )
+        ),
+        process_ai_activated_genes=lambda *_args: 0,
+        process_ai_new_dormant_genes=lambda *_args: 0,
+        try_speciation_breakthrough=lambda *_args: None,
+        check_and_trigger_plant_milestones=lambda *_args: None,
+        evaluate_new_species_viability=lambda *_args: pytest.fail(
+            "tensor viability must not run without tensor state"
+        ),
+        upsert_species=lambda species: (
+            upserts.append(species) or species
+        ),
+        log_lineage_event=lambda event: calls.append(("log_event", event)),
+        lineage_event_factory=lambda **_kwargs: lineage_event,
+        branching_event_factory=lambda **kwargs: kwargs,
+        utcnow=lambda: timestamp,
+    )
+
+    assert counts == {"PARENT": 2}
+    assert queued == [(child, parent, "adaptive")]
+    assert upserts == [child, child]
+    assert result == {
+        "parent_lineage": "PARENT",
+        "new_lineage": "CHILD",
+        "description": "AI event",
+        "timestamp": timestamp,
+        "reason": "AI reason",
+    }
+    assert [call[0] for call in calls] == [
+        "create",
+        "random",
+        "inherit_habitat",
+        "genetic_distance",
+        "gene_library",
+        "inherit_genes",
+        "log_event",
+    ]
+
+
+def test_active_result_materialization_preserves_optional_upserts() -> None:
+    parent = SimpleNamespace(common_name="Parent", lineage_code="PARENT")
+    child = SimpleNamespace(
+        common_name="Child",
+        created_turn=11,
+        genus_code="GENUS",
+        lineage_code="CHILD",
+        morphology_stats={},
+    )
+    ai_content = {
+        "latin_name": "Species child",
+        "common_name": "Child",
+        "description": "Description",
+        "genetic_discoveries": ["gene-a"],
+        "activated_genes": ["active-a"],
+        "new_dormant_genes": ["dormant-a"],
+    }
+    calls: list[str] = []
+    upserts: list[object] = []
+    tensor_state = SimpleNamespace(species_map={"CHILD": 1})
+
+    class GeneLibrary:
+        def record_discovery(self, **_kwargs):
+            calls.append("record_discovery")
+
+        def inherit_dormant_genes(self, *_args):
+            calls.append("inherit_genes")
+
+    class Owner:
+        _tensor_state = tensor_state
+
+        @property
+        def gene_library_service(self):
+            return GeneLibrary()
+
+    materialize_active_result(
+        {
+            "parent": parent,
+            "new_code": "CHILD",
+            "population": 50,
+            "speciation_type": "adaptive",
+        },
+        ai_content,
+        turn_index=11,
+        average_pressure=1.0,
+        validate_and_fix=lambda content, *_args, **_kwargs: content,
+        create_species=lambda **_kwargs: child,
+        turn_offspring_counts={"PARENT": 0},
+        rule_fallback_species=[],
+        random_uniform=lambda _low, _high: 0.4,
+        inherit_habitat_distribution=lambda **_kwargs: None,
+        update_genetic_distances=lambda *_args: None,
+        gene_library_service_owner=Owner(),
+        genus_repository=SimpleNamespace(
+            get_by_code=lambda code: f"genus:{code}"
+        ),
+        process_ai_activated_genes=lambda *_args: 1,
+        process_ai_new_dormant_genes=lambda *_args: 1,
+        try_speciation_breakthrough=lambda *_args: "breakthrough",
+        check_and_trigger_plant_milestones=lambda *_args: {
+            "milestone_name": "milestone"
+        },
+        evaluate_new_species_viability=lambda *args: {
+            "recommendation": "extinct",
+            "avg_suitability": 0.1,
+            "tile_count": 1,
+        },
+        upsert_species=lambda species: (
+            upserts.append(species) or species
+        ),
+        log_lineage_event=lambda _event: None,
+        lineage_event_factory=lambda **kwargs: kwargs,
+        branching_event_factory=lambda **kwargs: kwargs,
+        utcnow=lambda: "now",
+    )
+
+    assert calls == ["record_discovery", "inherit_genes"]
+    assert len(upserts) == 7
+    assert child.morphology_stats["viability_risk"] == "critical"
+
+
+def test_active_results_materialization_preserves_partial_append(
+    monkeypatch,
+) -> None:
+    first = object()
+    second = object()
+    processing_error = RuntimeError("second materialization failed")
+
+    monkeypatch.setattr(
+        speciation_process_module,
+        "prepare_active_result",
+        lambda result, entry, **_kwargs: (entry, result),
+    )
+
+    def materialize_one(ctx, _content, **_kwargs):
+        if ctx is second:
+            raise processing_error
+        return "first-event"
+
+    monkeypatch.setattr(
+        speciation_process_module,
+        "materialize_active_result",
+        materialize_one,
+    )
+    events = ["existing-event"]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        materialize_active_results(
+            ["first-content", "second-content", "zip-truncated"],
+            [first, second],
+            result_events=events,
+            preparation_kwargs={"prepare": object()},
+            materialization_kwargs={"materialize": object()},
+        )
+
+    assert exc_info.value is processing_error
+    assert events == ["existing-event", "first-event"]

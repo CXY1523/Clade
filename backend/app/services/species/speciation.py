@@ -41,6 +41,7 @@ from .speciation_process import (
     enhance_rule_fallback_descriptions,
     execute_active_ai_batches,
     generate_background_results,
+    materialize_active_results,
     materialize_background_results,
     partition_speciation_entries,
 )
@@ -1416,237 +1417,60 @@ class SpeciationService:
         # 3. 结果处理与写入
         logger.info(f"[分化] 开始处理 {len(results)} 个AI结果 + {len(background_results)} 个规则结果")
         new_species_events: list[BranchingEvent] = []
-        for res, entry in zip(results, active_batch):
-            # 【关键修复】验证请求是否属于当前回合
-            request_turn = entry.get("request_turn", -1)
-            if request_turn != turn_index:
-                logger.warning(
-                    f"[分化跳过-过期] {entry.get('ctx', {}).get('new_code', '?')}: "
-                    f"请求来自回合 {request_turn}，当前回合 {turn_index}，丢弃"
-                )
-                continue
-
-            ctx = entry["ctx"]  # 从entry中提取ctx
-            
-            # 【优化】检查是否需要使用规则fallback
-            retry_count = entry.get("_retry_count", 0)
-            use_fallback = False
-            
-            if isinstance(res, Exception):
-                logger.error(f"[分化AI异常] {res}")
-                if retry_count >= 2:
-                    use_fallback = True
-                    logger.info(f"[分化] 重试{retry_count}次后AI仍失败，使用规则fallback")
-                else:
-                    self._queue_deferred_request(entry)
-                    continue
-
-            ai_content = res
-            if not use_fallback and not isinstance(ai_content, dict):
-                logger.warning(f"[分化警告] AI返回的content不是dict类型: {type(ai_content)}, 内容: {ai_content}")
-                if retry_count >= 2:
-                    use_fallback = True
-                else:
-                    self._queue_deferred_request(entry)
-                    continue
-            if not use_fallback:
-                ai_content = self._normalize_ai_content(ai_content)
-
-            required_fields = ["latin_name", "common_name", "description"]
-            if not use_fallback and any(not ai_content.get(field) for field in required_fields):
-                logger.warning(
-                    "[分化警告] AI返回缺少必要字段: %s",
-                    {field: ai_content.get(field) for field in required_fields},
-                )
-                if retry_count >= 2:
-                    use_fallback = True
-                else:
-                    self._queue_deferred_request(entry)
-                    continue
-            
-            # 【新增】使用规则fallback生成内容
-            if use_fallback:
-                ai_content = self._generate_rule_based_fallback(
-                    parent=ctx["parent"],
-                    new_code=ctx["new_code"],
-                    survivors=ctx["population"],
-                    speciation_type=ctx["speciation_type"],
-                    average_pressure=average_pressure,
-                    environment_pressure=env_pressure_dict,
-                    turn_index=turn_index,
-                )
-                ai_content = self._normalize_ai_content(ai_content)
-
-            logger.info(
-                "[分化AI返回] latin_name: %s, common_name: %s, description长度: %s",
-                ai_content.get("latin_name"),
-                ai_content.get("common_name"),
-                len(str(ai_content.get("description", ""))),
-            )
-            
-            # 【新增】规则引擎后验证：验证并修正AI输出
-            ai_content = self.rules.validate_and_fix(
-                ai_content, 
-                ctx["parent"],
-                preprocess_result=None  # 如果需要可以传入预处理结果
-            )
-
-            new_species = self._create_species(
-                parent=ctx["parent"],
-                new_code=ctx["new_code"],
-                survivors=ctx["population"],
-                turn_index=turn_index,
-                ai_payload=ai_content,
-                average_pressure=average_pressure,
-                speciation_type=ctx["speciation_type"],  # 【一揽子修改】传递分化类型
-            )
-            logger.info(f"[分化] 新物种 {new_species.common_name} created_turn={new_species.created_turn} (传入的turn_index={turn_index})")
-            new_species = species_repository.upsert(new_species)
-            # 记录本回合亲本子代计数（与杂交共享上限）
-            parent_code = ctx["parent"].lineage_code
-            try:
-                turn_offspring_counts[parent_code] += 1
-                ctx.turn_offspring_counts = turn_offspring_counts  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            logger.info(f"[分化] upsert后 {new_species.common_name} created_turn={new_species.created_turn}")
-            # 记录本回合亲本子代计数（与杂交共享上限）
-            parent_code = ctx["parent"].lineage_code
-            try:
-                turn_offspring_counts[parent_code] += 1
-                ctx.turn_offspring_counts = turn_offspring_counts  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            
-            # 【描述增强】如果使用了规则fallback，将物种加入增强队列
-            if ai_content.get("_is_rule_fallback"):
-                self._rule_fallback_species.append((new_species, ctx["parent"], ctx["speciation_type"]))
-            
-            # ⚠️ 关键修复：子代只继承分配给它的地块（基于地理隔离分化）
-            # 如果没有分配地块，则继承全部（回退到旧行为）
-            assigned_tiles = ctx.get("assigned_tiles", set())
-            
-            # 【v3.1】计算繁殖补偿因子
-            # 分化发生在繁殖之后，新物种没有参与当前回合的繁殖
-            # 给予 30%-50% 的繁殖增长补偿，模拟"如果新物种早就存在"的情况
-            reproduction_bonus = random.uniform(0.30, 0.50)
-            
-            self._inherit_habitat_distribution(
-                parent=ctx["parent"], 
-                child=new_species, 
-                turn_index=turn_index,
-                assigned_tiles=assigned_tiles,  # 【新增】只继承这些地块
-                reproduction_bonus=reproduction_bonus  # 【v3.1】繁殖补偿
-            )
-            
-            self._update_genetic_distances(new_species, ctx["parent"], turn_index)
-            
-            if ai_content.get("genetic_discoveries") and new_species.genus_code:
-                self.gene_library_service.record_discovery(
-                    genus_code=new_species.genus_code,
-                    discoveries=ai_content["genetic_discoveries"],
-                    discoverer_code=new_species.lineage_code,
-                    turn=turn_index
-                )
-            
-            # 【修复】即使没有 genus 也调用继承方法（处理新突变和额外基因）
-            genus = self._genus_repository.get_by_code(new_species.genus_code) if new_species.genus_code else None
-            self.gene_library_service.inherit_dormant_genes(ctx["parent"], new_species, genus)
-            species_repository.upsert(new_species)
-            
-            # 【AI指定基因激活】处理 AI 返回的 activated_genes
-            ai_activated_genes = ai_content.get("activated_genes", []) if ai_content else []
-            if ai_activated_genes:
-                activated_count = self._process_ai_activated_genes(new_species, ai_activated_genes, turn_index)
-                if activated_count > 0:
-                    species_repository.upsert(new_species)
-                    logger.info(f"[AI基因激活] {new_species.common_name} 激活了 {activated_count} 个AI指定的基因")
-            
-            # 【LLM新基因】处理 AI 返回的 new_dormant_genes（分化时生成的新休眠基因）
-            ai_new_genes = ai_content.get("new_dormant_genes") if ai_content else None
-            if ai_new_genes:
-                added_count = self._process_ai_new_dormant_genes(new_species, ai_new_genes, turn_index)
-                if added_count > 0:
-                    species_repository.upsert(new_species)
-                    logger.info(f"[LLM新基因] {new_species.common_name} 获得了 {added_count} 个LLM生成的新休眠基因")
-            
-            # 【分化突破】仅激活已有休眠基因（不再本地生成新基因）
-            breakthrough_result = self._try_speciation_breakthrough(new_species, turn_index)
-            if breakthrough_result:
-                species_repository.upsert(new_species)
-                logger.info(
-                    f"[分化突破] {new_species.common_name} 在分化中激活休眠基因: "
-                    f"{breakthrough_result}"
-                )
-            
-            # 【植物演化】主动检查并触发里程碑
-            milestone_result = self._check_and_trigger_plant_milestones(new_species, turn_index)
-            if milestone_result:
-                # 里程碑触发后需要重新保存物种
-                species_repository.upsert(new_species)
-                logger.info(
-                    f"[植物里程碑] {new_species.common_name} 触发里程碑: "
-                    f"{milestone_result.get('milestone_name', 'unknown')}"
-                )
-            
-            # 【v3.0】新物种生存筛选：评估新种的适宜度和可行性
-            if self._tensor_state is not None:
-                # 构建物种映射
-                species_map = {}
-                if hasattr(self._tensor_state, 'species_map'):
-                    species_map = self._tensor_state.species_map
-                
-                viability = self.evaluate_new_species_viability(
-                    new_species, 
-                    self._tensor_state,
-                    species_map,
-                    turn_index
-                )
-                
-                if viability["recommendation"] == "extinct":
-                    # 标记为快速灭绝候选，但仍然创建（让后续回合自然灭绝）
-                    new_species.morphology_stats["viability_risk"] = "critical"
-                    species_repository.upsert(new_species)
-                    logger.warning(
-                        f"[新种筛选] {new_species.common_name} 被标记为高灭绝风险: "
-                        f"适宜度={viability['avg_suitability']:.3f}, 分布={viability['tile_count']}格"
-                    )
-                elif viability["recommendation"] == "penalize":
-                    new_species.morphology_stats["viability_risk"] = "low"
-                    species_repository.upsert(new_species)
-            
-            species_repository.log_event(
-                LineageEvent(
-                    lineage_code=ctx["new_code"],
-                    event_type="speciation",
-                    payload={"parent": ctx["parent"].lineage_code, "turn": turn_index},
-                )
-            )
-            
-            event_desc = ai_content.get("event_description") if ai_content else None
-            if not event_desc:
-                event_desc = f"{ctx['parent'].common_name}在压力{average_pressure:.1f}条件下分化出{ctx['new_code']}"
-            
-            reason_text = ai_content.get("reason") or ai_content.get("speciation_reason")
-            if not reason_text:
-                if ctx["speciation_type"] == "地理隔离":
-                    reason_text = f"{ctx['parent'].common_name}因地形剧变导致种群地理隔离，各隔离群体独立演化产生生殖隔离"
-                elif ctx["speciation_type"] == "极端环境特化":
-                    reason_text = f"{ctx['parent'].common_name}在极端环境压力下，部分种群演化出特化适应能力，与原种群形成生态分离"
-                elif ctx["speciation_type"] == "协同演化":
-                    reason_text = f"{ctx['parent'].common_name}与竞争物种的生态位重叠导致竞争排斥，促使种群分化到不同资源梯度"
-                else:
-                    reason_text = f"{ctx['parent'].common_name}种群在演化压力下发生生态位分化"
-            
-            new_species_events.append(
-                BranchingEvent(
-                    parent_lineage=ctx["parent"].lineage_code,
-                    new_lineage=ctx["new_code"],
-                    description=event_desc,
-                    timestamp=datetime.utcnow(),
-                    reason=reason_text,
-                )
-            )
+        materialize_active_results(
+            results,
+            active_batch,
+            result_events=new_species_events,
+            preparation_kwargs={
+                "turn_index": turn_index,
+                "average_pressure": average_pressure,
+                "environment_pressure": env_pressure_dict,
+                "queue_deferred_request": self._queue_deferred_request,
+                "normalize_ai_content": self._normalize_ai_content,
+                "generate_rule_based_fallback": (
+                    self._generate_rule_based_fallback
+                ),
+            },
+            materialization_kwargs={
+                "turn_index": turn_index,
+                "average_pressure": average_pressure,
+                "validate_and_fix": self.rules.validate_and_fix,
+                "create_species": self._create_species,
+                "turn_offspring_counts": turn_offspring_counts,
+                "rule_fallback_species": self._rule_fallback_species,
+                "random_uniform": (
+                    lambda low, high: random.uniform(low, high)
+                ),
+                "inherit_habitat_distribution": (
+                    self._inherit_habitat_distribution
+                ),
+                "update_genetic_distances": (
+                    self._update_genetic_distances
+                ),
+                "gene_library_service_owner": self,
+                "genus_repository": self._genus_repository,
+                "process_ai_activated_genes": (
+                    self._process_ai_activated_genes
+                ),
+                "process_ai_new_dormant_genes": (
+                    self._process_ai_new_dormant_genes
+                ),
+                "try_speciation_breakthrough": (
+                    self._try_speciation_breakthrough
+                ),
+                "check_and_trigger_plant_milestones": (
+                    self._check_and_trigger_plant_milestones
+                ),
+                "evaluate_new_species_viability": (
+                    self.evaluate_new_species_viability
+                ),
+                "upsert_species": species_repository.upsert,
+                "log_lineage_event": species_repository.log_event,
+                "lineage_event_factory": LineageEvent,
+                "branching_event_factory": BranchingEvent,
+                "utcnow": lambda: datetime.utcnow(),
+            },
+        )
         
         # ========== 【优化】处理背景物种的规则分化结果 ==========
         materialize_background_results(
