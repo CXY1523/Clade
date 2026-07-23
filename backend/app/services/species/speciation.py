@@ -38,6 +38,7 @@ from .speciation_lineage import (
     next_lineage_code,
 )
 from .speciation_process import (
+    append_offspring_plan_entries,
     build_offspring_ai_entry,
     apply_candidate_speciation_roll,
     calculate_candidate_speciation_chance,
@@ -50,6 +51,7 @@ from .speciation_process import (
     materialize_background_results,
     normalize_candidate_state,
     partition_speciation_entries,
+    plan_candidate_offspring,
 )
 from .speciation_habitat import (
     allocate_tiles_from_clusters,
@@ -520,240 +522,94 @@ class SpeciationService:
             generations = candidate_work.generations
             speciation_type = candidate_work.speciation_type
 
-            global_population = int(species.morphology_stats.get("population", 0) or 0)
-            
-            # 【关键修复】candidate_population 来自旧的 _population_matrix（死亡率计算前）
-            # 而 global_population 来自 morphology_stats（可能已被死亡率和繁殖更新）
-            # 必须确保 candidate_population 不超过 global_population，否则会导致负数种群
-            if candidate_population > global_population:
-                logger.warning(
-                    f"[种群同步警告] {species.common_name}: "
-                    f"候选地块种群({candidate_population:,}) > 全局种群({global_population:,})，"
-                    f"可能由于数据不同步，将候选种群限制为全局种群"
-                )
-                candidate_population = global_population
-            
-            # 【重要】分化只影响候选地块上的种群
-            # 非候选地块上的种群保持不变（仍属于父系）
-            speciation_pool = candidate_population  # 仅候选地块上的种群参与分化
-            non_candidate_population = max(0, global_population - candidate_population)  # 确保不为负数
-            
-            # ========== 【改进】基于地块级压力计算分化数量 ==========
-            # 计算各隔离区域的压力指标（用于决定分化数量和传递给AI）
-            cluster_pressure_data = []
-            if candidate_data and clusters:
-                for cluster_idx, cluster in enumerate(clusters):
-                    cluster_pop = sum(tile_populations.get(t, 0) for t in cluster)
-                    cluster_tiles_with_rate = [(t, tile_mortality.get(t, 0.5)) for t in cluster if t in tile_mortality]
-                    
-                    if cluster_tiles_with_rate:
-                        # 计算该区域的平均死亡率
-                        total_pop_in_cluster = sum(tile_populations.get(t, 0) for t, _ in cluster_tiles_with_rate)
-                        if total_pop_in_cluster > 0:
-                            avg_mortality = sum(
-                                tile_mortality.get(t, 0.5) * tile_populations.get(t, 0) 
-                                for t, _ in cluster_tiles_with_rate
-                            ) / total_pop_in_cluster
-                        else:
-                            avg_mortality = sum(r for _, r in cluster_tiles_with_rate) / len(cluster_tiles_with_rate)
-                        
-                        # 区域压力描述
-                        if avg_mortality > 0.5:
-                            pressure_level = "高压"
-                        elif avg_mortality > 0.3:
-                            pressure_level = "中压"
-                        else:
-                            pressure_level = "低压"
-                    else:
-                        avg_mortality = 0.5
-                        pressure_level = "未知"
-                    
-                    cluster_pressure_data.append({
-                        "cluster_idx": cluster_idx,
-                        "tiles": cluster,
-                        "population": int(cluster_pop),
-                        "avg_mortality": avg_mortality,
-                        "pressure_level": pressure_level,
-                    })
-            
-            if _settings.enable_dynamic_speciation:
-                sibling_count = sum(
-                    1 for r in mortality_results 
-                    if r.species.lineage_code.startswith(species.lineage_code[:2])
-                    and r.species.lineage_code != species.lineage_code
-                )
-                
-                # 【改进】基于地块级压力决定子代数量
-                if candidate_data and clusters:
-                    # 基础计算
-                    calculated_offspring = self._calculate_dynamic_offspring_count(
-                        generations, speciation_pool, evo_potential,
-                        current_species_count=current_species_count,
-                        sibling_count=sibling_count
-                    )
-                    
-                    # 【改进】考虑隔离区域数量和压力梯度
-                    # - 更多隔离区域 → 可能产生更多子代
-                    # - 更大的压力梯度 → 分化动力更强
-                    num_clusters = len(clusters)
-                    
-                    if num_clusters >= 3 and mortality_gradient > 0.3:
-                        # 强隔离 + 高梯度：允许更多子代
-                        num_offspring = min(num_clusters, calculated_offspring + 1)
-                    elif num_clusters >= 2:
-                        # 中等隔离：子代数 = min(隔离区域数, 计算值)
-                        num_offspring = min(num_clusters, calculated_offspring)
-                    else:
-                        # 单一区域：使用计算值
-                        num_offspring = calculated_offspring
-                else:
-                    num_offspring = self._calculate_dynamic_offspring_count(
-                        generations, speciation_pool, evo_potential,
-                        current_species_count=current_species_count,
-                        sibling_count=sibling_count
-                    )
-                
-                logger.info(
-                    f"[地块分化] {species.common_name} 将分化出 {num_offspring} 个子种 "
-                    f"(候选种群:{speciation_pool:,}, 隔离区域:{len(clusters) if clusters else 0}, "
-                    f"死亡率梯度:{mortality_gradient:.1%})"
-                )
-            else:
-                num_offspring = random.choice([2, 2, 3])
-                logger.info(f"[分化] {species.common_name} 将分化出 {num_offspring} 个子种")
-            
-            # 种群分配（仅从候选地块的种群中分配）
-            # 【v3.1改进】降低父代保留比例，让子代获得更多初始种群
-            # 从 60-80% 降低到 40-55%，子代将获得 45-60% 的种群
-            retention_ratio = random.uniform(0.40, 0.55)
-            proposed_parent_from_candidates = max(50, int(speciation_pool * retention_ratio))
-            max_parent_allowed = speciation_pool - num_offspring
-            if max_parent_allowed <= 0:
-                logger.warning(
-                    f"[分化终止] {species.common_name} 候选种群不足以生成子种 "
-                    f"(speciation_pool={speciation_pool}, offspring={num_offspring})"
-                )
-                continue
-            
-            parent_from_candidates = min(proposed_parent_from_candidates, max_parent_allowed)
-            child_pool = speciation_pool - parent_from_candidates
-            
-            if child_pool < num_offspring:
-                needed = num_offspring - child_pool
-                transferable = max(0, parent_from_candidates - 50)
-                if transferable <= 0:
-                    logger.warning(
-                        f"[分化终止] {species.common_name} 无法为子种分配个体 "
-                        f"(parent_from_candidates={parent_from_candidates})"
-                    )
-                    continue
-                borrowed = min(needed, transferable)
-                parent_from_candidates -= borrowed
-                child_pool = speciation_pool - parent_from_candidates
-            
-            if child_pool < num_offspring:
-                logger.warning(
-                    f"[分化终止] {species.common_name} 子代可用个体仍不足 "
-                    f"(child_pool={child_pool}, offspring={num_offspring})"
-                )
-                continue
-            
-            pop_splits = self._allocate_offspring_population(child_pool, num_offspring)
-            
-            # 生成编码
-            new_codes = self._generate_multiple_lineage_codes(
-                species.lineage_code, existing_codes, num_offspring
+            offspring_plan = plan_candidate_offspring(
+                candidate_work,
+                species=species,
+                mortality_results=mortality_results,
+                current_species_count=current_species_count,
+                existing_codes=existing_codes,
+                enable_dynamic_speciation=(
+                    _settings.enable_dynamic_speciation
+                ),
+                calculate_dynamic_offspring_count=(
+                    self._calculate_dynamic_offspring_count
+                ),
+                random_choice=random.choice,
+                random_uniform=random.uniform,
+                allocate_offspring_population=(
+                    self._allocate_offspring_population
+                ),
+                generate_multiple_lineage_codes=(
+                    self._generate_multiple_lineage_codes
+                ),
+                allocate_tiles_from_clusters=(
+                    self._allocate_tiles_from_clusters
+                ),
+                allocate_tiles_to_offspring=(
+                    self._allocate_tiles_to_offspring
+                ),
+                upsert_species=species_repository.upsert,
             )
-            for code in new_codes:
-                existing_codes.add(code)
-            
-            # 【改进】更新父系物种种群
-            # 父系保留：非候选地块种群 + 候选地块中保留的部分
-            parent_remaining = non_candidate_population + parent_from_candidates
-            
-            # 【关键修复】最终保护：确保父系种群不为负数
-            if parent_remaining < 0:
-                logger.error(
-                    f"[严重错误] {species.common_name} 分化后种群为负数！"
-                    f"parent_remaining={parent_remaining:,}, "
-                    f"non_candidate={non_candidate_population:,}, "
-                    f"parent_from_candidates={parent_from_candidates:,}, "
-                    f"global={global_population:,}, candidate={candidate_population:,}"
-                )
-                # 使用合理的最小值：至少保留 50 或 parent_from_candidates 中的较大者
-                parent_remaining = max(50, parent_from_candidates)
-            
-            species.morphology_stats["population"] = parent_remaining
-            species_repository.upsert(species)
-            
-            logger.debug(
-                f"[种群分配] {species.common_name}: "
-                f"全局{global_population:,} → 父系{parent_remaining:,} + 子代{child_pool:,} "
-                f"(非候选地块保留{non_candidate_population:,})"
+            if offspring_plan is None:
+                continue
+
+            append_offspring_plan_entries(
+                entries,
+                offspring_plan,
+                build_entry=build_offspring_ai_entry,
+                common_kwargs_factory=lambda: {
+                    "species": species,
+                    "clusters": clusters,
+                    "tile_populations": tile_populations,
+                    "tile_mortality": tile_mortality,
+                    "mortality_gradient": mortality_gradient,
+                    "is_isolated": is_isolated,
+                    "death_rate": death_rate,
+                    "candidate_data": candidate_data,
+                    "average_pressure": average_pressure,
+                    "pressure_summary": pressure_summary,
+                    "generations": generations,
+                    "speciation_type": speciation_type,
+                    "map_changes": map_changes,
+                    "major_events": major_events,
+                    "food_chain_summary": self._food_chain_summary,
+                    "current_pressures": getattr(
+                        self, "_current_pressures", None
+                    ),
+                    "current_pressure_types": (
+                        self._current_pressure_types
+                    ),
+                    "organ_catalog": self._organ_catalog,
+                    "turn_index": turn_index,
+                    "infer_biological_domain": (
+                        self._infer_biological_domain
+                    ),
+                    "generate_tile_context": (
+                        self._generate_tile_context
+                    ),
+                    "rules": self.rules,
+                    "naming_hint_generator": (
+                        self.naming_hint_generator
+                    ),
+                    "summarize_organs": self._summarize_organs,
+                    "summarize_map_changes": (
+                        self._summarize_map_changes
+                    ),
+                    "summarize_major_events": (
+                        self._summarize_major_events
+                    ),
+                    "summarize_prey_species": (
+                        self._summarize_prey_species
+                    ),
+                    "summarize_dormant_genes": (
+                        self._summarize_dormant_genes
+                    ),
+                    "organ_evolution_service": (
+                        self.organ_evolution_service
+                    ),
+                },
             )
-            
-            # 【核心改进】基于候选数据为子代分配地块
-            if candidate_data and clusters:
-                # 使用候选数据中的隔离区域分配地块
-                offspring_tiles = self._allocate_tiles_from_clusters(
-                    clusters, candidate_tiles, num_offspring
-                )
-            else:
-                # 回退到旧方法
-                offspring_tiles = self._allocate_tiles_to_offspring(
-                    species.lineage_code, num_offspring
-                )
-            
-            # 为每个子种创建任务
-            for idx, (new_code, population) in enumerate(zip(new_codes, pop_splits)):
-                entries.append(
-                    build_offspring_ai_entry(
-                        species=species,
-                        new_code=new_code,
-                        population=population,
-                        offspring_index=idx,
-                        num_offspring=num_offspring,
-                        offspring_tiles=offspring_tiles,
-                        cluster_pressure_data=cluster_pressure_data,
-                        clusters=clusters,
-                        tile_populations=tile_populations,
-                        tile_mortality=tile_mortality,
-                        mortality_gradient=mortality_gradient,
-                        is_isolated=is_isolated,
-                        death_rate=death_rate,
-                        candidate_data=candidate_data,
-                        average_pressure=average_pressure,
-                        pressure_summary=pressure_summary,
-                        generations=generations,
-                        speciation_type=speciation_type,
-                        map_changes=map_changes,
-                        major_events=major_events,
-                        food_chain_summary=self._food_chain_summary,
-                        current_pressures=getattr(
-                            self, "_current_pressures", None
-                        ),
-                        current_pressure_types=self._current_pressure_types,
-                        organ_catalog=self._organ_catalog,
-                        turn_index=turn_index,
-                        infer_biological_domain=(
-                            self._infer_biological_domain
-                        ),
-                        generate_tile_context=self._generate_tile_context,
-                        rules=self.rules,
-                        naming_hint_generator=self.naming_hint_generator,
-                        summarize_organs=self._summarize_organs,
-                        summarize_map_changes=self._summarize_map_changes,
-                        summarize_major_events=self._summarize_major_events,
-                        summarize_prey_species=self._summarize_prey_species,
-                        summarize_dormant_genes=(
-                            self._summarize_dormant_genes
-                        ),
-                        organ_evolution_service=(
-                            self.organ_evolution_service
-                        ),
-                    )
-                )
-        
+
         if not entries and not self._deferred_requests:
             return []
 

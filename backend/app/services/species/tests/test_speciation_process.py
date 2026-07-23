@@ -6,6 +6,7 @@ from .. import speciation_process as speciation_process_module
 from ..speciation_process import (
     build_offspring_ai_entry,
     apply_candidate_speciation_roll,
+    append_offspring_plan_entries,
     calculate_candidate_speciation_chance,
     enhance_rule_fallback_descriptions,
     evaluate_candidate_eligibility,
@@ -17,6 +18,7 @@ from ..speciation_process import (
     materialize_background_result,
     materialize_background_results,
     normalize_candidate_state,
+    plan_candidate_offspring,
     partition_speciation_entries,
     prepare_active_result,
 )
@@ -2057,3 +2059,179 @@ def test_final_roll_success_resets_pressure_and_sets_cooldown() -> None:
     assert result is work
     assert species.morphology_stats["speciation_pressure"] == 0.0
     assert species.morphology_stats["last_speciation_turn"] == 20
+
+
+def test_offspring_planner_preserves_dynamic_population_and_callback_order(
+) -> None:
+    species = _trigger_species()
+    species.morphology_stats["population"] = 150
+    work = speciation_process_module.replace(
+        _trigger_work(
+            candidate_data={"candidate_tiles": {1, 2}},
+            candidate_population=200,
+            is_isolated=True,
+            mortality_gradient=0.4,
+            clusters=[{1}, {2}],
+        ),
+        generations=500_000,
+    )
+    existing_codes = {"PARENT"}
+    calls: list[tuple] = []
+
+    plan = plan_candidate_offspring(
+        work,
+        species=species,
+        mortality_results=[],
+        current_species_count=5,
+        existing_codes=existing_codes,
+        enable_dynamic_speciation=True,
+        calculate_dynamic_offspring_count=lambda *args, **kwargs: (
+            calls.append(("count", args, kwargs)) or 2
+        ),
+        random_choice=lambda _values: pytest.fail(
+            "dynamic mode must not use legacy random choice"
+        ),
+        random_uniform=lambda low, high: (
+            calls.append(("uniform", low, high)) or 0.5
+        ),
+        allocate_offspring_population=lambda pool, count: (
+            calls.append(("population", pool, count)) or [37, 38]
+        ),
+        generate_multiple_lineage_codes=lambda parent, codes, count: (
+            calls.append(("codes", parent, set(codes), count))
+            or ["CHILD-A", "CHILD-B"]
+        ),
+        allocate_tiles_from_clusters=lambda clusters, tiles, count: (
+            calls.append(("cluster_tiles", clusters, tiles, count))
+            or [{1}, {2}]
+        ),
+        allocate_tiles_to_offspring=lambda *_args: pytest.fail(
+            "prescreened clusters must use cluster allocation"
+        ),
+        upsert_species=lambda species_arg: calls.append(
+            ("upsert", species_arg.morphology_stats["population"])
+        ),
+    )
+
+    assert plan is not None
+    assert plan.num_offspring == 2
+    assert plan.pop_splits == [37, 38]
+    assert plan.new_codes == ["CHILD-A", "CHILD-B"]
+    assert plan.offspring_tiles == [{1}, {2}]
+    assert plan.cluster_pressure_data == [
+        {
+            "cluster_idx": 0,
+            "tiles": {1},
+            "population": 100,
+            "avg_mortality": 0.2,
+            "pressure_level": "低压",
+        },
+        {
+            "cluster_idx": 1,
+            "tiles": {2},
+            "population": 100,
+            "avg_mortality": 0.2,
+            "pressure_level": "低压",
+        },
+    ]
+    assert existing_codes == {"PARENT", "CHILD-A", "CHILD-B"}
+    assert species.morphology_stats["population"] == 75
+    assert [call[0] for call in calls] == [
+        "count",
+        "uniform",
+        "population",
+        "codes",
+        "upsert",
+        "cluster_tiles",
+    ]
+    assert calls[0][1] == (500_000, 150, 0.2)
+    assert calls[0][2] == {
+        "current_species_count": 5,
+        "sibling_count": 0,
+    }
+
+
+def test_offspring_planner_preserves_legacy_random_order_and_early_return(
+) -> None:
+    species = _trigger_species()
+    species.morphology_stats["population"] = 1
+    calls: list[tuple] = []
+
+    plan = plan_candidate_offspring(
+        _trigger_work(candidate_population=1),
+        species=species,
+        mortality_results=[],
+        current_species_count=1,
+        existing_codes={"PARENT"},
+        enable_dynamic_speciation=False,
+        calculate_dynamic_offspring_count=lambda *_args, **_kwargs: (
+            pytest.fail("legacy mode must not calculate dynamic count")
+        ),
+        random_choice=lambda values: (
+            calls.append(("choice", values)) or 2
+        ),
+        random_uniform=lambda low, high: (
+            calls.append(("uniform", low, high)) or 0.5
+        ),
+        allocate_offspring_population=lambda *_args: pytest.fail(
+            "insufficient population must return before allocation"
+        ),
+        generate_multiple_lineage_codes=lambda *_args: pytest.fail(
+            "insufficient population must return before code generation"
+        ),
+        allocate_tiles_from_clusters=lambda *_args: pytest.fail(
+            "insufficient population must return before tile allocation"
+        ),
+        allocate_tiles_to_offspring=lambda *_args: pytest.fail(
+            "insufficient population must return before tile allocation"
+        ),
+        upsert_species=lambda *_args: pytest.fail(
+            "insufficient population must return before persistence"
+        ),
+    )
+
+    assert plan is None
+    assert calls == [("choice", [2, 2, 3]), ("uniform", 0.40, 0.55)]
+
+
+def test_offspring_entry_append_preserves_order_and_partial_progress() -> None:
+    plan = speciation_process_module._OffspringPlan(
+        cluster_pressure_data=[{"cluster_idx": 0}],
+        num_offspring=2,
+        pop_splits=[10, 20],
+        new_codes=["A", "B"],
+        offspring_tiles=[{1}, {2}],
+    )
+    entries = [{"existing": True}]
+    calls: list[dict] = []
+
+    def build_entry(**kwargs):
+        calls.append(kwargs)
+        if kwargs["new_code"] == "B":
+            raise RuntimeError("second entry failed")
+        return {"code": kwargs["new_code"]}
+
+    with pytest.raises(RuntimeError, match="second entry failed"):
+        append_offspring_plan_entries(
+            entries,
+            plan,
+            build_entry=build_entry,
+            common_kwargs_factory=lambda: {
+                "species": "parent",
+                "marker": object(),
+            },
+        )
+
+    assert entries == [{"existing": True}, {"code": "A"}]
+    assert [call["new_code"] for call in calls] == ["A", "B"]
+    assert [call["population"] for call in calls] == [10, 20]
+    assert [call["offspring_index"] for call in calls] == [0, 1]
+    assert all(call["num_offspring"] == 2 for call in calls)
+    assert all(
+        call["offspring_tiles"] is plan.offspring_tiles
+        for call in calls
+    )
+    assert all(
+        call["cluster_pressure_data"] is plan.cluster_pressure_data
+        for call in calls
+    )
