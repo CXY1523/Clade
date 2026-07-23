@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
+import pytest
+
 from ..speciation_process import (
+    execute_active_ai_batches,
     generate_background_results,
     partition_speciation_entries,
 )
@@ -172,3 +175,150 @@ def test_background_results_preserve_empty_inputs() -> None:
         generate_rule_based_fallback=lambda **kwargs: calls.append(kwargs),
     ) == []
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_active_ai_batches_preserve_empty_input_without_callbacks() -> None:
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("empty active batches must not invoke dependencies")
+
+    assert await execute_active_ai_batches(
+        [],
+        average_pressure=0.0,
+        pressure_summary="",
+        map_changes=[],
+        major_events=[],
+        turn_index=0,
+        stream_callback=None,
+        build_batch_payload=unexpected,
+        call_batch_ai=unexpected,
+        parse_batch_results=unexpected,
+        staggered_gather=unexpected,
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_active_ai_batches_preserve_stable_batches_and_arguments() -> None:
+    entries = [{"name": f"entry-{idx}"} for idx in range(5)]
+    callback = lambda *_args: None
+    calls: list[tuple] = []
+    gather_kwargs: dict = {}
+
+    def build_payload(
+        batch_entries,
+        average_pressure,
+        pressure_summary,
+        map_changes,
+        major_events,
+        turn_index,
+    ):
+        calls.append(("build", batch_entries))
+        assert average_pressure == 2.5
+        assert pressure_summary == "pressure"
+        assert map_changes == ["map"]
+        assert major_events == ["event"]
+        assert turn_index == 9
+        return {"batch": batch_entries}
+
+    async def call_batch(payload, stream_callback, batch_entries):
+        calls.append(("call", batch_entries))
+        assert payload == {"batch": batch_entries}
+        assert stream_callback is callback
+        return {"raw": batch_entries}
+
+    def parse_batch(raw, batch_entries):
+        calls.append(("parse", batch_entries))
+        assert raw == {"raw": batch_entries}
+        return [f"parsed-{entry['name']}" for entry in batch_entries]
+
+    async def gather(coroutines, **kwargs):
+        gather_kwargs.update(kwargs)
+        return [await coroutine for coroutine in coroutines]
+
+    results = await execute_active_ai_batches(
+        entries,
+        average_pressure=2.5,
+        pressure_summary="pressure",
+        map_changes=["map"],
+        major_events=["event"],
+        turn_index=9,
+        stream_callback=callback,
+        build_batch_payload=build_payload,
+        call_batch_ai=call_batch,
+        parse_batch_results=parse_batch,
+        staggered_gather=gather,
+    )
+
+    batches = [
+        entries[0:2],
+        entries[2:4],
+        entries[4:5],
+    ]
+    assert calls == [
+        ("build", batches[0]),
+        ("call", batches[0]),
+        ("parse", batches[0]),
+        ("build", batches[1]),
+        ("call", batches[1]),
+        ("parse", batches[1]),
+        ("build", batches[2]),
+        ("call", batches[2]),
+        ("parse", batches[2]),
+    ]
+    assert gather_kwargs == {
+        "interval": 1.5,
+        "max_concurrent": 20,
+        "task_name": "分化批次",
+        "event_callback": callback,
+    }
+    assert results == [f"parsed-entry-{idx}" for idx in range(5)]
+
+
+@pytest.mark.asyncio
+async def test_active_ai_batches_repeat_batch_exception_per_entry() -> None:
+    entries = [{"name": f"entry-{idx}"} for idx in range(5)]
+    batch_error = RuntimeError("first batch failed")
+
+    def build_payload(batch_entries, *_args):
+        return {"batch": batch_entries}
+
+    async def call_batch(payload, _stream_callback, _batch_entries):
+        if payload["batch"][0] is entries[0]:
+            raise batch_error
+        return payload
+
+    def parse_batch(payload, batch_entries):
+        return [entry["name"] for entry in batch_entries]
+
+    async def gather(coroutines, **_kwargs):
+        gathered = []
+        for coroutine in coroutines:
+            try:
+                gathered.append(await coroutine)
+            except Exception as exc:
+                gathered.append(exc)
+        return gathered
+
+    results = await execute_active_ai_batches(
+        entries,
+        average_pressure=1.0,
+        pressure_summary="pressure",
+        map_changes=[],
+        major_events=[],
+        turn_index=3,
+        stream_callback=None,
+        build_batch_payload=build_payload,
+        call_batch_ai=call_batch,
+        parse_batch_results=parse_batch,
+        staggered_gather=gather,
+    )
+
+    assert results == [
+        batch_error,
+        batch_error,
+        "entry-2",
+        "entry-3",
+        "entry-4",
+    ]
+    assert results[0] is batch_error
+    assert results[1] is batch_error
