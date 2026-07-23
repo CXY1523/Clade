@@ -8,6 +8,7 @@ from ..speciation_process import (
     apply_candidate_speciation_roll,
     append_offspring_plan_entries,
     calculate_candidate_speciation_chance,
+    collect_candidate_entries,
     enhance_rule_fallback_descriptions,
     evaluate_candidate_eligibility,
     evaluate_environmental_pressure,
@@ -2235,3 +2236,188 @@ def test_offspring_entry_append_preserves_order_and_partial_progress() -> None:
         call["cluster_pressure_data"] is plan.cluster_pressure_data
         for call in calls
     )
+
+
+def test_candidate_coordinator_preserves_phase_and_random_callback_order(
+    monkeypatch,
+) -> None:
+    species = _trigger_species()
+    species.morphology_stats["population"] = 500
+    result = SimpleNamespace(species=species, death_rate=0.2)
+    work = _trigger_work(candidate_population=500)
+    plan = speciation_process_module._OffspringPlan(
+        cluster_pressure_data=[],
+        num_offspring=1,
+        pop_splits=[100],
+        new_codes=["CHILD"],
+        offspring_tiles=[set()],
+    )
+    calls: list[tuple] = []
+
+    def phase(name, returned):
+        def run(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return returned
+
+        return run
+
+    monkeypatch.setattr(
+        speciation_process_module,
+        "normalize_candidate_state",
+        phase("normalize", work),
+    )
+    monkeypatch.setattr(
+        speciation_process_module,
+        "evaluate_candidate_eligibility",
+        phase("eligibility", work),
+    )
+    monkeypatch.setattr(
+        speciation_process_module,
+        "evaluate_environmental_pressure",
+        phase("environment", work),
+    )
+    monkeypatch.setattr(
+        speciation_process_module,
+        "calculate_candidate_speciation_chance",
+        phase("chance", work),
+    )
+    monkeypatch.setattr(
+        speciation_process_module,
+        "apply_candidate_speciation_roll",
+        phase("roll", work),
+    )
+    monkeypatch.setattr(
+        speciation_process_module,
+        "plan_candidate_offspring",
+        phase("plan", plan),
+    )
+
+    def append(entries, received_plan, **kwargs):
+        calls.append(("append", (entries, received_plan), kwargs))
+        entries.append({"lineage_code": "CHILD"})
+
+    monkeypatch.setattr(
+        speciation_process_module,
+        "append_offspring_plan_entries",
+        append,
+    )
+
+    threshold = object()
+    service = SimpleNamespace(
+        _speciation_candidates={},
+        _tile_population_cache={},
+        _tile_mortality_cache={},
+        _calculate_speciation_threshold=threshold,
+        _ai_speciation_candidates=set(),
+        _detect_geographic_isolation=object(),
+        _detect_coevolution=object(),
+        _calculate_dynamic_offspring_count=object(),
+        _allocate_offspring_population=object(),
+        _generate_multiple_lineage_codes=object(),
+        _allocate_tiles_from_clusters=object(),
+        _allocate_tiles_to_offspring=object(),
+    )
+    random_source = SimpleNamespace(
+        random=object(),
+        choice=object(),
+        uniform=object(),
+    )
+    config = SimpleNamespace(
+        max_direct_offspring=3,
+        count_only_alive_offspring=True,
+        max_hybrids_per_parent_per_turn=2,
+        min_population_for_speciation=100,
+        early_game_turns=10,
+    )
+    settings = SimpleNamespace(
+        base_speciation_rate=0.01,
+        enable_dynamic_speciation=True,
+    )
+    repository = SimpleNamespace(upsert=object())
+    is_plant = object()
+
+    entries = collect_candidate_entries(
+        service,
+        [result],
+        {"PARENT"},
+        direct_offspring_map={},
+        turn_offspring_counts={},
+        spec_config=config,
+        current_species_count=1,
+        turn_index=5,
+        is_early_game=True,
+        average_pressure=2.0,
+        pressure_summary="pressure",
+        density_damping=1.0,
+        map_changes=[],
+        major_events=[],
+        settings=settings,
+        species_repository=repository,
+        plant_evolution_service=object(),
+        random_source=random_source,
+        is_plant=is_plant,
+    )
+
+    assert entries == [{"lineage_code": "CHILD"}]
+    assert [call[0] for call in calls] == [
+        "normalize",
+        "eligibility",
+        "environment",
+        "chance",
+        "roll",
+        "plan",
+        "append",
+    ]
+    assert calls[0][2]["calculate_speciation_threshold"] is threshold
+    assert calls[2][2]["is_early_game"] is True
+    assert calls[2][2]["random_random"] is random_source.random
+    assert calls[4][2]["random_random"] is random_source.random
+    assert calls[5][2]["random_choice"] is random_source.choice
+    assert calls[5][2]["random_uniform"] is random_source.uniform
+    assert calls[5][2]["upsert_species"] is repository.upsert
+
+
+def test_candidate_coordinator_skips_before_phases_at_direct_child_limit(
+    monkeypatch,
+) -> None:
+    species = _trigger_species()
+    child = SimpleNamespace(status="alive")
+    service = SimpleNamespace()
+
+    monkeypatch.setattr(
+        speciation_process_module,
+        "normalize_candidate_state",
+        lambda **_kwargs: pytest.fail(
+            "direct-child limit must skip before candidate phases"
+        ),
+    )
+
+    entries = collect_candidate_entries(
+        service,
+        [SimpleNamespace(species=species, death_rate=0.2)],
+        {"PARENT"},
+        direct_offspring_map={"PARENT": [child]},
+        turn_offspring_counts={},
+        spec_config=SimpleNamespace(
+            max_direct_offspring=1,
+            count_only_alive_offspring=True,
+            max_hybrids_per_parent_per_turn=2,
+            min_population_for_speciation=100,
+            early_game_turns=10,
+        ),
+        current_species_count=1,
+        turn_index=5,
+        is_early_game=True,
+        average_pressure=2.0,
+        pressure_summary="pressure",
+        density_damping=1.0,
+        map_changes=[],
+        major_events=[],
+        settings=SimpleNamespace(),
+        species_repository=SimpleNamespace(),
+        plant_evolution_service=object(),
+        random_source=SimpleNamespace(),
+        is_plant=object(),
+    )
+
+    assert entries == []

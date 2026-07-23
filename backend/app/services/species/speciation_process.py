@@ -1019,6 +1019,252 @@ def append_offspring_plan_entries(
         )
 
 
+def collect_candidate_entries(
+    service: Any, mortality_results: list, existing_codes: set[str], *,
+    direct_offspring_map: dict, turn_offspring_counts: dict,
+    spec_config: Any, current_species_count: int, turn_index: int,
+    is_early_game: bool,
+    average_pressure: float, pressure_summary: str, density_damping: float,
+    map_changes: list, major_events: list, settings: Any,
+    species_repository: Any, plant_evolution_service: Any, random_source: Any,
+    is_plant: Callable[[Any], bool],
+) -> list[dict]:
+    """Run the already-bounded candidate phases in stable candidate order."""
+    entries: list[dict[str, Any]] = []
+    for result in mortality_results:
+        species = result.species
+        lineage_code = species.lineage_code
+
+        max_direct_offspring = spec_config.max_direct_offspring
+        count_only_alive = spec_config.count_only_alive_offspring
+        max_offspring_per_parent_per_turn = (
+            spec_config.max_hybrids_per_parent_per_turn
+        )
+
+        direct_children = direct_offspring_map.get(lineage_code, [])
+        if count_only_alive:
+            alive_children_count = sum(
+                1 for c in direct_children if c.status == "alive"
+            )
+        else:
+            alive_children_count = len(direct_children)
+
+        if alive_children_count >= max_direct_offspring:
+            logger.debug(
+                f"[分化限制] {species.common_name}: "
+                f"直接后代数量({alive_children_count})已达上限"
+                f"({max_direct_offspring})，跳过分化"
+            )
+            continue
+
+        if (
+            max_offspring_per_parent_per_turn
+            and max_offspring_per_parent_per_turn > 0
+        ):
+            turn_children = turn_offspring_counts.get(lineage_code, 0)
+            if turn_children >= max_offspring_per_parent_per_turn:
+                logger.debug(
+                    f"[分化限制-本回合] {species.common_name}: "
+                    f"本回合子代数({turn_children})已达上限"
+                    f"({max_offspring_per_parent_per_turn})，跳过分化"
+                )
+                continue
+
+        global_population = int(
+            species.morphology_stats.get("population", 0) or 0
+        )
+        min_pop_for_speciation = spec_config.min_population_for_speciation
+        if global_population < min_pop_for_speciation:
+            logger.debug(
+                f"[分化跳过-种群门槛] {species.common_name}: "
+                f"全局种群{global_population:,} < "
+                f"门槛{min_pop_for_speciation:,}"
+            )
+            continue
+
+        candidate_work = normalize_candidate_state(
+            species=species,
+            lineage_code=lineage_code,
+            global_population=global_population,
+            result_death_rate=result.death_rate,
+            turn_index=turn_index,
+            spec_config=spec_config,
+            speciation_candidates=service._speciation_candidates,
+            tile_population_cache=service._tile_population_cache,
+            tile_mortality_cache=service._tile_mortality_cache,
+            calculate_speciation_threshold=(
+                service._calculate_speciation_threshold
+            ),
+        )
+        candidate_data = candidate_work.candidate_data
+        candidate_tiles = candidate_work.candidate_tiles
+        tile_populations = candidate_work.tile_populations
+        tile_mortality = candidate_work.tile_mortality
+        global_population = candidate_work.global_population
+        candidate_population = candidate_work.candidate_population
+        death_rate = candidate_work.death_rate
+        is_isolated = candidate_work.is_isolated
+        mortality_gradient = candidate_work.mortality_gradient
+        clusters = candidate_work.clusters
+
+        candidate_work = evaluate_candidate_eligibility(
+            candidate_work,
+            species=species,
+            result=result,
+            turn_index=turn_index,
+            average_pressure=average_pressure,
+            spec_config=spec_config,
+            calculate_speciation_threshold=(
+                service._calculate_speciation_threshold
+            ),
+        )
+        if candidate_work is None:
+            continue
+
+        candidate_work = evaluate_environmental_pressure(
+            candidate_work,
+            species=species,
+            is_early_game=is_early_game,
+            average_pressure=average_pressure,
+            spec_config=spec_config,
+            is_plant=is_plant,
+            plant_evolution_service=plant_evolution_service,
+            random_random=random_source.random,
+        )
+        if candidate_work is None:
+            continue
+
+        survivors = candidate_work.survivors
+        resource_pressure = candidate_work.resource_pressure
+        niche_overlap = candidate_work.niche_overlap
+        niche_saturation = candidate_work.niche_saturation
+        base_threshold = candidate_work.base_threshold
+        min_population = candidate_work.min_population
+        evo_potential = candidate_work.evo_potential
+        speciation_pressure = candidate_work.speciation_pressure
+
+        candidate_work = calculate_candidate_speciation_chance(
+            candidate_work,
+            species=species,
+            lineage_code=lineage_code,
+            mortality_results=mortality_results,
+            turn_index=turn_index,
+            density_damping=density_damping,
+            average_pressure=average_pressure,
+            map_changes=map_changes,
+            major_events=major_events,
+            spec_config=spec_config,
+            base_speciation_rate=settings.base_speciation_rate,
+            ai_speciation_candidates=service._ai_speciation_candidates,
+            detect_geographic_isolation=(
+                service._detect_geographic_isolation
+            ),
+            detect_coevolution=service._detect_coevolution,
+        )
+        if candidate_work is None:
+            continue
+
+        candidate_work = apply_candidate_speciation_roll(
+            candidate_work,
+            species=species,
+            turn_index=turn_index,
+            random_random=random_source.random,
+            upsert_species=species_repository.upsert,
+        )
+        if candidate_work is None:
+            continue
+
+        clusters = candidate_work.clusters
+        generations = candidate_work.generations
+        speciation_type = candidate_work.speciation_type
+
+        offspring_plan = plan_candidate_offspring(
+            candidate_work,
+            species=species,
+            mortality_results=mortality_results,
+            current_species_count=current_species_count,
+            existing_codes=existing_codes,
+            enable_dynamic_speciation=settings.enable_dynamic_speciation,
+            calculate_dynamic_offspring_count=(
+                service._calculate_dynamic_offspring_count
+            ),
+            random_choice=random_source.choice,
+            random_uniform=random_source.uniform,
+            allocate_offspring_population=(
+                service._allocate_offspring_population
+            ),
+            generate_multiple_lineage_codes=(
+                service._generate_multiple_lineage_codes
+            ),
+            allocate_tiles_from_clusters=(
+                service._allocate_tiles_from_clusters
+            ),
+            allocate_tiles_to_offspring=(
+                service._allocate_tiles_to_offspring
+            ),
+            upsert_species=species_repository.upsert,
+        )
+        if offspring_plan is None:
+            continue
+
+        append_offspring_plan_entries(
+            entries,
+            offspring_plan,
+            build_entry=build_offspring_ai_entry,
+            common_kwargs_factory=lambda: {
+                "species": species,
+                "clusters": clusters,
+                "tile_populations": tile_populations,
+                "tile_mortality": tile_mortality,
+                "mortality_gradient": mortality_gradient,
+                "is_isolated": is_isolated,
+                "death_rate": death_rate,
+                "candidate_data": candidate_data,
+                "average_pressure": average_pressure,
+                "pressure_summary": pressure_summary,
+                "generations": generations,
+                "speciation_type": speciation_type,
+                "map_changes": map_changes,
+                "major_events": major_events,
+                "food_chain_summary": service._food_chain_summary,
+                "current_pressures": getattr(
+                    service, "_current_pressures", None
+                ),
+                "current_pressure_types": (
+                    service._current_pressure_types
+                ),
+                "organ_catalog": service._organ_catalog,
+                "turn_index": turn_index,
+                "infer_biological_domain": (
+                    service._infer_biological_domain
+                ),
+                "generate_tile_context": (
+                    service._generate_tile_context
+                ),
+                "rules": service.rules,
+                "naming_hint_generator": service.naming_hint_generator,
+                "summarize_organs": service._summarize_organs,
+                "summarize_map_changes": (
+                    service._summarize_map_changes
+                ),
+                "summarize_major_events": (
+                    service._summarize_major_events
+                ),
+                "summarize_prey_species": (
+                    service._summarize_prey_species
+                ),
+                "summarize_dormant_genes": (
+                    service._summarize_dormant_genes
+                ),
+                "organ_evolution_service": (
+                    service.organ_evolution_service
+                ),
+            },
+        )
+
+    return entries
+
+
 def build_offspring_ai_entry(
     *,
     species: Any, new_code: str, population: int,
