@@ -6,6 +6,7 @@ from ..speciation_ai import (
     build_batch_payload,
     generate_rule_based_fallback,
     normalize_ai_content,
+    parse_batch_results,
 )
 
 
@@ -514,6 +515,200 @@ def test_service_rule_fallback_delegate_preserves_bound_overrides(
     assert captured["generate_background_species_name"](value=2) == (
         "name",
         {"value": 2},
+    )
+
+
+def _batch_result_entries(count: int) -> list[dict]:
+    return [
+        {
+            "ctx": {
+                "parent": SimpleNamespace(code=f"PARENT-{idx}"),
+                "new_code": f"CHILD-{idx}",
+                "population": 100 + idx,
+                "speciation_type": f"type-{idx}",
+                **({"average_pressure": 1.25} if idx == 0 else {}),
+            }
+        }
+        for idx in range(count)
+    ]
+
+
+def _fallback_recorder(calls: list[dict]):
+    def generate_fallback(**kwargs):
+        calls.append(kwargs)
+        return {"fallback_code": kwargs["new_code"]}
+
+    return generate_fallback
+
+
+def test_batch_result_parser_pops_endosymbiosis_and_prioritizes_it_in_fallback(
+) -> None:
+    entries = _batch_result_entries(3)
+    endosymbiosis = {"common_name": "内共生结果"}
+    response = {
+        "_use_fallback": True,
+        "_endo_overrides": {1: endosymbiosis},
+    }
+    calls: list[dict] = []
+
+    results = parse_batch_results(
+        response,
+        entries,
+        generate_rule_based_fallback=_fallback_recorder(calls),
+    )
+
+    assert response == {"_use_fallback": True}
+    assert results == [
+        {"fallback_code": "CHILD-0", "_is_fallback": True},
+        endosymbiosis,
+        {"fallback_code": "CHILD-2", "_is_fallback": True},
+    ]
+    assert [call["new_code"] for call in calls] == ["CHILD-0", "CHILD-2"]
+    assert calls[0] == {
+        "parent": entries[0]["ctx"]["parent"],
+        "new_code": "CHILD-0",
+        "survivors": 100,
+        "speciation_type": "type-0",
+        "average_pressure": 1.25,
+    }
+    assert calls[1]["average_pressure"] == 3.0
+
+
+def test_batch_result_parser_falls_back_for_non_dict_response() -> None:
+    entries = _batch_result_entries(2)
+    calls: list[dict] = []
+
+    results = parse_batch_results(
+        ["not", "a", "dict"],
+        entries,
+        generate_rule_based_fallback=_fallback_recorder(calls),
+    )
+
+    assert results == [
+        {"fallback_code": "CHILD-0", "_is_fallback": True},
+        {"fallback_code": "CHILD-1", "_is_fallback": True},
+    ]
+    assert [call["new_code"] for call in calls] == ["CHILD-0", "CHILD-1"]
+
+
+def test_batch_result_parser_preserves_invalid_results_branch_behavior() -> None:
+    entries = _batch_result_entries(2)
+    ignored_endosymbiosis = {"common_name": "当前分支不会使用"}
+    response = {
+        "_endo_overrides": {0: ignored_endosymbiosis},
+        "results": "not-a-list",
+    }
+    calls: list[dict] = []
+
+    results = parse_batch_results(
+        response,
+        entries,
+        generate_rule_based_fallback=_fallback_recorder(calls),
+    )
+
+    assert "_endo_overrides" not in response
+    assert results == [
+        {"fallback_code": "CHILD-0", "_is_fallback": True},
+        {"fallback_code": "CHILD-1", "_is_fallback": True},
+    ]
+    assert ignored_endosymbiosis not in results
+
+
+def test_batch_result_parser_matches_request_ids_then_position() -> None:
+    entries = _batch_result_entries(3)
+    mapped_one = {
+        "request_id": "1",
+        "latin_name": "One",
+        "common_name": "一",
+        "description": "mapped one",
+    }
+    mapped_zero = {
+        "request_id": 0,
+        "latin_name": "Zero",
+        "common_name": "零",
+        "description": "mapped zero",
+    }
+    positional_two = {
+        "request_id": "not-an-index",
+        "latin_name": "Two",
+        "common_name": "二",
+        "description": "position two",
+    }
+    calls: list[dict] = []
+
+    results = parse_batch_results(
+        {"results": [mapped_one, mapped_zero, positional_two]},
+        entries,
+        generate_rule_based_fallback=_fallback_recorder(calls),
+    )
+
+    assert results == [mapped_zero, mapped_one, positional_two]
+    assert calls == []
+
+
+def test_batch_result_parser_falls_back_for_missing_fields_and_matches() -> None:
+    entries = _batch_result_entries(3)
+    response = {
+        "results": [
+            {
+                "request_id": 0,
+                "latin_name": "Missing",
+                "common_name": "缺描述",
+                "description": "",
+            },
+            "not-a-dict",
+        ]
+    }
+    calls: list[dict] = []
+
+    results = parse_batch_results(
+        response,
+        entries,
+        generate_rule_based_fallback=_fallback_recorder(calls),
+    )
+
+    assert results == [
+        {"fallback_code": "CHILD-0", "_is_fallback": True},
+        {"fallback_code": "CHILD-1", "_is_fallback": True},
+        {"fallback_code": "CHILD-2", "_is_fallback": True},
+    ]
+    assert [call["new_code"] for call in calls] == [
+        "CHILD-0",
+        "CHILD-1",
+        "CHILD-2",
+    ]
+
+
+def test_service_batch_result_parser_delegate_preserves_fallback_override(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    sentinel = [{"delegated": True}]
+
+    def fake_parse_batch_results(batch_response, entries, **kwargs):
+        captured["batch_response"] = batch_response
+        captured["entries"] = entries
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        speciation_module,
+        "parse_batch_results",
+        fake_parse_batch_results,
+    )
+    service = object.__new__(SpeciationService)
+    service._generate_rule_based_fallback = lambda **kwargs: ("fallback", kwargs)
+    response = {"results": []}
+    entries = _batch_result_entries(1)
+
+    result = service._parse_batch_results(response, entries)
+
+    assert result is sentinel
+    assert captured["batch_response"] is response
+    assert captured["entries"] is entries
+    assert captured["generate_rule_based_fallback"](value=3) == (
+        "fallback",
+        {"value": 3},
     )
 
 

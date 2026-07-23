@@ -28,6 +28,7 @@ from .speciation_ai import (
     build_batch_payload,
     generate_rule_based_fallback,
     normalize_ai_content,
+    parse_batch_results,
 )
 from .speciation_naming import fallback_common_name, fallback_latin_name
 from .speciation_lineage import (
@@ -2012,136 +2013,11 @@ class SpeciationService:
         【内共生支持】优先使用 _endo_overrides 中的结果
         【重要修复】如果响应包含 _use_fallback 标记，立即为所有entry生成规则fallback结果
         """
-        results = []
-        
-        # 【新增】提取内共生覆盖结果
-        endo_overrides = {}
-        if isinstance(batch_response, dict):
-             endo_overrides = batch_response.pop("_endo_overrides", {})
-        
-        # 【修复】检测是否需要使用fallback（AI超时或错误）
-        if isinstance(batch_response, dict) and batch_response.get("_use_fallback"):
-            logger.info(f"[分化批量] 检测到fallback标记，为 {len(entries)} 个物种生成规则fallback")
-            for idx, entry in enumerate(entries):
-                # 【新增】即使是 fallback，如果内共生成功了，也优先使用内共生
-                if idx in endo_overrides:
-                    results.append(endo_overrides[idx])
-                    continue
-                    
-                ctx = entry["ctx"]
-                fallback_result = self._generate_rule_based_fallback(
-                    parent=ctx["parent"],
-                    new_code=ctx["new_code"],
-                    survivors=ctx["population"],
-                    speciation_type=ctx["speciation_type"],
-                    average_pressure=ctx.get("average_pressure", 3.0),
-                )
-                # 标记为fallback结果
-                fallback_result["_is_fallback"] = True
-                results.append(fallback_result)
-            return results
-        
-        if not isinstance(batch_response, dict):
-            logger.warning(f"[分化批量] 响应不是字典类型: {type(batch_response)}")
-            # 【修复】改为生成fallback而不是返回异常
-            for idx, entry in enumerate(entries):
-                if idx in endo_overrides:
-                    results.append(endo_overrides[idx])
-                    continue
-                    
-                ctx = entry["ctx"]
-                fallback_result = self._generate_rule_based_fallback(
-                    parent=ctx["parent"],
-                    new_code=ctx["new_code"],
-                    survivors=ctx["population"],
-                    speciation_type=ctx["speciation_type"],
-                    average_pressure=ctx.get("average_pressure", 3.0),
-                )
-                fallback_result["_is_fallback"] = True
-                results.append(fallback_result)
-            return results
-        
-        # 尝试从响应中提取 results 数组
-        ai_results = batch_response.get("results", [])
-        if not isinstance(ai_results, list):
-            # 可能响应本身就是结果数组
-            if isinstance(batch_response, list):
-                ai_results = batch_response
-            else:
-                logger.warning(f"[分化批量] 响应中没有 results 数组，使用规则fallback")
-                # 【修复】使用fallback而不是返回异常
-                for entry in entries:
-                    ctx = entry["ctx"]
-                    fallback_result = self._generate_rule_based_fallback(
-                        parent=ctx["parent"],
-                        new_code=ctx["new_code"],
-                        survivors=ctx["population"],
-                        speciation_type=ctx["speciation_type"],
-                        average_pressure=ctx.get("average_pressure", 3.0),
-                    )
-                    fallback_result["_is_fallback"] = True
-                    results.append(fallback_result)
-                return results
-        
-        # 建立 request_id 到结果的映射
-        result_map = {}
-        for item in ai_results:
-            if isinstance(item, dict):
-                req_id = item.get("request_id")
-                if req_id is not None:
-                    try:
-                        result_map[int(req_id)] = item
-                    except (ValueError, TypeError):
-                        result_map[str(req_id)] = item
-        
-        # 按顺序匹配结果
-        for idx, entry in enumerate(entries):
-            # 【新增】检查是否有内共生覆盖（优先使用）
-            if idx in endo_overrides:
-                results.append(endo_overrides[idx])
-                continue
-
-            # 尝试多种方式匹配
-            matched_result = result_map.get(idx) or result_map.get(str(idx))
-            
-            if matched_result is None and idx < len(ai_results):
-                # 如果没有 request_id，按顺序匹配
-                matched_result = ai_results[idx] if isinstance(ai_results[idx], dict) else None
-            
-            if matched_result:
-                # 验证必要字段
-                required_fields = ["latin_name", "common_name", "description"]
-                if all(matched_result.get(f) for f in required_fields):
-                    results.append(matched_result)
-                    logger.debug(f"[分化批量] 成功匹配结果 {idx}: {matched_result.get('common_name')}")
-                else:
-                    logger.warning(f"[分化批量] 结果 {idx} 缺少必要字段，使用规则fallback")
-                    # 【修复】使用fallback而不是返回异常
-                    ctx = entry["ctx"]
-                    fallback_result = self._generate_rule_based_fallback(
-                        parent=ctx["parent"],
-                        new_code=ctx["new_code"],
-                        survivors=ctx["population"],
-                        speciation_type=ctx["speciation_type"],
-                        average_pressure=ctx.get("average_pressure", 3.0),
-                    )
-                    fallback_result["_is_fallback"] = True
-                    results.append(fallback_result)
-            else:
-                logger.warning(f"[分化批量] 无法匹配结果 {idx}，使用规则fallback")
-                # 【修复】使用fallback而不是返回异常
-                ctx = entry["ctx"]
-                fallback_result = self._generate_rule_based_fallback(
-                    parent=ctx["parent"],
-                    new_code=ctx["new_code"],
-                    survivors=ctx["population"],
-                    speciation_type=ctx["speciation_type"],
-                    average_pressure=ctx.get("average_pressure", 3.0),
-                )
-                fallback_result["_is_fallback"] = True
-                results.append(fallback_result)
-        
-        return results
+        return parse_batch_results(
+            batch_response,
+            entries,
+            generate_rule_based_fallback=self._generate_rule_based_fallback,
+        )
 
     async def _call_ai_wrapper(self, payload: dict, stream_callback: Callable[[str], Awaitable[None] | None] | Callable[[str, str, str], None] | None) -> dict:
         """AI调用包装器（带心跳检测）"""
