@@ -41,6 +41,7 @@ from .speciation_habitat import (
 from .speciation_organs import (
     get_complexity_constraints,
     infer_complexity_by_rules,
+    normalize_organ_evolution,
     process_plant_organ_changes,
     update_capabilities,
     validate_gradual_evolution,
@@ -5087,98 +5088,13 @@ class SpeciationService:
         - 语义漏斗：与父系/同批次名称相似度高（>0.85）则转为升级，不新增。
         - 半径限制：radius<0.2 禁止新增；radius>=0.4 仅允许新增1个新 organ_key。
         """
-        if not organ_evolution:
-            return []
-
-        import re
-        from difflib import SequenceMatcher
-
-        catalog = {c["organ_key"]: c for c in self._organ_catalog}
-
-        def _normalize_name(name: str) -> str:
-            n = (name or "").lower()
-            n = re.sub(r"[^\w\u4e00-\u9fff]+", "", n)
-            return n
-
-        def _guess_key_by_name(name: str) -> str | None:
-            n = _normalize_name(name)
-            for key, meta in catalog.items():
-                base = _normalize_name(meta["default_name"])
-                if base and base in n:
-                    return key
-            return None
-
-        def _similar(a: str, b: str) -> float:
-            return SequenceMatcher(None, a, b).ratio()
-
-        # 父系器官名称索引
-        parent_index = []
-        for cat, data in (parent.organs or {}).items():
-            if isinstance(data, dict):
-                parent_index.append(
-                    {
-                        "category": cat,
-                        "name_norm": _normalize_name(data.get("type", "")),
-                        "raw": data.get("type", ""),
-                    }
-                )
-
-        new_allowed = gene_diversity_radius >= 0.4
-        new_count = 0
-        normalized: list = []
-
-        for evo in organ_evolution:
-            if not isinstance(evo, dict):
-                continue
-
-            raw_name = evo.get("structure_name", "") or evo.get("description", "") or evo.get("organ_key", "")
-            organ_key = evo.get("organ_key") or _guess_key_by_name(raw_name)
-            if organ_key not in catalog:
-                organ_key = _guess_key_by_name(raw_name)
-            if organ_key not in catalog:
-                # 无法识别的 organ_key 丢弃，避免污染
-                continue
-
-            category = catalog[organ_key]["category"]
-            evo["organ_key"] = organ_key
-            evo["category"] = category
-            name_norm = _normalize_name(raw_name)
-            action = evo.get("action", "enhance")
-
-            # 与父系同类比对，语义相似则转为升级
-            similar_parent = False
-            for meta in parent_index:
-                if meta["category"] != category:
-                    continue
-                if _similar(name_norm, meta["name_norm"]) > 0.85:
-                    similar_parent = True
-                    break
-
-            if similar_parent and action == "initiate":
-                evo["action"] = "enhance"
-
-            # 半径限制新增
-            is_new = evo.get("action", "enhance") == "initiate"
-            if is_new:
-                if not new_allowed:
-                    if category in (parent.organs or {}):
-                        evo["action"] = "enhance"
-                    else:
-                        continue
-                else:
-                    if new_count >= 1:
-                        continue
-                    new_count += 1
-
-            # 同批次 organ_key 去重：取更高 target_stage
-            existing = next((x for x in normalized if x.get("organ_key") == organ_key), None)
-            if existing:
-                existing["target_stage"] = max(existing.get("target_stage", 1), evo.get("target_stage", 1))
-                continue
-
-            normalized.append(evo)
-
-        return normalized
+        return normalize_organ_evolution(
+            organ_evolution,
+            parent,
+            turn_index,
+            gene_diversity_radius,
+            self._organ_catalog,
+        )
 
 
     async def _attempt_endosymbiosis_async(

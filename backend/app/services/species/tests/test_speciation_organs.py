@@ -12,10 +12,30 @@ from ..speciation import SpeciationService
 from ..speciation_organs import (
     get_complexity_constraints,
     infer_complexity_by_rules,
+    normalize_organ_evolution,
     process_plant_organ_changes,
     update_capabilities,
     validate_gradual_evolution,
 )
+
+
+ORGAN_CATALOG = [
+    {
+        "organ_key": "vision_simple_eye",
+        "category": "sensory",
+        "default_name": "眼点",
+    },
+    {
+        "organ_key": "vision_complex_eye",
+        "category": "sensory",
+        "default_name": "成像眼",
+    },
+    {
+        "organ_key": "locomotion_fins",
+        "category": "locomotion",
+        "default_name": "鳍状运动",
+    },
+]
 
 
 def test_capabilities_convert_legacy_labels_preserve_unknown_and_deduplicate() -> None:
@@ -510,3 +530,145 @@ def test_service_plant_change_delegate_matches_direct_function() -> None:
         direct_organs, deepcopy(changes), parent, 3
     )
     assert service_organs == direct_organs
+
+
+def _normalize_organ_changes(
+    changes: list,
+    parent: SimpleNamespace,
+    radius: float,
+) -> list:
+    return normalize_organ_evolution(changes, parent, 8, radius, ORGAN_CATALOG)
+
+
+def test_organ_normalization_empty_input_returns_empty_list() -> None:
+    parent = SimpleNamespace(organs={})
+
+    assert _normalize_organ_changes([], parent, 0.4) == []
+
+
+def test_organ_normalization_filters_invalid_items_and_unknown_keys() -> None:
+    parent = SimpleNamespace(organs={})
+    changes = [
+        None,
+        "bad",
+        {"organ_key": "unknown", "structure_name": "未知"},
+    ]
+
+    assert _normalize_organ_changes(changes, parent, 0.4) == []
+
+
+def test_organ_normalization_guesses_key_and_overwrites_category_in_place() -> None:
+    parent = SimpleNamespace(organs={})
+    change = {
+        "organ_key": "unknown",
+        "category": "wrong",
+        "action": "initiate",
+        "structure_name": "强化-眼点!",
+        "target_stage": 1,
+    }
+
+    assert _normalize_organ_changes([change], parent, 0.4) == [change]
+    assert change["organ_key"] == "vision_simple_eye"
+    assert change["category"] == "sensory"
+
+
+def test_organ_normalization_converts_similar_parent_initiate_to_enhance() -> None:
+    parent = SimpleNamespace(organs={"sensory": {"type": "强化眼点"}})
+    change = {
+        "organ_key": "vision_simple_eye",
+        "category": "wrong",
+        "action": "initiate",
+        "structure_name": "强化眼点",
+        "target_stage": 1,
+    }
+
+    assert _normalize_organ_changes([change], parent, 0.0) == [change]
+    assert change["action"] == "enhance"
+    assert change["category"] == "sensory"
+
+
+def test_organ_normalization_radius_boundary_converts_or_drops_new_organs() -> None:
+    existing_category_parent = SimpleNamespace(
+        organs={"sensory": {"type": "不同名称"}}
+    )
+    missing_category_parent = SimpleNamespace(organs={})
+    converted = {
+        "organ_key": "vision_simple_eye",
+        "action": "initiate",
+        "target_stage": 1,
+    }
+    dropped = {
+        "organ_key": "vision_simple_eye",
+        "action": "initiate",
+        "target_stage": 1,
+    }
+
+    assert _normalize_organ_changes(
+        [converted], existing_category_parent, 0.39
+    ) == [converted]
+    assert converted["action"] == "enhance"
+    assert _normalize_organ_changes([dropped], missing_category_parent, 0.39) == []
+
+
+def test_organ_normalization_allows_only_first_new_key_at_boundary() -> None:
+    parent = SimpleNamespace(organs={})
+    first = {
+        "organ_key": "vision_simple_eye",
+        "action": "initiate",
+        "target_stage": 1,
+    }
+    second = {
+        "organ_key": "locomotion_fins",
+        "action": "initiate",
+        "target_stage": 1,
+    }
+
+    assert _normalize_organ_changes([first, second], parent, 0.4) == [first]
+
+
+def test_organ_normalization_deduplicates_by_key_into_first_item() -> None:
+    parent = SimpleNamespace(organs={})
+    first = {
+        "organ_key": "vision_simple_eye",
+        "action": "enhance",
+        "target_stage": 2,
+        "description": "first",
+    }
+    duplicate = {
+        "organ_key": "vision_simple_eye",
+        "action": "enhance",
+        "target_stage": 4,
+        "description": "second",
+    }
+
+    result = _normalize_organ_changes([first, duplicate], parent, 0.4)
+
+    assert result == [first]
+    assert result[0] is first
+    assert first["target_stage"] == 4
+    assert first["description"] == "first"
+
+
+def test_service_organ_normalization_delegate_matches_direct_function() -> None:
+    parent = SimpleNamespace(organs={})
+    service = object.__new__(SpeciationService)
+    service._organ_catalog = deepcopy(ORGAN_CATALOG)
+    service_changes = [
+        {
+            "organ_key": "vision_simple_eye",
+            "action": "initiate",
+            "target_stage": 1,
+        }
+    ]
+    direct_changes = deepcopy(service_changes)
+
+    assert service._normalize_organ_evolution(
+        service_changes, parent, 8, 0.4
+    ) == normalize_organ_evolution(
+        direct_changes,
+        parent,
+        8,
+        0.4,
+        service._organ_catalog,
+    )
+    assert service_changes == direct_changes
