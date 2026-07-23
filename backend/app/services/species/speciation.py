@@ -37,7 +37,10 @@ from .speciation_lineage import (
     generate_multiple_lineage_codes,
     next_lineage_code,
 )
-from .speciation_process import partition_speciation_entries
+from .speciation_process import (
+    generate_background_results,
+    partition_speciation_entries,
+)
 from .speciation_habitat import (
     allocate_tiles_from_clusters,
     allocate_tiles_to_offspring,
@@ -1384,34 +1387,13 @@ class SpeciationService:
         # ========== 【优化】先处理背景物种的规则分化 ==========
         # 背景物种完全跳过 AI，直接使用规则引擎生成，节省 Token 和时间
         # 【改进】现在使用完整的规则引擎约束系统，生成高质量的物种数据
-        background_results: list[tuple[dict, dict]] = []  # [(entry, ai_content)]
-        
-        # 构建环境压力字典（用于规则引擎）
-        env_pressure_dict = {}
-        if pressures:
-            for p in pressures:
-                if hasattr(p, 'category') and hasattr(p, 'intensity'):
-                    env_pressure_dict[p.category] = p.intensity
-        
-        for entry in background_entries:
-            ctx = entry["ctx"]
-            ai_content = self._generate_rule_based_fallback(
-                parent=ctx["parent"],
-                new_code=ctx["new_code"],
-                survivors=ctx["population"],
-                speciation_type=ctx["speciation_type"],
-                average_pressure=average_pressure,
-                environment_pressure=env_pressure_dict,
-                turn_index=turn_index,
-            )
-            background_results.append((entry, ai_content))
-            logger.debug(
-                f"[规则分化] 背景物种 {ctx['parent'].common_name} -> {ai_content.get('common_name')} "
-                f"({ai_content.get('_evolution_direction', '自然分化')})"
-            )
-        
-        if background_results:
-            logger.info(f"[规则分化] 完成 {len(background_results)} 个背景物种的规则生成")
+        background_results = generate_background_results(
+            background_entries,
+            pressures,
+            average_pressure=average_pressure,
+            turn_index=turn_index,
+            generate_rule_based_fallback=self._generate_rule_based_fallback,
+        )
         
         # ========== AI 分化（仅针对非背景物种）==========
         results = []

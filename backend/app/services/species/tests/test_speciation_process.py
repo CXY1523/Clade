@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
-from ..speciation_process import partition_speciation_entries
+from ..speciation_process import (
+    generate_background_results,
+    partition_speciation_entries,
+)
 
 
 def _entry(name: str, *, background: bool | None = None) -> dict:
@@ -85,3 +88,87 @@ def test_entry_partition_preserves_empty_lists() -> None:
         max_deferred_requests=5,
         max_speciation_per_turn=2,
     ) == ([], [], [])
+
+
+def test_background_results_preserve_pressures_order_arguments_and_identity(
+) -> None:
+    entries = [
+        {
+            "ctx": {
+                "parent": SimpleNamespace(common_name="Parent A"),
+                "new_code": "CHILD-A",
+                "population": 101,
+                "speciation_type": "type-a",
+            }
+        },
+        {
+            "ctx": {
+                "parent": SimpleNamespace(common_name="Parent B"),
+                "new_code": "CHILD-B",
+                "population": 202,
+                "speciation_type": "type-b",
+            }
+        },
+    ]
+    pressures = [
+        SimpleNamespace(category="temperature", intensity=0.2),
+        SimpleNamespace(category="ignored-no-intensity"),
+        SimpleNamespace(intensity=9.9),
+        SimpleNamespace(category="temperature", intensity=0.8),
+        SimpleNamespace(category="humidity", intensity=0.4),
+    ]
+    calls: list[dict] = []
+    contents = [
+        {"common_name": "Child A", "_evolution_direction": "direction-a"},
+        {"common_name": "Child B"},
+    ]
+
+    def fallback(**kwargs):
+        calls.append(kwargs)
+        return contents[len(calls) - 1]
+
+    results = generate_background_results(
+        entries,
+        pressures,
+        average_pressure=3.5,
+        turn_index=12,
+        generate_rule_based_fallback=fallback,
+    )
+
+    assert results == [
+        (entries[0], contents[0]),
+        (entries[1], contents[1]),
+    ]
+    assert results[0][0] is entries[0]
+    assert results[0][1] is contents[0]
+    assert [call["new_code"] for call in calls] == ["CHILD-A", "CHILD-B"]
+    assert calls[0] == {
+        "parent": entries[0]["ctx"]["parent"],
+        "new_code": "CHILD-A",
+        "survivors": 101,
+        "speciation_type": "type-a",
+        "average_pressure": 3.5,
+        "environment_pressure": {
+            "temperature": 0.8,
+            "humidity": 0.4,
+        },
+        "turn_index": 12,
+    }
+    assert calls[1]["parent"] is entries[1]["ctx"]["parent"]
+    assert (
+        calls[0]["environment_pressure"]
+        is calls[1]["environment_pressure"]
+    )
+
+
+def test_background_results_preserve_empty_inputs() -> None:
+    calls: list[dict] = []
+
+    assert generate_background_results(
+        [],
+        None,
+        average_pressure=0.0,
+        turn_index=0,
+        generate_rule_based_fallback=lambda **kwargs: calls.append(kwargs),
+    ) == []
+    assert calls == []
