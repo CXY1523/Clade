@@ -41,6 +41,7 @@ from .speciation_habitat import (
 from .speciation_organs import (
     get_complexity_constraints,
     infer_complexity_by_rules,
+    process_plant_organ_changes,
     update_capabilities,
     validate_gradual_evolution,
 )
@@ -52,7 +53,12 @@ from .speciation_dormant_genes import (
 from .trait_config import TraitConfig, PlantTraitConfig
 from .trophic import TrophicLevelCalculator
 from .speciation_rules import SpeciationRules, speciation_rules  # 【新增】规则引擎
-from .plant_evolution import plant_evolution_service, PLANT_MILESTONES  # 【植物演化】
+from .plant_evolution import (  # 【植物演化】
+    PLANT_MILESTONES,
+    PLANT_ORGANS,
+    PLANT_ORGAN_CATEGORIES,
+    plant_evolution_service,
+)
 from .plant_competition import plant_competition_calculator  # 【植物竞争】
 from .description_enhancer import DescriptionEnhancerService  # 【描述增强】
 from .gene_diversity import GeneDiversityService
@@ -4513,164 +4519,15 @@ class SpeciationService:
         Returns:
             更新后的器官字典（含植物专用结构）
         """
-        from .plant_evolution import (
-            plant_evolution_service, 
-            PLANT_ORGANS, 
+        return process_plant_organ_changes(
+            organs,
+            organ_changes,
+            parent,
+            turn_index,
+            plant_evolution_service,
+            PLANT_ORGANS,
             PLANT_ORGAN_CATEGORIES,
-            MILESTONE_REQUIRED_ORGANS
         )
-        
-        current_stage = getattr(parent, 'life_form_stage', 0)
-        
-        # 初始化或继承植物器官
-        plant_organs = getattr(parent, 'plant_organs', None)
-        if plant_organs is None:
-            plant_organs = {}
-        else:
-            plant_organs = dict(plant_organs)  # 深拷贝
-            for cat, cat_organs in plant_organs.items():
-                if isinstance(cat_organs, dict):
-                    plant_organs[cat] = dict(cat_organs)
-        
-        for change in organ_changes:
-            if not isinstance(change, dict):
-                continue
-            
-            category = change.get("category", "")
-            change_type = change.get("change_type", "new")
-            organ_name = change.get("organ_name", "")
-            
-            # 参数可能是新格式的 parameters 或旧格式的 parameter+delta
-            parameters = change.get("parameters", {})
-            if not parameters:
-                # 兼容旧格式
-                param_name = change.get("parameter", "")
-                delta = change.get("delta", 0)
-                if param_name:
-                    parameters = {param_name: delta}
-            
-            # 验证类别是否有效
-            if category not in PLANT_ORGAN_CATEGORIES:
-                logger.warning(f"[植物器官] 未知类别 {category}，跳过")
-                continue
-            
-            cat_config = PLANT_ORGAN_CATEGORIES[category]
-            min_stage = cat_config.get("min_stage", 0)
-            
-            # 验证阶段限制
-            if current_stage < min_stage:
-                logger.warning(
-                    f"[植物器官] {organ_name} 需要阶段{min_stage}，当前阶段{current_stage}，跳过"
-                )
-                continue
-            
-            # 检查是否是里程碑必须器官
-            is_milestone_organ, milestone_id = plant_evolution_service.is_milestone_required_organ(organ_name)
-            
-            if change_type == "new":
-                # 新增器官
-                if category not in plant_organs:
-                    plant_organs[category] = {}
-                
-                # 使用验证系统获取修正后的参数
-                valid, reason, corrected_params = plant_evolution_service.validate_custom_organ(
-                    category, organ_name, parameters, current_stage
-                )
-                
-                if valid:
-                    plant_organs[category][organ_name] = {
-                        **corrected_params,
-                        "acquired_turn": turn_index,
-                        "is_custom": organ_name not in PLANT_ORGANS.get(category, {}),
-                    }
-                    
-                    # 里程碑器官特殊标记
-                    if is_milestone_organ:
-                        plant_organs[category][organ_name]["milestone_required"] = True
-                        plant_organs[category][organ_name]["milestone_id"] = milestone_id
-                    
-                    organ_type = "自定义" if plant_organs[category][organ_name]["is_custom"] else "参考"
-                    logger.info(
-                        f"[植物器官] 新增{organ_type}器官: {organ_name} ({category})"
-                    )
-                else:
-                    logger.warning(f"[植物器官] 验证失败: {reason}")
-            
-            elif change_type == "enhance":
-                # 增强现有器官
-                if category in plant_organs and organ_name in plant_organs[category]:
-                    existing = plant_organs[category][organ_name]
-                    
-                    # 应用参数增强
-                    param_ranges = cat_config.get("param_ranges", {})
-                    for param, delta in parameters.items():
-                        current_val = existing.get(param, 0)
-                        new_val = current_val + delta
-                        
-                        # 范围钳制
-                        if param in param_ranges:
-                            min_val, max_val = param_ranges[param]
-                            new_val = max(min_val, min(max_val, new_val))
-                        
-                        existing[param] = new_val
-                    
-                    existing["modified_turn"] = turn_index
-                    logger.info(f"[植物器官] 增强器官: {organ_name} ({category})")
-                else:
-                    logger.warning(
-                        f"[植物器官] 增强失败: 器官 {organ_name} 不存在于 {category}"
-                    )
-            
-            elif change_type == "degrade":
-                # 退化器官
-                if category in plant_organs and organ_name in plant_organs[category]:
-                    # 里程碑器官不能退化
-                    if is_milestone_organ:
-                        logger.warning(
-                            f"[植物器官] 里程碑器官 {organ_name} 不能退化"
-                        )
-                        continue
-                    
-                    existing = plant_organs[category][organ_name]
-                    existing["is_degraded"] = True
-                    existing["degraded_turn"] = turn_index
-                    logger.info(f"[植物器官] 退化器官: {organ_name} ({category})")
-        
-        # 将植物器官合并到通用器官字典中
-        # 同时保持与动物器官系统的兼容性
-        for category, cat_organs in plant_organs.items():
-            if category not in organs:
-                organs[category] = {}
-            
-            # 找到该类别中最高效的器官作为主器官
-            if cat_organs:
-                best_organ = None
-                best_value = -1
-                
-                for name, data in cat_organs.items():
-                    if data.get("is_degraded"):
-                        continue
-                    
-                    # 获取主要参数值作为排序依据
-                    cat_config = PLANT_ORGAN_CATEGORIES.get(category, {})
-                    main_param = (cat_config.get("required_params") or ["efficiency"])[0]
-                    value = data.get(main_param, 0)
-                    
-                    if value > best_value:
-                        best_value = value
-                        best_organ = name
-                
-                if best_organ:
-                    organs[category]["type"] = best_organ
-                    organs[category]["parameters"] = dict(cat_organs[best_organ])
-                    organs[category]["evolution_stage"] = 4  # 植物器官默认完善
-                    organs[category]["evolution_progress"] = 1.0
-                    organs[category]["is_active"] = True
-        
-        # 保存完整的植物器官到隐藏字段（供后续使用）
-        organs["_plant_organs"] = plant_organs
-        
-        return organs
     
     def _update_capabilities(self, parent: Species, organs: dict) -> list[str]:
         """根据器官更新能力标签

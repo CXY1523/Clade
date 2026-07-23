@@ -3,10 +3,16 @@ from types import SimpleNamespace
 
 import pytest
 
+from ..plant_evolution import (
+    PLANT_ORGANS,
+    PLANT_ORGAN_CATEGORIES,
+    plant_evolution_service,
+)
 from ..speciation import SpeciationService
 from ..speciation_organs import (
     get_complexity_constraints,
     infer_complexity_by_rules,
+    process_plant_organ_changes,
     update_capabilities,
     validate_gradual_evolution,
 )
@@ -330,3 +336,177 @@ def test_service_gradual_validation_delegate_matches_direct_function() -> None:
         get_complexity_constraints,
     )
     assert service_changes == direct_changes
+
+
+def _process_plant_changes(
+    organs: dict,
+    changes: list,
+    parent: SimpleNamespace,
+    turn_index: int,
+) -> dict:
+    return process_plant_organ_changes(
+        organs,
+        changes,
+        parent,
+        turn_index,
+        plant_evolution_service,
+        PLANT_ORGANS,
+        PLANT_ORGAN_CATEGORIES,
+    )
+
+
+def test_plant_changes_empty_input_returns_same_generic_organs() -> None:
+    organs = {"legacy": {"type": "legacy"}}
+    parent = SimpleNamespace(life_form_stage=0, plant_organs=None)
+
+    result = _process_plant_changes(organs, [], parent, 4)
+
+    assert result is organs
+    assert result == {
+        "legacy": {"type": "legacy"},
+        "_plant_organs": {},
+    }
+
+
+def test_plant_changes_add_reference_milestone_from_legacy_parameters() -> None:
+    organs = {}
+    parent = SimpleNamespace(life_form_stage=1, plant_organs=None)
+    change = {
+        "category": "photosynthetic",
+        "change_type": "new",
+        "organ_name": "叶绿体",
+        "parameter": "efficiency",
+        "delta": 9.0,
+    }
+
+    result = _process_plant_changes(organs, [change], parent, 7)
+    stored = result["_plant_organs"]["photosynthetic"]["叶绿体"]
+
+    assert stored == {
+        "efficiency": 5.0,
+        "min_stage": 0,
+        "acquired_turn": 7,
+        "is_custom": False,
+        "milestone_required": True,
+        "milestone_id": "first_eukaryote",
+    }
+    assert result["photosynthetic"] == {
+        "type": "叶绿体",
+        "parameters": stored.copy(),
+        "evolution_stage": 4,
+        "evolution_progress": 1.0,
+        "is_active": True,
+    }
+
+
+def test_plant_changes_skip_unknown_and_stage_locked_categories() -> None:
+    parent = SimpleNamespace(life_form_stage=0, plant_organs=None)
+    changes = [
+        {
+            "category": "unknown",
+            "change_type": "new",
+            "organ_name": "未知",
+            "parameters": {},
+        },
+        {
+            "category": "root_system",
+            "change_type": "new",
+            "organ_name": "假根",
+            "parameters": {"depth_cm": 1, "absorption": 1},
+        },
+    ]
+
+    assert _process_plant_changes({}, changes, parent, 1) == {
+        "_plant_organs": {}
+    }
+
+
+def test_plant_changes_enhance_and_degrade_shared_parent_records() -> None:
+    photosynthetic = {"efficiency": 4.8, "min_stage": 0}
+    protection = {"uv_resist": 1.0, "min_stage": 0}
+    parent = SimpleNamespace(
+        life_form_stage=3,
+        plant_organs={
+            "photosynthetic": {"自定义叶": photosynthetic},
+            "protection": {"树脂层": protection},
+        },
+    )
+    changes = [
+        {
+            "category": "photosynthetic",
+            "change_type": "enhance",
+            "organ_name": "自定义叶",
+            "parameters": {"efficiency": 1.0},
+        },
+        {
+            "category": "protection",
+            "change_type": "degrade",
+            "organ_name": "树脂层",
+        },
+    ]
+
+    result = _process_plant_changes({}, changes, parent, 9)
+
+    assert photosynthetic == {
+        "efficiency": 5.0,
+        "min_stage": 0,
+        "modified_turn": 9,
+    }
+    assert protection == {
+        "uv_resist": 1.0,
+        "min_stage": 0,
+        "is_degraded": True,
+        "degraded_turn": 9,
+    }
+    assert result["photosynthetic"]["type"] == "自定义叶"
+    assert "type" not in result["protection"]
+
+
+def test_plant_changes_protect_milestones_and_keep_first_best_organ() -> None:
+    first = {"efficiency": 2.0, "min_stage": 0}
+    tied = {"efficiency": 2.0, "min_stage": 0}
+    milestone = {"efficiency": 1.0, "min_stage": 0}
+    parent = SimpleNamespace(
+        life_form_stage=3,
+        plant_organs={
+            "photosynthetic": {
+                "第一叶": first,
+                "同值叶": tied,
+                "叶绿体": milestone,
+            }
+        },
+    )
+    changes = [
+        {
+            "category": "photosynthetic",
+            "change_type": "degrade",
+            "organ_name": "叶绿体",
+        }
+    ]
+
+    result = _process_plant_changes({}, changes, parent, 10)
+
+    assert "is_degraded" not in milestone
+    assert result["photosynthetic"]["type"] == "第一叶"
+
+
+def test_service_plant_change_delegate_matches_direct_function() -> None:
+    parent = SimpleNamespace(life_form_stage=1, plant_organs=None)
+    changes = [
+        {
+            "category": "photosynthetic",
+            "change_type": "new",
+            "organ_name": "光合泡",
+            "parameters": {"efficiency": 1.2},
+        }
+    ]
+    service_organs = {}
+    direct_organs = {}
+    service = object.__new__(SpeciationService)
+
+    assert service._process_plant_organ_changes(
+        service_organs, deepcopy(changes), parent, 3
+    ) == _process_plant_changes(
+        direct_organs, deepcopy(changes), parent, 3
+    )
+    assert service_organs == direct_organs
