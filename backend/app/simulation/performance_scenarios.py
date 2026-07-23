@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import random
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -19,6 +21,7 @@ from ..repositories.environment_repository import EnvironmentRepository
 from ..repositories.species_repository import SpeciesRepository
 from ..schemas.requests import TurnCommand
 from ..services.geo.map_evolution import MapEvolutionService
+from ..services.system.save_manager import SaveManager
 from .engine import SimulationEngine
 from .performance_baseline import BenchmarkCase
 from .performance_measurement import (
@@ -207,6 +210,8 @@ def _build_core_engine(
 async def run_deterministic_scenario(
     scenario: BenchmarkScenario,
     database_engine: Engine,
+    *,
+    save_root: Path,
 ) -> BenchmarkCase:
     """Measure one scenario in the already-configured isolated app database."""
 
@@ -244,12 +249,46 @@ async def run_deterministic_scenario(
                 raise RuntimeError(
                     "core pipeline did not complete every requested turn"
                 )
+
+            save_manager = SaveManager(save_root)
+            save_started = time.perf_counter()
+            save_directory = save_manager.save_game(
+                f"benchmark-{scenario.case_id}",
+                turn_index=scenario.turns,
+            )
+            save_duration_ms = (
+                time.perf_counter() - save_started
+            ) * 1000
+            save_size_bytes = sum(
+                path.stat().st_size
+                for path in save_directory.rglob("*")
+                if path.is_file()
+            )
+
+            load_started = time.perf_counter()
+            loaded = save_manager.load_game(
+                f"benchmark-{scenario.case_id}"
+            )
+            load_duration_ms = (
+                time.perf_counter() - load_started
+            ) * 1000
+            if loaded.get("turn_index") != scenario.turns:
+                raise RuntimeError("save/load restored the wrong turn")
+            if loaded.get("species_count") != scenario.species_count:
+                raise RuntimeError(
+                    "save/load restored the wrong species count"
+                )
+
             return MeasurementEvidence(
                 pipeline_metrics=tuple(metrics),
+                save_size_bytes=save_size_bytes,
+                save_duration_ms=save_duration_ms,
+                load_duration_ms=load_duration_ms,
                 ai_calls=0,
                 notes=(
                     "deterministic core pipeline",
                     "AI and embedding integration disabled",
+                    "save/load round trip measured",
                 ),
             )
 

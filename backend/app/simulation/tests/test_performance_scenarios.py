@@ -142,6 +142,7 @@ async def test_scale_scenario_runs_measured_core_pipeline_in_isolation(
         measured = await run_deterministic_scenario(
             scenario,
             database_engine,
+            save_root=tmp_path / "saves",
         )
         with Session(database_engine) as session:
             species_count = session.exec(
@@ -159,11 +160,18 @@ async def test_scale_scenario_runs_measured_core_pipeline_in_isolation(
     assert measured.database_write_statements is not None
     assert measured.database_write_statements > 0
     assert measured.database_rows_changed is not None
+    assert measured.save_size_bytes is not None
+    assert measured.save_size_bytes > 0
+    assert measured.save_duration_ms is not None
+    assert measured.save_duration_ms >= 0
+    assert measured.load_duration_ms is not None
+    assert measured.load_duration_ms >= 0
     assert measured.stages
     assert all(stage.sample_count == 1 for stage in measured.stages)
     assert measured.notes == (
         "deterministic core pipeline",
         "AI and embedding integration disabled",
+        "save/load round trip measured",
     )
     assert species_count == scenario.species_count
     assert map_state is not None
@@ -188,6 +196,7 @@ async def test_seeded_scenario_completes_and_aggregates_100_turns(
         measured = await run_deterministic_scenario(
             BENCHMARK_SCENARIOS[-1],
             database_engine,
+            save_root=tmp_path / "saves",
         )
         with Session(database_engine) as session:
             map_state = session.get(MapState, 1)
@@ -197,6 +206,10 @@ async def test_seeded_scenario_completes_and_aggregates_100_turns(
     assert measured.case_id == "seeded-100-turn"
     assert measured.turns == 100
     assert measured.ai_calls == 0
+    assert measured.save_size_bytes is not None
+    assert measured.save_size_bytes > 0
+    assert measured.save_duration_ms is not None
+    assert measured.load_duration_ms is not None
     assert measured.stages
     assert all(stage.sample_count == 100 for stage in measured.stages)
     assert map_state is not None
@@ -221,6 +234,7 @@ async def test_scenario_runner_requires_explicit_process_isolation(
             await run_deterministic_scenario(
                 BENCHMARK_SCENARIOS[0],
                 database_engine,
+                save_root=tmp_path / "saves",
             )
         with Session(database_engine) as session:
             assert session.exec(select(func.count(Species.id))).one() == 0
