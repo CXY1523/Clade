@@ -5,6 +5,8 @@ import pytest
 from .. import speciation_process as speciation_process_module
 from ..speciation_process import (
     build_offspring_ai_entry,
+    apply_candidate_speciation_roll,
+    calculate_candidate_speciation_chance,
     enhance_rule_fallback_descriptions,
     evaluate_candidate_eligibility,
     evaluate_environmental_pressure,
@@ -1811,3 +1813,247 @@ def test_environmental_pressure_preserves_legacy_death_rate_return_order(
 
     assert work is None
     assert calls == ["random"]
+
+
+def _trigger_work(
+    *,
+    candidate_data: dict | None = None,
+    candidate_population: int = 200,
+    death_rate: float = 0.2,
+    is_isolated: bool = False,
+    mortality_gradient: float = 0.0,
+    clusters: list | None = None,
+    niche_overlap: float = 0.2,
+    niche_saturation: float = 0.2,
+    speciation_pressure: float = 0.0,
+) -> speciation_process_module._CandidateWork:
+    return speciation_process_module._CandidateWork(
+        candidate_data=candidate_data,
+        candidate_tiles={1, 2},
+        tile_populations={1: 100, 2: 100},
+        tile_mortality={1: 0.2, 2: 0.2},
+        global_population=candidate_population,
+        candidate_population=candidate_population,
+        death_rate=death_rate,
+        is_isolated=is_isolated,
+        mortality_gradient=mortality_gradient,
+        clusters=[] if clusters is None else clusters,
+        survivors=candidate_population,
+        resource_pressure=0.2,
+        niche_overlap=niche_overlap,
+        niche_saturation=niche_saturation,
+        base_threshold=100,
+        min_population=100,
+        evo_potential=0.2,
+        speciation_pressure=speciation_pressure,
+    )
+
+
+def _trigger_species(
+    *,
+    recent_migrations: list[int] | None = None,
+    is_background: bool = False,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        common_name="Parent",
+        lineage_code="PARENT",
+        is_background=is_background,
+        morphology_stats={
+            "generation_time_days": 365,
+            "recent_migration_turns": (
+                [] if recent_migrations is None else recent_migrations
+            ),
+            "speciation_pressure": 0.0,
+        },
+    )
+
+
+def test_final_chance_rejects_high_death_rate_before_channel_callbacks(
+) -> None:
+    assert calculate_candidate_speciation_chance(
+        _trigger_work(death_rate=0.61),
+        species=_trigger_species(),
+        lineage_code="PARENT",
+        mortality_results=[],
+        turn_index=20,
+        density_damping=1.0,
+        average_pressure=0.0,
+        map_changes=[],
+        major_events=[],
+        spec_config=_candidate_config(
+            early_game_turns=10,
+            background_speciation_penalty=0.1,
+        ),
+        base_speciation_rate=0.1,
+        ai_speciation_candidates=set(),
+        detect_geographic_isolation=lambda _code: pytest.fail(
+            "high death rate must return before channel detection"
+        ),
+        detect_coevolution=lambda *_args: pytest.fail(
+            "high death rate must return before coevolution"
+        ),
+    ) is None
+
+
+def test_final_chance_preserves_prescreened_geographic_channel() -> None:
+    clusters = [{1}, {2}]
+    work = calculate_candidate_speciation_chance(
+        _trigger_work(
+            candidate_data={"candidate_tiles": {1, 2}},
+            is_isolated=True,
+            mortality_gradient=0.3,
+            clusters=clusters,
+        ),
+        species=_trigger_species(),
+        lineage_code="PARENT",
+        mortality_results=[],
+        turn_index=20,
+        density_damping=1.0,
+        average_pressure=0.0,
+        map_changes=[],
+        major_events=[],
+        spec_config=_candidate_config(
+            early_game_turns=10,
+            background_speciation_penalty=0.1,
+        ),
+        base_speciation_rate=0.1,
+        ai_speciation_candidates=set(),
+        detect_geographic_isolation=lambda _code: pytest.fail(
+            "prescreened candidate must not run legacy detection"
+        ),
+        detect_coevolution=lambda *_args: {
+            "has_coevolution": False,
+        },
+    )
+
+    assert work is not None
+    expected_base = (
+        (0.1 + 0.2 * 0.25) * 0.8
+        + __import__("math").log10(500_000) * 0.02
+    )
+    assert work.generations == 500_000
+    assert work.speciation_type == "地理隔离"
+    assert work.speciation_chance == pytest.approx(
+        expected_base + 0.50 + 0.10
+    )
+    assert work.clusters is clusters
+
+
+def test_final_chance_preserves_ecological_population_rejection() -> None:
+    assert calculate_candidate_speciation_chance(
+        _trigger_work(
+            candidate_data={"candidate_tiles": {1}},
+            candidate_population=100,
+            niche_overlap=0.7,
+        ),
+        species=_trigger_species(),
+        lineage_code="PARENT",
+        mortality_results=[],
+        turn_index=20,
+        density_damping=1.0,
+        average_pressure=0.7,
+        map_changes=[],
+        major_events=[],
+        spec_config=_candidate_config(
+            early_game_turns=10,
+            background_speciation_penalty=0.1,
+        ),
+        base_speciation_rate=0.1,
+        ai_speciation_candidates=set(),
+        detect_geographic_isolation=lambda _code: pytest.fail(
+            "prescreened candidate must not run legacy detection"
+        ),
+        detect_coevolution=lambda *_args: {
+            "has_coevolution": False,
+        },
+    ) is None
+
+
+def test_final_chance_preserves_migration_ai_and_background_order() -> None:
+    species = _trigger_species(
+        recent_migrations=[10, 17, 18],
+        is_background=True,
+    )
+    work = calculate_candidate_speciation_chance(
+        _trigger_work(),
+        species=species,
+        lineage_code="PARENT",
+        mortality_results=[],
+        turn_index=20,
+        density_damping=1.0,
+        average_pressure=0.0,
+        map_changes=[],
+        major_events=[],
+        spec_config=_candidate_config(
+            early_game_turns=10,
+            background_speciation_penalty=0.2,
+        ),
+        base_speciation_rate=0.1,
+        ai_speciation_candidates={"PARENT"},
+        detect_geographic_isolation=lambda _code: {
+            "is_isolated": False,
+        },
+        detect_coevolution=lambda *_args: {
+            "has_coevolution": False,
+        },
+    )
+
+    assert work is not None
+    base_chance = (
+        (0.1 + 0.2 * 0.25) * 0.8
+        + __import__("math").log10(500_000) * 0.02
+    )
+    assert species.morphology_stats["recent_migration_turns"] == [18]
+    assert work.speciation_type == "AI辅助生态隔离"
+    assert work.speciation_chance == pytest.approx(
+        (base_chance * 0.5 + 0.15) * 0.2
+    )
+
+
+def test_final_roll_failure_accumulates_pressure_before_upsert() -> None:
+    species = _trigger_species()
+    work = _trigger_work(speciation_pressure=0.10)
+    work = speciation_process_module.replace(
+        work,
+        speciation_chance=0.20,
+    )
+    calls: list[tuple] = []
+
+    result = apply_candidate_speciation_roll(
+        work,
+        species=species,
+        turn_index=20,
+        random_random=lambda: calls.append(("random",)) or 0.30,
+        upsert_species=lambda species_arg: calls.append(
+            (
+                "upsert",
+                species_arg.morphology_stats["speciation_pressure"],
+            )
+        ),
+    )
+
+    assert result is None
+    assert species.morphology_stats["speciation_pressure"] == 0.18
+    assert calls == [("random",), ("upsert", 0.18)]
+
+
+def test_final_roll_success_resets_pressure_and_sets_cooldown() -> None:
+    species = _trigger_species()
+    work = speciation_process_module.replace(
+        _trigger_work(speciation_pressure=0.10),
+        speciation_chance=0.20,
+    )
+
+    result = apply_candidate_speciation_roll(
+        work,
+        species=species,
+        turn_index=20,
+        random_random=lambda: 0.20,
+        upsert_species=lambda _species: pytest.fail(
+            "successful roll must not upsert at this boundary"
+        ),
+    )
+
+    assert result is work
+    assert species.morphology_stats["speciation_pressure"] == 0.0
+    assert species.morphology_stats["last_speciation_turn"] == 20

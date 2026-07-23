@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
@@ -28,6 +29,9 @@ class _CandidateWork:
     min_population: int = 0
     evo_potential: float = 0.0
     speciation_pressure: float = 0.0
+    generations: float = 0.0
+    speciation_type: str = ""
+    speciation_chance: float = 0.0
 
 
 def normalize_candidate_state(
@@ -477,6 +481,288 @@ def evaluate_environmental_pressure(
     ):
         return None
     return replace(work, speciation_pressure=speciation_pressure)
+
+
+def calculate_candidate_speciation_chance(
+    work: _CandidateWork,
+    *,
+    species: Any,
+    lineage_code: str,
+    mortality_results: list,
+    turn_index: int,
+    density_damping: float,
+    average_pressure: float,
+    map_changes: list,
+    major_events: list,
+    spec_config: Any,
+    base_speciation_rate: float,
+    ai_speciation_candidates: set,
+    detect_geographic_isolation: Callable[[str], dict],
+    detect_coevolution: Callable[[Any, list], dict],
+) -> _CandidateWork | None:
+    """Calculate the final speciation channel and chance."""
+    candidate_data = work.candidate_data
+    candidate_tiles = work.candidate_tiles
+    candidate_population = work.candidate_population
+    death_rate = work.death_rate
+    is_isolated = work.is_isolated
+    mortality_gradient = work.mortality_gradient
+    clusters = work.clusters
+    survivors = work.survivors
+    resource_pressure = work.resource_pressure
+    niche_overlap = work.niche_overlap
+    niche_saturation = work.niche_saturation
+    base_threshold = work.base_threshold
+    min_population = work.min_population
+    evo_potential = work.evo_potential
+    speciation_pressure = work.speciation_pressure
+
+    generation_time = species.morphology_stats.get("generation_time_days", 365)
+    total_days = 500_000 * 365
+    generations = total_days / max(1.0, generation_time)
+
+    generation_bonus = math.log10(max(10, generations)) * 0.02
+
+    base_rate = base_speciation_rate
+    base_chance = ((base_rate + (evo_potential * 0.25)) * 0.8 + generation_bonus) * density_damping
+
+    if turn_index < spec_config.early_game_turns:
+        if is_isolated or candidate_population >= base_threshold * 2.0:
+            base_chance = max(base_chance, 0.45)
+        else:
+            base_chance = max(base_chance, 0.20)
+
+    speciation_bonus = 0.0
+    speciation_type = "生态隔离"
+
+    death_rate_penalty = 0.0
+    if death_rate < 0.05:
+        # 死亡率过低，分化动力不足
+        death_rate_penalty = -0.1
+    elif death_rate <= 0.40:
+        # 最优区间，无惩罚
+        death_rate_penalty = 0.0
+    elif death_rate <= 0.60:
+        # 40%-60% 线性衰减
+        death_rate_penalty = -0.3 * ((death_rate - 0.40) / 0.20)  # 最多-0.3
+    else:
+        # >60% 直接跳过（极端死亡率不适合分化）
+        logger.debug(
+            f"[分化跳过-死亡率过高] {species.common_name}: "
+            f"死亡率{death_rate:.1%} > 60%"
+        )
+        return None
+    # ========== 地理隔离通道（主路径）==========
+    if candidate_data and is_isolated:
+        speciation_bonus += 0.50  # 【强化】从 +0.25 提高到 +0.50
+        speciation_type = "地理隔离"
+
+        # 死亡率梯度 >0.2 再 +0.1 概率加成
+        if mortality_gradient > 0.2:
+            speciation_bonus += 0.10
+            logger.info(
+                f"[地块级隔离检测] {species.common_name}: "
+                f"检测到{len(clusters)}个隔离区域, "
+                f"死亡率梯度={mortality_gradient:.1%} (>20%, +10%加成), "
+                f"候选地块={len(candidate_tiles)}"
+            )
+        else:
+            logger.info(
+                f"[地块级隔离检测] {species.common_name}: "
+                f"检测到{len(clusters)}个隔离区域, "
+                f"死亡率梯度={mortality_gradient:.1%}, "
+                f"候选地块={len(candidate_tiles)}"
+            )
+    elif not candidate_data:
+        # 回退到旧的检测方法
+        geo_isolation_data = detect_geographic_isolation(lineage_code)
+        if geo_isolation_data["is_isolated"]:
+            speciation_bonus += 0.50  # 【强化】
+            speciation_type = "地理隔离"
+            clusters = geo_isolation_data["clusters"]
+
+            if geo_isolation_data["mortality_gradient"] > 0.2:
+                speciation_bonus += 0.10
+
+            logger.info(
+                f"[地理隔离检测] {species.common_name}: "
+                f"检测到{geo_isolation_data['num_clusters']}个隔离区域, "
+                f"死亡率差异={geo_isolation_data['mortality_gradient']:.1%}"
+            )
+
+    # ========== 重大地形事件（强触发）==========
+    if map_changes:
+        for change in (map_changes or []):
+            change_type = change.get("change_type", "") if isinstance(change, dict) else getattr(change, "change_type", "")
+            if change_type in ["uplift", "volcanic", "glaciation"]:
+                speciation_bonus += 0.30  # 【强化】从 +0.15 提高到 +0.30
+                if speciation_type != "地理隔离":
+                    speciation_type = "地理隔离"
+                break
+
+    # ========== 生态隔离/垂直分化通道（同域分层）==========
+    # 允许无地理隔离时触发，但条件更严
+    ecological_isolation_triggered = False
+    if not is_isolated and speciation_type != "地理隔离":
+        # 条件：高压力/资源 + 生态信号（overlap/saturation）
+        eco_pressure_ok = (average_pressure >= 0.7 or resource_pressure >= 0.65)
+        eco_signal_ok = (niche_overlap > 0.6 or niche_saturation > 0.7)
+
+        if eco_pressure_ok and eco_signal_ok:
+            speciation_bonus += 0.25  # 中等加成，低于地理隔离
+            speciation_type = "生态隔离"
+            ecological_isolation_triggered = True
+            logger.info(
+                f"[生态隔离] {species.common_name}: "
+                f"同域分层触发 (overlap={niche_overlap:.1%}, saturation={niche_saturation:.1%})"
+            )
+
+    # 检测极端环境特化
+    if major_events:
+        for event in (major_events or []):
+            severity = event.get("severity", "") if isinstance(event, dict) else getattr(event, "severity", "")
+            if severity in ["extreme", "catastrophic"]:
+                speciation_bonus += 0.10
+                if speciation_type == "生态隔离" and not ecological_isolation_triggered:
+                    speciation_type = "极端环境特化"
+                break
+
+    # 检测协同演化（降低加成）
+    if niche_overlap > 0.4 and speciation_type not in ["地理隔离", "生态隔离"]:
+        speciation_bonus += 0.05  # 【降低】从 +0.08 降到 +0.05
+        speciation_type = "协同演化"
+
+    # 【大浪淘沙v4】自然分化兜底加成
+    # 对于通过初步检查的候选，即使没有明显压力也给予基础分化机会
+    if speciation_type == "自然分化":
+        # 基于种群规模给予加成
+        pop_ratio = survivors / min_population if min_population > 0 else 1
+        if pop_ratio >= 1.5:
+            speciation_bonus += 0.10 + min(0.15, (pop_ratio - 1.5) * 0.05)
+            logger.debug(f"[自然分化加成] {species.common_name}: 种群比={pop_ratio:.1f}x, 加成={speciation_bonus:.0%}")
+
+    # 【新增】动植物协同演化检测
+    coevolution_result = detect_coevolution(species, mortality_results)
+    if coevolution_result["has_coevolution"]:
+        speciation_bonus += coevolution_result["bonus"]
+        if speciation_type == "生态隔离":  # 只在没有更强触发时更新类型
+            speciation_type = coevolution_result["type"]
+        logger.debug(
+            f"[协同演化] {species.common_name}: {coevolution_result['type']} "
+            f"(+{coevolution_result['bonus']:.0%})"
+        )
+
+    # 应用死亡率区间惩罚
+    speciation_bonus += death_rate_penalty
+
+    # 【修复】将累积分化压力加入概率计算
+    # 每回合满足条件但未分化的物种，下回合分化概率+10%
+    speciation_chance = base_chance + speciation_bonus + speciation_pressure
+
+    # ========== 【一揽子修改】迁徙抑制 ==========
+    # 检查最近 2 回合是否有大规模迁徙
+    migration_penalty = 1.0
+    recent_migration_turns = species.morphology_stats.get("recent_migration_turns", [])
+    if recent_migration_turns:
+        # 统计最近2回合的迁徙并保存
+        recent_migrations = [t for t in recent_migration_turns if turn_index - t <= 2]
+        species.morphology_stats["recent_migration_turns"] = recent_migrations
+
+        # 早期分化不受迁徙抑制，以免新版迁徙更积极导致分化全被压制
+        if turn_index >= spec_config.early_game_turns and len(recent_migrations) >= 1:
+            # 有迁徙记录，对非地理通道 ×0.5 抑制
+            if speciation_type not in ["地理隔离"]:
+                migration_penalty = 0.5
+                logger.debug(
+                    f"[迁徙抑制] {species.common_name}: "
+                    f"最近{len(recent_migrations)}回合有迁徙, 概率×0.5"
+                )
+            else:
+                logger.debug(
+                    f"[迁徙抑制豁免] {species.common_name}: 地理隔离通道，忽略迁徙惩罚"
+                )
+
+    # 生态隔离额外门槛检查
+    if ecological_isolation_triggered:
+        # 生态隔离通道：种群门槛 ×1.5（在已计算的门槛基础上）
+        eco_min_population = int(min_population * 1.5)
+        if candidate_population < eco_min_population:
+            logger.debug(
+                f"[分化跳过-生态隔离门槛] {species.common_name}: "
+                f"种群{candidate_population:,} < 生态隔离门槛{eco_min_population:,}"
+            )
+            return None
+    speciation_chance *= migration_penalty
+
+    # 【新增】AI 分化信号加成
+    # 如果物种被 ModifierApplicator 识别为高分化信号候选，增加概率
+    ai_boost = 0.0
+    if lineage_code in ai_speciation_candidates:
+        ai_boost = 0.15  # AI 识别的候选获得 15% 加成
+        speciation_chance += ai_boost
+        if speciation_type == "自然辐射" or speciation_type == "生态隔离":
+            speciation_type = "AI辅助" + speciation_type
+        logger.info(f"[AI分化] {species.common_name}: AI 分化信号加成 +{ai_boost:.0%}")
+
+    # 【新增】背景物种分化惩罚
+    # 背景物种（is_background=True）的分化概率大幅降低
+    background_penalty = 1.0
+    is_background = getattr(species, 'is_background', False)
+    if is_background:
+        background_penalty = spec_config.background_speciation_penalty
+        speciation_chance *= background_penalty
+        logger.debug(
+            f"[背景物种惩罚] {species.common_name}: "
+            f"分化概率×{background_penalty:.0%} (背景物种)"
+        )
+
+    # 记录分化概率计算详情
+    ai_info = f" + AI={ai_boost:.1%}" if ai_boost > 0 else ""
+    logger.info(
+        f"[分化概率] {species.common_name}: "
+        f"基础={base_chance:.1%} + 加成={speciation_bonus:.1%} + 累积={speciation_pressure:.1%}{ai_info} "
+        f"= 总概率{speciation_chance:.1%} (类型:{speciation_type})"
+    )
+
+
+    return replace(
+        work,
+        clusters=clusters,
+        generations=generations,
+        speciation_type=speciation_type,
+        speciation_chance=speciation_chance,
+    )
+
+
+def apply_candidate_speciation_roll(
+    work: _CandidateWork,
+    *,
+    species: Any,
+    turn_index: int,
+    random_random: Callable[[], float],
+    upsert_species: Callable[[Any], Any],
+) -> _CandidateWork | None:
+    """Apply the final roll and its existing pressure side effects."""
+    roll = random_random()
+    if roll > work.speciation_chance:
+        new_pressure = min(0.4, work.speciation_pressure + 0.08)
+        species.morphology_stats["speciation_pressure"] = new_pressure
+        upsert_species(species)
+        logger.info(
+            f"[分化失败] {species.common_name}: "
+            f"掷骰{roll:.2f} > 概率{work.speciation_chance:.1%}, "
+            f"累积压力: {work.speciation_pressure:.1%} → "
+            f"{new_pressure:.1%}"
+        )
+        return None
+
+    logger.info(
+        f"[分化成功!] {species.common_name}: "
+        f"掷骰{roll:.2f} <= 概率{work.speciation_chance:.1%}"
+    )
+    species.morphology_stats["speciation_pressure"] = 0.0
+    species.morphology_stats["last_speciation_turn"] = turn_index
+    return work
 
 
 def build_offspring_ai_entry(
